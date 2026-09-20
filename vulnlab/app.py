@@ -19,6 +19,10 @@
 - /api/reset_token   竞态：一次性重置令牌并发消费 → 拿到多个会话
 - /api/jwt_login     签发 HS256 JWT（密钥泄露 + 校验接受 alg=none）
 - /api/admin/export  JWT 保护的管理员接口（漏洞 13 的利用目标）
+- /cart              业务逻辑：接受客户端提交的价格（价格篡改）+ 不校验正负数量
+- /cart/total        用客户端价格算合计（让"我传的价格生效了"可观测）
+- /order/prepare     下单第一步（**可有可无**，用于证明"跳过步骤"）
+- /order/confirm     业务逻辑：跳过步骤 + 价格篡改 + 无幂等（重复提交重复下单）
 
 运行：python vulnlab/app.py  （默认监听 0.0.0.0:5000）
 """
@@ -101,6 +105,7 @@ def index() -> str:
       <li><a href="/api/users">/api/users</a> —— 未授权访问 / IDOR</li>
       <li><a href="/wallet">/wallet</a> —— 余额（配合 /coupon 验证竞态）</li>
       <li><a href="/coupon">/coupon</a> —— 竞态：单次优惠券并发重复兑换（POST code=HH-RACE-100）</li>
+      <li>/cart、/cart/total、/order/prepare、/order/confirm —— 业务逻辑：价格篡改 / 负数数量 / 跳过步骤 / 重复提交</li>
       <li><a href="/api/admin/export">/api/admin/export</a> —— JWT 保护的管理员导出</li>
     </ul>
     <form method="POST" action="/login">
@@ -452,6 +457,271 @@ def admin_export() -> tuple[str, int] | str:
             "token_payload": payload,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# 业务逻辑（v0.7 追加）：**价格篡改 / 负数数量 / 跳过步骤 / 重复提交**
+#
+# 这一组与竞态的区别：**不需要并发**。它要的是"理解业务规则"——
+# 而规则不在任何 payload 字典里，只在服务端（本该有）的校验里。
+# 实测它们进不了任何扫描器的覆盖面，所以靶场必须先把它们放进来，
+# 才能验证"HexHound 能不能发现业务逻辑漏洞"这句话。
+#
+# 四个缺陷分别对应四种最常见的业务逻辑错误：
+#   1. 价格由**客户端**提交，服务端不重新计算         → 1 分钱买走商品
+#   2. 数量不校验正负，小计按"单价 × 数量"算          → 负数数量把总价做成负数
+#   3. 下单时**不检查**是否真的加过购物车/走过确认步  → 直接 POST 确认接口即可下单
+#   4. 确认接口没有幂等性（重复提交重复扣库存）       → 一次购物车多次下单
+# ---------------------------------------------------------------------------
+
+#: 商品目录：**服务端**知道每件商品的真实单价（这是"重新计算"的依据）。
+CATALOG: dict[str, dict[str, object]] = {
+    "SKU-1001": {"name": "机械键盘", "price": 399.0, "stock": 8},
+    "SKU-1002": {"name": "显示器", "price": 1299.0, "stock": 5},
+    "SKU-1003": {"name": "鼠标垫", "price": 29.0, "stock": 50},
+}
+
+#: 每个用户的购物车：`{user: {sku: {"qty": n, "client_price": p}}}`。
+CARTS: dict[str, dict[str, dict[str, object]]] = {}
+#: 已下单记录（用于证明"重复提交真的产生了多张订单"）。
+ORDERS: list[dict[str, object]] = []
+#: 库存扣减次数（用于证明重复提交重复扣库存）。
+STOCK_DEDUCTIONS: list[dict[str, object]] = []
+
+
+def _reset_shop() -> None:
+    """把商店状态恢复到初始值（验证脚本用它保证可重复运行）。"""
+    CARTS.clear()
+    ORDERS.clear()
+    STOCK_DEDUCTIONS.clear()
+    CATALOG["SKU-1001"]["stock"] = 8
+    CATALOG["SKU-1002"]["stock"] = 5
+    CATALOG["SKU-1003"]["stock"] = 50
+
+
+@app.route("/cart", methods=["GET", "POST", "DELETE"])
+def cart() -> tuple[str, int] | str:
+    """购物车。
+
+    **漏洞 14（价格篡改）**：POST 时接受客户端传来的 `price`，并原样存进购物车。
+    真实系统里服务端必须只信自己的 `CATALOG[sku]["price"]`——前端传价只是为了
+    显示。这里刻意把它存下来，好在 `/order/confirm` 里用上，于是
+    "客户端说多少钱就是多少钱"。
+
+    **漏洞 15（负数数量）**：`qty` 不做范围校验，负数照收。
+    小计按 `price × qty` 计算时，负数数量会把订单金额做成负数。
+    """
+    who = _current_user()
+    if not who:
+        return jsonify({"code": 1, "msg": "请先登录"}), 401
+    if request.method == "GET":
+        return jsonify({"code": 0, "user": who, "cart": CARTS.get(who, {})})
+    if request.method == "DELETE":
+        CARTS.pop(who, None)
+        return jsonify({"code": 0, "msg": "购物车已清空"})
+
+    data = request.get_json(silent=True) or request.form
+    sku = str(data.get("sku") or "").strip()
+    if sku not in CATALOG:
+        return jsonify({"code": 1, "msg": "商品不存在"}), 404
+    # 注意用 `is None` 而不是 `or`：`qty=0` 是**合法输入**（也是漏洞的一部分——
+    # 服务端不该接受 0 件），而 `data.get("qty") or 1` 会把它静默变成 1，
+    # 于是"0 件加购"这个可测的边界条件根本到不了服务端逻辑。
+    raw_qty = data.get("qty")
+    try:
+        qty = 1 if raw_qty is None or raw_qty == "" else int(raw_qty)
+    except (TypeError, ValueError):
+        return jsonify({"code": 1, "msg": "数量不合法"}), 400
+    # 故意**不校验** qty > 0（漏洞 15），也**不校验** price 与服务端一致（漏洞 14）。
+    # 同理用 `is None`：`price=0` 是攻击者会试的值，不能被 `or` 吞成服务端单价。
+    raw_price = data.get("price")
+    try:
+        client_price = (
+            float(CATALOG[sku]["price"])  # type: ignore[arg-type]
+            if raw_price is None or raw_price == ""
+            else float(raw_price)
+        )
+    except (TypeError, ValueError):
+        client_price = float(CATALOG[sku]["price"])  # type: ignore[arg-type]
+    cart_entry = CARTS.setdefault(who, {})
+    current = cart_entry.setdefault(sku, {"qty": 0, "client_price": client_price})
+    current["qty"] = int(current["qty"]) + qty  # type: ignore[arg-type]
+    current["client_price"] = client_price
+    item = CATALOG[sku]
+    return jsonify(
+        {
+            "code": 0,
+            "msg": "已加入购物车",
+            "sku": sku,
+            "qty": current["qty"],
+            "server_price": item["price"],
+            "client_price": client_price,
+            "note": "服务端单价见 server_price；下单金额由 /order/confirm 计算",
+        }
+    )
+
+
+@app.route("/cart/total")
+def cart_total() -> tuple[str, int] | str:
+    """购物车合计（**用客户端提交的价格**算——漏洞 14 的直接体现）。
+
+    提供一个"看得见"的接口是刻意的：Agent 需要能观察到"我传的价格生效了"。
+    """
+    who = _current_user()
+    if not who:
+        return jsonify({"code": 1, "msg": "请先登录"}), 401
+    items = CARTS.get(who, {})
+    total = 0.0
+    detail = []
+    for sku, entry in items.items():
+        price = float(entry.get("client_price") or 0.0)
+        qty = int(entry.get("qty") or 0)
+        subtotal = round(price * qty, 2)
+        total = round(total + subtotal, 2)
+        detail.append(
+            {
+                "sku": sku,
+                "qty": qty,
+                "client_price": price,
+                "server_price": CATALOG[sku]["price"],
+                "subtotal": subtotal,
+            }
+        )
+    return jsonify(
+        {
+            "code": 0,
+            "user": who,
+            "items": detail,
+            "total": total,
+            "priced_by": "client",  # 直接写明：金额是按客户端价格算的
+        }
+    )
+
+
+@app.route("/order/prepare", methods=["POST"])
+def order_prepare() -> tuple[str, int] | str:
+    """下单第一步：生成一个订单号（**可有可无的一步**）。
+
+    它存在的意义是让"跳过步骤"这个漏洞**可证明**：
+    `/order/confirm` 并不检查你是否调用过它。
+    """
+    who = _current_user()
+    if not who:
+        return jsonify({"code": 1, "msg": "请先登录"}), 401
+    return jsonify(
+        {
+            "code": 0,
+            "step": 1,
+            "msg": "订单已就绪，请调用 /order/confirm 确认",
+            "next_required_step": "/order/confirm",
+        }
+    )
+
+
+@app.route("/order/confirm", methods=["POST"])
+def order_confirm() -> tuple[str, int] | str:
+    """下单确认。
+
+    三个缺陷叠在一起：
+
+    - **漏洞 16（跳过步骤）**：不校验是否真加过购物车、也不校验是否调用过
+      `/order/prepare`。购物车为空时它按请求体里的 `sku`/`qty`/`price` 直接下单。
+    - **漏洞 14（价格篡改）**：金额优先用请求体里的 `price`（或购物车里的
+      `client_price`），**从不**回退到 `CATALOG` 的服务端单价重算。
+    - **漏洞 17（重复提交 / 无幂等）**：同一购物车可以反复确认，每次都会
+      新建订单并再扣一次库存（没有幂等键、没有"购物车已结算"标记）。
+
+    正确实现：金额一律由服务端 `CATALOG` 重算、数量必须为正、下单前校验
+    购物车状态、并要求幂等键（或把购物车标记为已结算）。
+    """
+    who = _current_user()
+    if not who:
+        return jsonify({"code": 1, "msg": "请先登录"}), 401
+    data = request.get_json(silent=True) or request.form
+    items = CARTS.get(who, {})
+
+    # 购物车为空 → **不报错**，直接用请求体里的内容下单（漏洞 16）
+    if not items and data:
+        sku = str(data.get("sku") or "").strip()
+        if sku not in CATALOG:
+            return jsonify({"code": 1, "msg": "购物车为空且未指定商品"}), 400
+        try:
+            qty = int(data.get("qty") or 1)
+        except (TypeError, ValueError):
+            qty = 1
+        try:
+            price = float(data.get("price") or 0.0)
+        except (TypeError, ValueError):
+            price = 0.0
+        items = {sku: {"qty": qty, "client_price": price}}
+
+    total = 0.0
+    lines = []
+    for sku, entry in items.items():
+        if sku not in CATALOG:
+            continue
+        qty = int(entry.get("qty") or 0)
+        # 价格优先取客户端提交值（漏洞 14）
+        price = float(entry.get("client_price") or 0.0)
+        if not price and data:
+            try:
+                price = float(data.get("price") or 0.0)
+            except (TypeError, ValueError):
+                price = 0.0
+        subtotal = round(price * qty, 2)  # 负数 qty → 负小计（漏洞 15）
+        total = round(total + subtotal, 2)
+        lines.append(
+            {
+                "sku": sku,
+                "name": CATALOG[sku]["name"],
+                "qty": qty,
+                "paid_price": price,
+                "server_price": CATALOG[sku]["price"],
+                "subtotal": subtotal,
+            }
+        )
+
+    order_id = f"ORD-{len(ORDERS) + 1001}"
+    for line in lines:
+        stock = int(CATALOG[line["sku"]]["stock"])
+        CATALOG[line["sku"]]["stock"] = stock - int(line["qty"])
+        STOCK_DEDUCTIONS.append(
+            {"order_id": order_id, "sku": line["sku"], "deducted": int(line["qty"])}
+        )
+    ORDERS.append(
+        {"order_id": order_id, "owner": who, "total": total, "lines": lines,
+         "status": "paid"}
+    )
+    return jsonify(
+        {
+            "code": 0,
+            "msg": "下单成功",
+            "order_id": order_id,
+            "owner": who,
+            "total": total,
+            "lines": lines,
+            "priced_by": "client",
+            "idempotent": False,  # 直接写明：重复提交会重复下单
+        }
+    )
+
+
+@app.route("/order/<order_id>")
+def order_detail(order_id: str) -> tuple[str, int] | str:
+    """查订单（用于证明"重复提交真的产生了多张订单"）。"""
+    for order in ORDERS:
+        if order["order_id"] == order_id:
+            return jsonify({"code": 0, "data": order})
+    return jsonify({"code": 1, "msg": "订单不存在"}), 404
+
+
+@app.route("/admin/shop/reset", methods=["POST"])
+def shop_reset() -> str:
+    """把商店状态恢复初始值（**仅本地靶场**，供验证脚本重复运行）。"""
+    if _current_user() != "admin":
+        return jsonify({"code": 1, "msg": "需要管理员会话"}), 403
+    _reset_shop()
+    return jsonify({"code": 0, "msg": "商店状态已重置"})
 
 
 @app.route("/actuator/env")

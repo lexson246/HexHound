@@ -1252,6 +1252,99 @@ class Orchestrator:
         ]
         return sort_urls(hits, limit)
 
+    # ---------- 业务逻辑（价格 / 数量 / 步骤 / 幂等）----------
+
+    def _commerce_surface(self) -> dict[str, list[str]]:
+        """按语义挑出"电商/订单"这一类面。
+
+        为什么单独找：业务逻辑漏洞**不吃 payload**，它吃的是"服务端少了一道校验"。
+        要测它，必须先认出"这是一条下单链路"——加购 → 确认 → 查订单。
+        只靠通用词表找不出这层关系，因此这里按路径语义分组。
+        """
+        with self.surface._lock:  # noqa: SLF001
+            items = list(self.surface.endpoints.values())
+        groups: dict[str, list[str]] = {
+            "cart": [], "confirm": [], "prepare": [], "detail": [],
+        }
+        for item in items:
+            url = item.url.lower()
+            if any(hint in url for hint in ("/cart", "basket", "shopping")):
+                groups["cart"].append(item.url)
+            is_confirm = any(
+                hint in url for hint in ("confirm", "checkout", "submit_order", "place_order")
+            )
+            is_prepare = any(
+                hint in url for hint in ("prepare", "pre_order", "order/init", "step")
+            )
+            if is_confirm:
+                groups["confirm"].append(item.url)
+            if is_prepare:
+                groups["prepare"].append(item.url)
+            # 查询单个订单的端点：**排除**确认/前置步骤类，
+            # 否则 `/order/confirm` 会同时落进 confirm 与 detail 两组，
+            # 派任务时把"下单接口"当成"查订单接口"用。
+            if (
+                any(hint in url for hint in ("/order/", "/orders/"))
+                and not is_confirm
+                and not is_prepare
+            ):
+                groups["detail"].append(item.url)
+        return {
+            key: sort_urls(value)
+            for key, value in groups.items()
+        }
+
+    def business_logic_tasks(self, limit: int = 1) -> list[WorkerTask]:
+        """生成**确定性**的业务逻辑测试任务（价格篡改 / 负数数量 / 跳过步骤 / 重复提交）。
+
+        与竞态任务（S1）同样的理由：实测里"提示词给了能力但没人负责用"必然发生。
+        这一类更严重——业务逻辑不触发任何 payload 类信号，模型除非**专门去想**
+        "这个金额能不能由客户端说了算"，否则永远不会去试。
+        所以这里按攻面特征机械派发。
+
+        前提：必须能认出"这是一条下单链路"（至少有购物车/确认类端点之一）。
+        认不出来就不派——瞎猜业务规则比不测更糟（会产出无证据的结论）。
+        """
+        groups = self._commerce_surface()
+        cart = groups["cart"]
+        confirm = groups["confirm"]
+        if not cart and not confirm:
+            return []
+        endpoints = cart + [url for url in confirm if url not in cart]
+        listing = "\n".join(f"  - {url}" for url in endpoints[:6])
+        steps = max(8, min(3 * len(endpoints) + 8, 18))
+        return [
+            WorkerTask(
+                id="B1",
+                role="injection",
+                objective=(
+                    "**业务逻辑测试**：下面是一条下单链路，逐条验证服务端是否真的在校验"
+                    "（这类问题不触发任何 payload 信号，必须主动想「钱和数量能不能由客户端说了算」）：\n"
+                    f"{listing}\n"
+                    "先侦察再判定：用 http_request 读一次（GET）拿清了字段名与正常流程，"
+                    "然后逐项验证下面 4 种典型缺陷。**每一项都要给出可核对的证据**"
+                    "（请求 + 响应关键字段 + 前后状态对比），成立就 record_finding，"
+                    "不成立也要 record_coverage 写清试过什么。\n"
+                    "1) **价格篡改**：加购/下单时把客户端提交的 `price` 改成一个极低价"
+                    "（如 0.01），或干脆不传 price。看服务端是**按自己目录里的单价重算**，"
+                    "还是接受客户端价格。判据：同一商品用低价提交后，"
+                    "合计/订单金额是否变成你提交的价（而不是服务端单价）。\n"
+                    "2) **负数或异常数量**：qty 传 -1 / -5 / 0 / 极大值。"
+                    "判据：服务端是否拒绝；不拒绝就会让合计或订单金额变成负数。\n"
+                    "3) **跳过步骤**：**只**调确认类接口（不先加购物车、不调其它前置步骤），"
+                    "请求体里直接给 sku/qty/price。判据：是否照样下单成功。\n"
+                    "4) **重复提交 / 无幂等**：同一份购物车连续确认 2~3 次（不要并发，"
+                    "串行即可——这一条测的是缺幂等键，不是竞态）。"
+                    "判据：是否产生**多张**订单、是否重复扣库存。\n"
+                    "证据要求（缺一不可）：每条结论都要有 request 响应原文（evidence_ref 用 R 编号）"
+                    "与**前后状态对比**（金额/订单号/库存数量）。"
+                    "只凭「没报错」不算证据——要说清「钱少了多少」或「多出了几张订单」。"
+                ),
+                url=endpoints[0],
+                steps=steps,
+            )
+        ]
+
     def special_class_tasks(self, limit: int = 2) -> list[WorkerTask]:
         """生成竞态/业务逻辑与认证实现两类**确定性**任务（不依赖模型自觉）。
 
@@ -1526,6 +1619,22 @@ class Orchestrator:
                     ),
                 )
                 done.extend(self.run_wave(special, wave=2))
+        # 业务逻辑（价格篡改 / 负数数量 / 跳过步骤 / 重复提交）：同样**确定性**派发。
+        # 不放进 special_class_tasks 是因为那个函数以"脚本通道可用"为前提
+        # （竞态必须写并发脚本），而业务逻辑用 http_request 串行就能测——
+        # 没有沙箱时也不该漏掉这一类。
+        if self._may_start_wave("业务逻辑任务波"):
+            business = self.business_logic_tasks()
+            if business:
+                self._event(
+                    kind="business_logic_tasks",
+                    message=(
+                        "按攻面特征派发业务逻辑任务："
+                        + "、".join(f"{t.id}({t.role})" for t in business)
+                        + "（价格篡改/负数数量/跳过步骤/重复提交）"
+                    ),
+                )
+                done.extend(self.run_wave(business, wave=2))
         # 覆盖率补扫：未测端点/未攻击参数强制补上（这是报告可信度的前提）。
         # 最多两轮，且**只在确实缩小了盲区时**才继续——否则就是一个收敛不了的烧钱循环。
         # 每一波**开始之前**都要过 `_may_start_wave`：允许的时长不是"开始后无限跑"，
