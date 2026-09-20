@@ -409,16 +409,109 @@ class WorkerSupervisionTests(unittest.TestCase):
         )
 
     def test_repeat_calls_warn_then_abort(self) -> None:
+        """重复调用：3 次告警、5 次中止（判定委托给 supervisor.Supervisor）。"""
         worker = self.make_worker()
         messages: list[dict[str, str]] = []
         step = {"action": "http_request", "action_input": {"url": TARGET + "/x"}}
         worker._supervise(step, messages)  # 1
         worker._supervise(step, messages)  # 2
         worker._supervise(step, messages)  # 3 → 告警
-        self.assertTrue(any("完全相同的参数" in item["content"] for item in messages))
+        self.assertTrue(
+            any("同样的调用不会产生新信息" in item["content"] for item in messages),
+            f"第 3 次应当告警，实际消息：{messages}",
+        )
         worker._supervise(step, messages)  # 4
         with self.assertRaises(StepAbort):
             worker._supervise(step, messages)  # 5 → 中止
+
+    def test_repeat_interventions_are_recorded_in_the_supervisor(self) -> None:
+        """每次干预都要留下记录——"为什么这个子任务被中止"必须能回答。"""
+        worker = self.make_worker()
+        step = {"action": "http_request", "action_input": {"url": TARGET + "/x"}}
+        for _ in range(5):
+            try:
+                worker._supervise(step, [])
+            except StepAbort:
+                break
+        summary = worker.supervisor.summary()
+        kinds = {item["kind"] for item in summary["interventions"]}
+        self.assertIn("repeat", kinds)
+        self.assertTrue(any(item["level"] == "abort" for item in summary["interventions"]))
+
+    def test_stall_detection_warns_then_aborts(self) -> None:
+        """长期无进展：连续多步没有新证据/新结论 → 先干预，再终止。
+
+        实测里这比"完全相同的调用"更常见：模型稍微换个参数继续撞同一堵墙，
+        签名不同所以旧的重复判据抓不到，但预算照样烧光。
+        """
+        worker = self.make_worker()
+        messages: list[dict[str, str]] = []
+        # 每一步参数都不同（绕开重复判据），观察文本也没有任何进展标记
+        for index in range(4):
+            worker._supervise(
+                {"action": "http_request", "action_input": {"url": TARGET + f"/p{index}"},
+                 "observation": "200 OK，普通页面"},
+                messages,
+            )
+        self.assertTrue(
+            any("原地打转" in item["content"] for item in messages),
+            f"连续 4 步无进展应当告警：{messages}",
+        )
+        with self.assertRaises(StepAbort) as ctx:
+            for index in range(4, 10):
+                worker._supervise(
+                    {"action": "http_request", "action_input": {"url": TARGET + f"/p{index}"},
+                     "observation": "200 OK，普通页面"},
+                    messages,
+                )
+        self.assertIn("停滞", str(ctx.exception))
+
+    def test_progress_resets_the_stall_counter(self) -> None:
+        """产生进展要清零停滞计数——否则正常的长任务会被误砍。"""
+        worker = self.make_worker()
+        for index in range(3):
+            worker._supervise(
+                {"action": "http_request", "action_input": {"url": TARGET + f"/q{index}"},
+                 "observation": "普通响应"},
+                [],
+            )
+        worker._supervise(
+            {"action": "record_coverage", "action_input": {"target": "x", "status": "no_issue_found"},
+             "observation": "已记录覆盖：x"},
+            [],
+        )
+        self.assertEqual(worker.supervisor.stall_steps, 0)
+
+    def test_identical_failure_loop_aborts(self) -> None:
+        """相同失败循环：同一个失败连续多次 → 终止（继续重试不会成功）。"""
+        worker = self.make_worker()
+        with self.assertRaises(StepAbort) as ctx:
+            for index in range(5):
+                worker._supervise(
+                    {"action": "sqlmap_scan",
+                     "action_input": {"url": TARGET + f"/f{index}"},
+                     "observation": "工具执行出错：Timeout"},
+                    [],
+                )
+        self.assertIn("失败", str(ctx.exception))
+
+    def test_different_failures_do_not_trigger_the_loop_rule(self) -> None:
+        """失败特征不同就不算"相同失败循环"——否则正常排错会被掐断。"""
+        worker = self.make_worker()
+        observations = [
+            "工具执行出错：Timeout",
+            "请求失败：连接被拒绝",
+            "错误：参数不合法",
+            "工具执行出错：Timeout",
+        ]
+        for index, observation in enumerate(observations):
+            worker._supervise(
+                {"action": "http_request", "action_input": {"url": TARGET + f"/g{index}"},
+                 "observation": observation},
+                [],
+            )
+        # 没有连续 5 次相同失败 → 不应中止
+        self.assertLess(worker.supervisor.stall_steps, 8)
 
     def test_finish_actions_are_not_supervised(self) -> None:
         worker = self.make_worker()

@@ -28,8 +28,17 @@ from .dedupe import dedupe_findings
 from .llm import LLMClient
 from .memory import HostMemory, RunArtifacts, TaskLedger
 from .prompts import ROLE_PROMPTS
+from .replan import (
+    MAX_NEW_TASKS_PER_PATCH,
+    PlanEntry,
+    ReplanError,
+    ReplanPolicy,
+    apply_patch,
+    parse_patch,
+)
 from .sandbox import sandbox_report
 from .surface import AttackSurface, normalize_endpoint, sort_urls
+from .supervisor import Supervisor
 from .tools import ToolRegistry
 from .trace import TraceRecorder, summarize_trace, write_snapshot
 
@@ -178,8 +187,8 @@ class TaskWorker:
         self.trace = trace
         #: 本任务自己的用量账本（并发下唯一正确的"这个任务花了多少"）。
         self.task_usage = TaskUsage(label=task.id)
-        self._recent_calls: list[str] = []
-        self._warned = False
+        #: 停滞/重复/失败循环监督（判定逻辑见 supervisor.py）。
+        self.supervisor = Supervisor()
         self._step_notices: set[str] = set()
 
     def _signature(self, action: str, action_input: dict[str, Any]) -> str:
@@ -229,32 +238,33 @@ class TaskWorker:
             )
 
     def _supervise(self, step: dict[str, Any], messages: list[dict[str, str]]) -> None:
-        """步数收尾提醒 + 重复动作监督（PentAGI：同工具 3 次告警、7 次中止）。"""
-        action = str(step.get("action") or "")
-        action_input = step.get("action_input") or {}
-        if not isinstance(action_input, dict):
-            action_input = {}
+        """步数收尾提醒 + 停滞/重复/失败循环监督。
+
+        监督判定委托给 `supervisor.Supervisor`（可脱离编排器单独测试）。
+        这里只负责把判定结果变成**动作**：加一条提示，或者抛 `StepAbort`。
+
+        v0.6 起多出来两类判据（原来只有"同工具同参数重复"）：
+        - **长期无进展**：连续多步没有任何新证据/新结论；
+        - **相同失败循环**：同一个失败连续出现多次。
+        实测里这两种比"完全相同的调用"更常见——模型会稍微换个参数继续撞同一堵墙，
+        签名不同所以旧判据抓不到，但预算照样烧光。
+        """
         self._step_notice(step, messages)
-        if action in ("finish", "finish_task", "parse_error", "budget_stop"):
-            return
-        signature = self._signature(action, action_input)
-        self._recent_calls.append(signature)
-        del self._recent_calls[:-40]
-        repeats = self._recent_calls.count(signature)
-        if repeats >= self.REPEAT_ABORT:
-            raise StepAbort(
-                f"同一工具以相同参数调用了 {repeats} 次，已中止本子任务以避免浪费预算。"
+        verdict = self.supervisor.observe(step)
+        if self.trace is not None and verdict.level != "ok":
+            self.trace.record(
+                "supervisor",
+                task=self.task.id,
+                role=self.task.role,
+                **verdict.to_dict(),
             )
-        if repeats == self.REPEAT_WARN and not self._warned:
-            self._warned = True
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        f"注意：你刚刚用完全相同的参数调用了 {action} 三次。"
-                        "同样的调用不会产生新信息——请换参数、换端点，或直接进入复核/收尾。"
-                    ),
-                }
+        if verdict.abort:
+            raise StepAbort(f"{verdict.reason}；{verdict.directive}")
+        if verdict.warn:
+            messages.append({"role": "user", "content": "注意：" + verdict.directive})
+            self.callbacks.emit(
+                kind="notice", task=self.task.id, level="SUPERVISOR",
+                message=verdict.reason,
             )
 
     def run(self) -> AgentResult:
@@ -621,6 +631,8 @@ class Orchestrator:
             goal=goal,
             mode=mode,
         )
+        #: 有界动态重规划的轮数政策（上限见 replan.MAX_REPLAN_ROUNDS）。
+        self.replan_policy = ReplanPolicy()
         #: 本次运行开始前，跨运行记忆里已有的 findings（用于跨运行 diff）
         self.previous_findings: list[dict[str, Any]] = []
         self.previous_run_at: str = ""
@@ -1556,6 +1568,19 @@ class Orchestrator:
                     after["untouched"] < before["untouched"]
                     or after["params_unattacked"] < before["params_unattacked"]
                 )
+                # ---- 波次边界：有界动态重规划 ----
+                # 位置就在"一轮补扫跑完、下一轮开始之前"——这正是**唯一**允许
+                # 改计划的时刻（波次内部不动计划：正在执行的目标被改掉，
+                # 产出就与目标不对应了）。
+                #
+                # 触发条件：还有重规划额度，且**出现/变多了新盲区**。
+                # `progressed` 说明补扫有效，那就不需要重规划；反之说明
+                # 原计划没有覆盖到这些面，值得让规划者按现状调整一次。
+                if not progressed or round_index == 0:
+                    replanned = self._run_replan_round(after, done, tasks)
+                    if replanned and self._may_start_wave("重规划新增任务波"):
+                        self._event(kind="wave", wave=6, count=len(replanned))
+                        done.extend(self.run_wave(replanned, wave=6))
                 # 有盲区但一点没缩小 → 再跑一轮只会重复烧钱，如实留在报告里
                 if not progressed or self._stopped():
                     break
@@ -1615,6 +1640,167 @@ class Orchestrator:
                 endpoints=len(self.surface.endpoints),
             )
         return result
+
+    # ---------- 有界动态重规划（只在波次边界）----------
+    #
+    # 对标 PentAGI 的 Refiner `subtask_patch`，但加了三道 HexHound 自己的约束：
+    # 只在波次边界改计划、只能改白名单字段、有硬上限（见 replan.py）。
+    # **重规划不能扩大授权范围**：新任务的 URL 主机必须与本次目标一致。
+
+    def _replan_brief(self, gate: dict[str, Any], done: list[WorkerTask]) -> str:
+        """给重规划者的现状简报（它只做增量决策，不重写整份计划）。"""
+        pending = self.untested_targets()[:15]
+        unattacked = [f"{url} 参数[{param}]" for url, param in self.unattacked_params()[:15]]
+        finished = [task for task in done if task.outcome in CLOSED_OUTCOMES]
+        unfinished = [task for task in done if task.outcome not in CLOSED_OUTCOMES]
+        lines = [
+            "<current_state>",
+            f"已完成子任务：{len(finished)} 个；未收尾：{len(unfinished)} 个"
+            + (
+                "（" + "、".join(f"{t.id}({t.outcome_label})" for t in unfinished[:6]) + "）"
+                if unfinished
+                else ""
+            ),
+            f"端点覆盖：{gate.get('touched')}/{gate.get('total')}"
+            f"；参数覆盖：{gate.get('params_attempted')}/{gate.get('params_total')}",
+        ]
+        if pending:
+            lines.append("从未被触碰的端点：")
+            lines += [f"  - {url}" for url in pending]
+        if unattacked:
+            lines.append("从未被攻击过的参数：")
+            lines += [f"  - {item}" for item in unattacked]
+        lines.append(
+            "已记录的结论："
+            f"{len([f for f in self.surface.finding_dicts() if f.get('status') != 'candidate'])} 条已复核 / "
+            f"{len(self.surface.pending_candidates())} 条待复核"
+        )
+        lines.append("</current_state>")
+        return "\n".join(lines)
+
+    def _run_replan_round(
+        self, gate: dict[str, Any], done: list[WorkerTask], plan: list[WorkerTask]
+    ) -> list[WorkerTask]:
+        """执行一轮重规划，返回新增的任务（不修改入参）。"""
+        policy: ReplanPolicy = self.replan_policy
+        if not policy.can_replan():
+            return []
+        prompt = self._replan_prompt(gate, done)
+        if not prompt:
+            return []
+        if not self.budget.can_spend():
+            return []
+        try:
+            content, usage = self._llm_for("planner").complete(prompt)
+            self.budget.add_usage(usage)
+        except Exception as exc:  # noqa: BLE001 重规划失败不该影响主流程
+            self._event(
+                kind="replan_error",
+                message=f"重规划调用失败，按原计划继续：{type(exc).__name__}: {exc}",
+            )
+            return []
+        if self.trace is not None:
+            self.trace.record("replan_request", role="planner", gate=gate)
+        try:
+            ops = parse_patch(extract_json(content))
+        except (ReplanError, ValueError) as exc:
+            self._event(kind="replan_rejected", message=f"重规划输出无法解析，已忽略：{exc}")
+            if self.trace is not None:
+                self.trace.record("replan_rejected", reason=str(exc))
+            return []
+
+        entries = [self._entry_from_task(task) for task in plan]
+        new_plan, result = apply_patch(
+            entries,
+            ops,
+            allowed_hosts=self.allowed_hosts,
+            target_host=self._target_host(),
+            total_tasks=len(done) + len(plan),
+            salt=self.target,
+        )
+        policy.take()
+        if self.trace is not None:
+            self.trace.record(
+                "replan_applied",
+                rounds=policy.rounds_used,
+                applied=result.applied,
+                rejected=result.rejected,
+                ok=result.ok,
+                reason=result.reason,
+            )
+        self._event(
+            kind="replan",
+            message=(
+                f"第 {policy.rounds_used}/{policy.max_rounds} 轮重规划："
+                f"应用 {len(result.applied)} 条、拒绝 {len(result.rejected)} 条"
+            ),
+        )
+        for item in result.rejected:
+            self._event(
+                kind="replan_rejected",
+                message=f"重规划请求被拒（{item.get('op')} {item.get('id') or ''}）：{item.get('reason')}",
+            )
+        # 只把**新增**的任务交给下一波；update/remove 影响的是尚未派发的任务，
+        # 已经跑过的任务不动（改了目标，它的产出就与目标不对应了）。
+        new_ids = {item["id"] for item in result.applied if item["op"] == "add"}
+        added: list[WorkerTask] = []
+        for entry in new_plan:
+            if entry.id not in new_ids:
+                continue
+            added.append(
+                WorkerTask(
+                    id=entry.id,
+                    role=entry.role,
+                    objective=entry.objective,
+                    url=entry.url or self.target,
+                    steps=entry.steps,
+                )
+            )
+        return added[: MAX_NEW_TASKS_PER_PATCH * policy.max_rounds]
+
+    def _replan_prompt(self, gate: dict[str, Any], done: list[WorkerTask]) -> list[dict[str, str]]:
+        """重规划提示词：要求输出**结构化 patch**，并明确硬约束。"""
+        state = self._replan_brief(gate, done)
+        if not state:
+            return []
+        instruction = (
+            "你在做一次**运行中的计划调整**（不是重写整份计划）。\n"
+            f"{state}\n\n"
+            "只输出一个 JSON 对象：\n"
+            '{"thought": "为什么这样调整", "ops": [\n'
+            '  {"op": "add", "role": "recon|injection|auth|verify", '
+            '"objective": "任务目标", "url": "完整 URL（必须与本次目标同主机）", '
+            '"steps": 6, "depends_on": []},\n'
+            '  {"op": "update", "id": "T2", "changes": {"objective": "…", "steps": 8}},\n'
+            '  {"op": "remove", "id": "T3"}\n'
+            "]}\n\n"
+            "<constraints>\n"
+            f"- 最多新增 {MAX_NEW_TASKS_PER_PATCH} 个任务；\n"
+            "- 只能修改 objective / steps / depends_on / priority（改不了 id/role/url）；\n"
+            "- **不允许把任务指向本次授权目标之外的主机**，哪怕它在白名单里；\n"
+            "- 只在确实有新盲区时才新增任务；没有值得做的调整就输出 {\"ops\": []}。\n"
+            "</constraints>"
+        )
+        return [
+            {"role": "system", "content": ROLE_PROMPTS["orchestrator"]},
+            {"role": "user", "content": instruction},
+        ]
+
+    @staticmethod
+    def _entry_from_task(task: WorkerTask) -> PlanEntry:
+        return PlanEntry(
+            id=task.id,
+            role=task.role,
+            objective=task.objective,
+            url=task.url,
+            steps=task.steps,
+            source="initial",
+        )
+
+    def _target_host(self) -> str:
+        from urllib.parse import urlparse
+
+        return (urlparse(self.target).hostname or "").lower()
 
     def _follow_up_tasks(self, done: list[WorkerTask]) -> list[WorkerTask]:
         """侦察完成后，把新发现的高价值端点补成第二波任务。
