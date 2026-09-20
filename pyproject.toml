@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hexhound"
+version = "0.1.0"
+description = "AI-driven vulnerability hunting agent: source audit -> black-box verification -> evidence-backed findings"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "HexHound contributors" }]
+keywords = ["security", "llm", "agent", "pentest", "vulnerability", "react"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+]
+dependencies = [
+    "openai>=1.40",
+    "httpx>=0.27",
+    "click>=8.1",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+lab = ["flask>=3.0"]
+desktop = ["pywebview>=5.0", "pyinstaller>=6.0", "playwright>=1.40"]
+dev = ["pytest>=8.0", "ruff>=0.5", "pyinstaller>=6.0"]
+
+[project.scripts]
+hexhound = "hexhound.cli:main"
+hexhound-desktop = "hexhound.desktop:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hexhound"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+# 注意：不要在这里写相对 testpaths —— `tests/conftest.py` 会把工作目录切到临时目录
+# （防止测试覆盖开发机真实的 .env），相对路径在那之后就解析不到了。
+# 测试收集路径由根目录的 `conftest.py` 在切目录之前锚定。
+addopts = "-q"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# gui.py 内联了 HTML/CSS/JS 模板字符串，长行不可避免。
+"src/hexhound/gui.py" = ["E501"]

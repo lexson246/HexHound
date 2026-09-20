@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# 打包产物（PyInstaller）
+hexhound.exe
+HexHound.exe
+*.pkg
+
+# 环境变量 / 密钥（绝不提交）
+.env
+.env.bak
+
+# 测试与工具产物
+.tmp/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+.coverage
+htmlcov/
+
+# 报告输出
+reports/
+
+# HexHound 运行产物（攻面快照 / 任务台账 / PoC / 跨运行记忆）
+# 默认在 ~/.hexhound/，但如果有人覆盖成仓库内路径也不该提交
+.hexhound/
+runs/
+
+# 靶场运行时产物
+vulnlab/app.db
+*.db
+*.sqlite3
+*.sqlite
+
+# 本地临时文件
+tmp_*.txt
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
