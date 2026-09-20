@@ -25,8 +25,18 @@ import sys
 from .sanitize import sanitize_terminal_text
 
 
+_UTF8_READY = False
+
+
 def enable_utf8_console() -> bool:
-    """尽力把标准输出切到 UTF-8。返回是否确认可写 UTF-8。"""
+    """尽力把标准输出切到 UTF-8。返回是否确认可写 UTF-8。
+
+    幂等：包导入时会调一次（覆盖示例脚本等入口），`cli.main()` 会再调一次。
+    重复调用没有副作用，但没必要重复探测。
+    """
+    global _UTF8_READY
+    if _UTF8_READY:
+        return True
     ok = False
     if sys.platform == "win32":
         try:
@@ -47,6 +57,7 @@ def enable_utf8_console() -> bool:
                 ok = True
             except Exception:  # noqa: BLE001 流被重定向成不支持重配置的对象
                 pass
+    _UTF8_READY = ok
     return ok
 
 

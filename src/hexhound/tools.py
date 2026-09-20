@@ -2751,6 +2751,7 @@ class ToolRegistry:
         artifacts: RunArtifacts | None = None,
         rate_limit: float = 0.0,
         sandbox: Any = None,
+        task_usage: Any = None,
     ) -> None:
         self.base_dir = Path(base_dir).resolve()
         self.allowed_hosts = allowed_hosts
@@ -2786,6 +2787,8 @@ class ToolRegistry:
         from .budget import Budget
 
         self.budget = budget if budget is not None else Budget()
+        #: 本任务自己的用量账本（并发下由任务自己累计，见 budget.TaskUsage）。
+        self.task_usage = task_usage
         self._tools: dict[str, Tool] = {}
         self._register_defaults()
 
@@ -2988,14 +2991,25 @@ class ToolRegistry:
         )
 
     def execute(self, name: str, action_input: Any) -> str:
-        """执行工具，统一捕获异常并返回可读的错误字符串。"""
+        """执行工具，统一捕获异常并返回可读的错误字符串。
+
+        工具调用名额用 `budget.reserve_tool_call()` **原子**占用（检查 + 扣减
+        在同一把锁里）。早先的 `can_spend()` + 事后 `add_tool_call()` 是两步，
+        N 个并发 worker 能一起穿过检查、一起记账，于是 `--max-tool-calls`
+        会被超出（经典 TOCTOU）。
+        """
         tool = self._tools.get(name)
         if tool is None:
             available = ", ".join(sorted(self._tools))
             return f"错误：未知工具 {name!r}。当前角色的可用工具：{available}。"
         if not isinstance(action_input, dict):
             action_input = {}
-        self.budget.add_tool_call()
+        granted, reason = self.budget.reserve_tool_call(task=self.task_usage)
+        if not granted:
+            return (
+                f"错误：预算已用尽，本次 {name} 调用未执行（{reason}）。"
+                "请立刻用 finish_task 交回已有结论，不要再发起新的工具调用。"
+            )
         try:
             result = tool.func(_truncate_args(action_input))
         except Exception as exc:  # noqa: BLE001 工具层兜底：任何异常都转成字符串喂回 agent

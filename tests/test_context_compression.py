@@ -36,10 +36,15 @@ class FakeTools:
 
     def execute(self, name: str, action_input: dict) -> str:
         self.calls.append(name)
-        # 真实 ToolRegistry 会在 execute 里记一次工具调用；替身必须同样记账，
+        # 真实 ToolRegistry 会在 execute 里**原子**占用工具调用名额；替身必须同样记账，
         # 否则预算类测试会"假绿"（上限永远到不了）。
-        self.budget.add_tool_call()
+        granted, reason = self.budget.reserve_tool_call()
+        if not granted:
+            return f"错误：预算已用尽，本次 {name} 调用未执行（{reason}）。"
         return f"observation for {name}"
+
+    def tool_names(self) -> list[str]:
+        return ["http_request", "think", "finish_task"]
 
 
 class FakeLLM:
@@ -188,11 +193,105 @@ class ContextCompressionTests(unittest.TestCase):
         self.assertIn("预算", notices[0][1])
 
     def test_max_steps_marks_reason(self) -> None:
+        """步数用尽 + 收尾回合内仍不收尾 → 明确终态 `closing_no_finish`。
+
+        v0.6 起"达到步数上限"不再是一个终态：正常步数用尽后会先给
+        `MAX_CLOSING_ROUNDS` 个**受限收尾回合**（只能 record_finding /
+        record_coverage / leave_note / finish_task）。模型连收尾回合都不收尾时，
+        状态是 `closing_no_finish`（系统代写总结、产出全部保留），
+        而不是原先那句含糊的 `max_steps`。
+        """
         result = agent.ReActAgent(
             NeverFinishingLLM(), FakeTools(), max_steps=2, budget=Budget()
         ).run("goal")
-        self.assertEqual(result.finish_reason, "max_steps")
-        self.assertEqual(result.steps_used, 2)
+        self.assertEqual(result.finish_reason, "closing_no_finish")
+        # 2 个正常步 + 2 个收尾回合，全部执行过
+        self.assertEqual(result.steps_used, 2 + agent.MAX_CLOSING_ROUNDS)
+        self.assertEqual(result.closing["attempted"], agent.MAX_CLOSING_ROUNDS)
+        self.assertFalse(result.closing["closed"])
+        # 摘要必须存在（系统代写），否则报告里这个子任务看起来"无产出"
+        self.assertTrue(result.final_summary)
+        self.assertIn("系统代写总结", result.final_summary)
+
+    def test_closing_rounds_reject_probing_actions(self) -> None:
+        """收尾回合里模型要探测 → 拒绝执行，且不消耗真实工具调用。
+
+        判据是"工具没被执行"：FakeTools 记录收到的动作，
+        收尾回合里出现的 http_request 不应留下执行痕迹。
+        """
+        tools = FakeTools()
+        budget = Budget()
+        tools.budget = budget
+        result = agent.ReActAgent(
+            NeverFinishingLLM(), tools, max_steps=1, budget=budget
+        ).run("goal")
+        closing_steps = [s for s in result.steps if s.get("phase") == "closing"]
+        self.assertTrue(closing_steps, "应当存在收尾回合")
+        for step in closing_steps:
+            self.assertIn("收尾阶段不接受", step["observation"])
+        # 收尾回合里被拒的动作没有执行 → 工具调用数只来自正常步
+        self.assertEqual(budget.usage.tool_calls, 1)
+
+    def test_closing_round_saves_evidence_then_finishes(self) -> None:
+        """收尾回合应当能把产出固化下来（record_finding / record_coverage）。"""
+
+        class ClosingLLM:
+            """正常步一直探测；进入收尾后记录一条结论并 finish。"""
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages):
+                self.calls += 1
+                text = "\n".join(str(m.get("content", "")) for m in messages)
+                usage = SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+                if "收尾回合" in text:
+                    return json.dumps(
+                        {
+                            "action": "finish_task",
+                            "action_input": {"summary": "收尾回合内完成收尾"},
+                        }
+                    ), usage
+                return json.dumps(
+                    {"action": "think", "action_input": {"note": "继续探测"}}
+                ), usage
+
+        result = agent.ReActAgent(
+            ClosingLLM(), FakeTools(), max_steps=2, budget=Budget()
+        ).run("goal")
+        self.assertEqual(result.finish_reason, "finish")
+        self.assertTrue(result.closing["closed"])
+        self.assertEqual(result.closing["attempted"], 1)
+        self.assertEqual(result.final_summary, "收尾回合内完成收尾")
+
+    def test_provider_error_is_a_terminal_state_with_output_preserved(self) -> None:
+        """provider 故障必须形成明确终态，且**保住已记录的发现**。"""
+
+        class FlakyLLM:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages):
+                self.calls += 1
+                if self.calls >= 2:
+                    raise RuntimeError("provider down")
+                return json.dumps(
+                    {"action": "think", "action_input": {"note": "先想一想"}}
+                ), SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+
+        result = agent.ReActAgent(FlakyLLM(), FakeTools(), max_steps=5).run("goal")
+        self.assertEqual(result.finish_reason, "provider_error")
+        self.assertIn("provider down", result.final_summary)
+        # 中断前的步骤仍然在结果里（不是空壳）
+        self.assertTrue(result.steps)
+        self.assertEqual(result.steps[0]["action"], "think")
+
+    def test_closing_rounds_are_bounded(self) -> None:
+        """收尾回合**最多** MAX_CLOSING_ROUNDS 个——不能变成"再跑一轮"。"""
+        llm = NeverFinishingLLM()
+        result = agent.ReActAgent(llm, FakeTools(), max_steps=3, budget=Budget()).run("goal")
+        self.assertEqual(llm.calls, 3 + agent.MAX_CLOSING_ROUNDS)
+        self.assertLessEqual(result.closing["attempted"], agent.MAX_CLOSING_ROUNDS)
 
     def test_parse_failure_twice_stops(self) -> None:
         class GarbageLLM:

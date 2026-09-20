@@ -22,8 +22,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .agent import AgentResult, ReActAgent, extract_json
-from .budget import Budget
+from .agent import AgentResult, ReActAgent, extract_json, harvest_findings
+from .budget import Budget, TaskUsage
 from .dedupe import dedupe_findings
 from .llm import LLMClient
 from .memory import HostMemory, RunArtifacts, TaskLedger
@@ -41,20 +41,43 @@ MAX_TASKS = 6
 #: 并发子代理数上限（避免把目标与 LLM 配额一起打爆）。
 MAX_PARALLEL = 3
 
+#: 每个波次开始前至少要剩余的墙钟时间（秒）。低于这个值就不再开新波。
+#:
+#: 为什么需要（HANDOVER §10 第 4 条：**"运行时长无界"**）：覆盖率补扫最多两轮，
+#: 每轮还会跑端点补扫 + 参数补扫两波，实测一次运行能拖到 20 分钟。
+#: `MAX_SECONDS` 只在"工具调用之间"生效，管不住"要不要再开一波"。
+#: 这里在**每个波次边界**检查剩余时间，不够就不开新波——
+#: 已经开跑的波次不会被腰斩，但不会再有下一波。
+SWEEP_MIN_SECONDS = 45.0
+
 #: 子任务结束状态的展示文案。注意 "done" 只表示**正常收尾**：
-#: 撞到步数上限（max_steps）、被预算掐断（budget）、被监督器中止（supervisor_abort）
-#: 都单独成状态——它们的产出仍然有效，但"没做完"这件事必须如实呈现。
 OUTCOME_LABEL: dict[str, str] = {
     "pending": "待执行",
     "done": "已收尾",
     "max_steps": "未收尾（达到步数上限）",
+    "closing_no_finish": "已收尾（收尾回合内用受限动作固化产出）",
+    "closing_failed": "未收尾（收尾回合也未交总结）",
     "budget": "未收尾（预算用尽）",
     "supervisor_abort": "未收尾（重复动作被中止）",
     "stopped": "已中断（用户停止）",
     "parse_error": "未收尾（输出无法解析）",
+    "provider_error": "未收尾（模型调用失败）",
     "failed": "执行失败",
     "skipped": "跳过（预算/用户停止）",
 }
+
+#: 这些终态表示"子任务确实把活收口了"，产出可以当完整结论用。
+#: 其余状态一律按"未收尾"对待（产出仍有效，但报告要标注没做完）。
+CLOSED_OUTCOMES: frozenset[str] = frozenset({"done", "closing_no_finish"})
+
+#: 这些终态表示"子任务被外部原因打断"，要在覆盖记录里标 blocked。
+ABORTED_OUTCOMES: frozenset[str] = frozenset({"failed", "skipped"})
+
+#: 这些终态表示"步数/预算/模型原因没跑完"，覆盖记录里标 not_tested。
+INCOMPLETE_OUTCOMES: frozenset[str] = frozenset({
+    "max_steps", "closing_failed", "budget", "supervisor_abort",
+    "parse_error", "provider_error", "stopped",
+})
 
 
 @dataclass
@@ -83,6 +106,10 @@ class WorkerTask:
             "outcome_label": OUTCOME_LABEL.get(self.outcome, self.outcome),
             "error": self.error,
             "summary": (self.result.final_summary if self.result else ""),
+            # 收尾情况与本地用量：报告里要能回答"这个子任务是模型自己收的尾，
+            # 还是系统给了收尾回合才收的尾"，以及"它自己花了多少"。
+            "closing": (self.result.closing if self.result else {}),
+            "usage": (self.result.usage if self.result else {}),
         }
 
 
@@ -145,6 +172,8 @@ class TaskWorker:
         self.callbacks = callbacks or SwarmCallbacks()
         self.worker_id = worker_id or task.id
         self.sandbox = sandbox
+        #: 本任务自己的用量账本（并发下唯一正确的"这个任务花了多少"）。
+        self.task_usage = TaskUsage(label=task.id)
         self._recent_calls: list[str] = []
         self._warned = False
         self._step_notices: set[str] = set()
@@ -238,6 +267,7 @@ class TaskWorker:
             artifacts=self.artifacts,
             rate_limit=self.rate_limit,
             sandbox=self.sandbox,
+            task_usage=self.task_usage,
         )
         prior_exhausted = self.budget.exhausted_reason()
         # 监督器需要往对话里插话：用可变容器承接 ReActAgent 的消息列表引用。
@@ -271,15 +301,32 @@ class TaskWorker:
                 on_step=on_step,
                 on_usage=self.callbacks.on_usage,
                 should_stop=self.callbacks.should_stop,
+                task_usage=self.task_usage,
             )
         except StepAbort as exc:
             result = AgentResult(
                 steps=[],
-                findings=list(registry.findings),
+                findings=harvest_findings(registry),
                 final_summary=str(exc),
                 finish_reason="supervisor_abort",
                 surface=self.surface,
                 poc_paths=dict(registry.poc_paths),
+                usage=self.task_usage.to_dict(),
+            )
+        except Exception as exc:  # noqa: BLE001 最后一层兜底：任何未预期异常也要留下产出
+            # ReActAgent 内部已经把 provider 故障转成终态；走到这里说明是别的东西坏了
+            # （工具注册表构造、监督器回调…）。**仍然要保住已记录的证据**：
+            # 一份"任务失败但有 N 条发现"的报告，比一句"子任务失败"有用得多。
+            result = AgentResult(
+                findings=harvest_findings(registry),
+                final_summary=(
+                    f"子任务因未预期错误中断（{type(exc).__name__}: {exc}）。"
+                    "已保留中断前记录的证据与发现。"
+                ),
+                finish_reason="failed",
+                surface=self.surface,
+                poc_paths=dict(registry.poc_paths),
+                usage=self.task_usage.to_dict(),
             )
         # 把本子任务的 **T 编号证据** 带上：报告附录必须能按 finding 里引用的编号查到命令，
         # 否则"证据可复核"就是一句空话（早先附录用的是沙箱内部 X 编号，两边对不上）。
@@ -292,6 +339,22 @@ class TaskWorker:
 
 class StepAbort(RuntimeError):
     """子任务被监督器中止（重复动作过多）。"""
+
+
+def _outcome_for(result: AgentResult) -> str:
+    """把 `AgentResult.finish_reason` 映射成台账/报告里的终态。
+
+    `finish` 是模型自己交的总结；`closing_no_finish` 是"正常步数用尽，
+    但在受限收尾回合里把产出固化下来了"。两者都算**已收尾**——
+    区别只在报告里显示的文案（见 `OUTCOME_LABEL`），因为
+    "模型自己收的尾"和"系统给了两轮机会才收的尾"对读者是不同信息。
+    """
+    reason = str(result.finish_reason or "failed")
+    if reason == "finish":
+        return "done"
+    if reason == "closing_no_finish":
+        return "closing_no_finish"
+    return reason
 
 
 def _parse_plan(text: str, target: str, surface: AttackSurface, max_tasks: int) -> list[WorkerTask]:
@@ -568,6 +631,35 @@ class Orchestrator:
             return True
         return not self.budget.can_spend()
 
+    def _time_left(self) -> float | None:
+        """剩余墙钟时间（秒）；未设 `MAX_SECONDS` 时返回 None。"""
+        return self.budget.remaining_seconds()
+
+    def _may_start_wave(self, stage: str, *, need: float = SWEEP_MIN_SECONDS) -> bool:
+        """波次边界闸门：时间不够就别开新的一波。
+
+        只在**波次之间**判断，不打断已启动的波次——半途掐断会让子代理
+        来不及写结论，比"这一波根本没开始"更糟（产出全丢）。
+
+        每次拒绝都写进事件流，报告里能看出"为什么后面几波没跑"。
+        """
+        if self._stopped():
+            return False
+        left = self._time_left()
+        if left is None or left >= need:
+            return True
+        self._event(
+            kind="time_budget_stop",
+            stage=stage,
+            remaining=round(left, 1),
+            needed=need,
+            message=(
+                f"剩余时间 {left:.0f}s 不足以再开一波（{stage} 至少需要 {need:.0f}s），"
+                "已跳过该波次。报告里会如实标注哪些补扫没有执行。"
+            ),
+        )
+        return False
+
     # ---------- 规划 ----------
 
     def plan(self) -> list[WorkerTask]:
@@ -759,7 +851,6 @@ class Orchestrator:
         )
         if self.verbose:
             print(f"\n>>> [{task.id}] {task.role} ({self._llm_label(task.role)}): {task.objective}")
-        before = self.budget.usage.to_dict()
         role_llm = self._llm_for(task.role)
         worker = TaskWorker(
             role_llm,
@@ -782,22 +873,24 @@ class Orchestrator:
             # 子任务"跑完"不等于"跑好了"：被预算掐断、被监督器中止、
             # 或撞到步数上限仍未收尾的，都要如实标出来，否则调用方（CLI/GUI/报告）
             # 会把"达到最大步数仍未收尾"当成成功完成。
-            task.outcome = "done" if task.result.finish_reason == "finish" else task.result.finish_reason
+            task.outcome = _outcome_for(task.result)
         except Exception as exc:  # noqa: BLE001 单个子任务失败不影响整次运行
             task.outcome = "failed"
             task.error = f"{type(exc).__name__}: {exc}"
-        after = self.budget.usage.to_dict()
+        # 用量取自**任务自己的账本**，而不是"全局快照前后差值"：
+        # 并发时差值会把邻居的消耗算进来（实测一个 0 步任务的台账里出现过几万 token）。
+        usage = worker.task_usage
         self.ledger.update_usage(
             task.id,
             steps=task.result.steps_used if task.result else 0,
-            llm_calls=int(after["llm_calls"]) - int(before["llm_calls"]),
-            tool_calls=int(after["tool_calls"]) - int(before["tool_calls"]),
-            total_tokens=int(after["total_tokens"]) - int(before["total_tokens"]),
-            estimated_cost=float(after["estimated_cost"]) - float(before["estimated_cost"]),
+            llm_calls=usage.llm_calls,
+            tool_calls=usage.tool_calls,
+            total_tokens=usage.total_tokens,
+            estimated_cost=usage.estimated_cost,
         )
         self.ledger.finish(
             task.id,
-            status="done" if task.outcome == "done" else "failed",
+            status="done" if task.outcome in CLOSED_OUTCOMES else "failed",
             summary=task.result.final_summary if task.result else "",
             error=task.error,
         )
@@ -1156,7 +1249,7 @@ class Orchestrator:
             hit += result.cache_hit_tokens
             miss += result.cache_miss_tokens
             cost += result.estimated_cost
-            if result.finish_reason in ("budget", "supervisor_abort"):
+            if result.finish_reason in ("budget", "supervisor_abort", "provider_error"):
                 stop_reasons.append(f"{task.id}: {result.final_summary[:80]}")
         summaries = [
             f"[{task.id}/{task.role}] {task.result.final_summary}" if task.result and task.result.final_summary
@@ -1245,18 +1338,30 @@ class Orchestrator:
                 f"含参数 {','.join(endpoint.params[:4])}）",
             )
         for task in tasks:
-            if task.outcome in ("failed", "skipped"):
+            if task.outcome in ABORTED_OUTCOMES:
                 self.surface.record_coverage(
                     f"子任务 {task.id}（{task.role}）",
                     "blocked",
                     detail=(task.error or "预算/用户停止")[:150],
                 )
-            elif task.outcome == "max_steps":
+            elif task.outcome in INCOMPLETE_OUTCOMES:
                 # 未收尾 ≠ 没产出：把"活没干完"如实记进覆盖，而不是当成完成。
+                # 收尾回合也没交出总结的（closing_failed）与撞步数上限同样处理。
+                detail = {
+                    "max_steps": "达到步数上限仍未收尾，可能仍有未覆盖的目标",
+                    "closing_failed": (
+                        "达到步数上限，且受限收尾回合内未交出总结，可能仍有未覆盖的目标"
+                    ),
+                    "provider_error": "模型调用中断，未跑完",
+                    "parse_error": "模型输出无法解析，未跑完",
+                    "budget": "预算用尽，未跑完",
+                    "supervisor_abort": "重复动作被中止，未跑完",
+                    "stopped": "用户中断，未跑完",
+                }.get(task.outcome, "未跑完，可能仍有未覆盖的目标")
                 self.surface.record_coverage(
                     f"子任务 {task.id}（{task.role}）",
                     "not_tested",
-                    detail="达到步数上限仍未收尾，可能仍有未覆盖的目标",
+                    detail=detail,
                 )
 
     def run(self) -> AgentResult:
@@ -1276,7 +1381,7 @@ class Orchestrator:
         self._event(kind="wave", wave=1, count=len(tasks))
         done = self.run_wave(tasks, wave=1)
         # 侦察后再补一波：把侦察新发现的端点交给注入/认证角色。
-        if not self._stopped() and self.verify is not False:
+        if self._may_start_wave("第 2 波（侦察后跟进）") and self.verify is not False:
             follow_up = self._follow_up_tasks(done)
             if follow_up:
                 self._event(kind="wave", wave=2, count=len(follow_up))
@@ -1285,7 +1390,7 @@ class Orchestrator:
         # 放在补扫之前：这两类更依赖"看懂业务"，越晚派越容易被步数上限挤掉。
         # 注意：不受 `coverage_sweep` 开关控制——那个开关管的是"补扫没碰过的端点/参数"，
         # 与"这两类问题必须有人去打"是两回事（早先耦合在一起，关掉补扫就把它们一起关了）。
-        if not self._stopped():
+        if self._may_start_wave("特殊类别任务波"):
             special = self.special_class_tasks()
             if special:
                 self._event(
@@ -1299,14 +1404,20 @@ class Orchestrator:
                 done.extend(self.run_wave(special, wave=2))
         # 覆盖率补扫：未测端点/未攻击参数强制补上（这是报告可信度的前提）。
         # 最多两轮，且**只在确实缩小了盲区时**才继续——否则就是一个收敛不了的烧钱循环。
+        # 每一波**开始之前**都要过 `_may_start_wave`：允许的时长不是"开始后无限跑"，
+        # 而是"每一阶段都有资格入场的一次判定"。
         if not self._stopped() and self.coverage_sweep:
             for round_index in range(2):
+                if not self._may_start_wave(f"覆盖率补扫第 {round_index + 1} 轮"):
+                    break
                 sweep = self.coverage_sweep_tasks(round_index=round_index)
                 param_sweep = self.param_sweep_tasks(round_index=round_index)
                 if not sweep and not param_sweep:
                     break
                 before = self.coverage_gate()
                 if sweep:
+                    if not self._may_start_wave("端点补扫"):
+                        break
                     self._event(
                         kind="coverage_sweep",
                         message=(
@@ -1317,6 +1428,8 @@ class Orchestrator:
                     )
                     done.extend(self.run_wave(sweep, wave=3))
                 if param_sweep:
+                    if not self._may_start_wave("参数补扫"):
+                        break
                     self._event(
                         kind="param_sweep",
                         message=(
@@ -1334,7 +1447,7 @@ class Orchestrator:
                 # 有盲区但一点没缩小 → 再跑一轮只会重复烧钱，如实留在报告里
                 if not progressed or self._stopped():
                     break
-        if self.verify and not self._stopped():
+        if self.verify and self._may_start_wave("复核波"):
             verify_tasks = self.verification_tasks()
             if verify_tasks:
                 self._event(kind="wave", wave=5, count=len(verify_tasks))
@@ -1369,7 +1482,8 @@ class Orchestrator:
     def _follow_up_tasks(self, done: list[WorkerTask]) -> list[WorkerTask]:
         """侦察完成后，把新发现的高价值端点补成第二波任务。
 
-        注意：未收尾（max_steps）的子任务其**产出仍然有效**——只是没来得及说"我做完了"。
+        注意：未收尾的子任务（`closing_failed` / `budget` / `supervisor_abort` …）
+        其**产出仍然有效**——只是没来得及说"我做完了"。
         因此这里只看"哪些端点还没被注入/认证角色碰过"，不看子任务是否漂亮收尾。
         """
         already = {
