@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 from .agent import AgentResult
 from .butian import build_butian_entry
 from .diff import build_diff_from_memory, render_diff_markdown
+from .sanitize import sanitize_terminal_text
 
 
 def build_diff(result: AgentResult):
@@ -136,7 +137,13 @@ def _http_evidence_lines(label: str, block: str, collapse_chars: int = 5000) -> 
 
 
 def to_json(result: AgentResult, goal: str) -> dict:
-    """结构化 JSON 报告（含任务台账、覆盖矩阵与统计）。"""
+    """结构化 JSON 报告（含任务台账、覆盖矩阵与统计）。
+
+    工具证据的 `command` / `output` / `script` 也会清洗：JSON 里 `\\u001b` 虽然是
+    合法转义，但下游（GUI 展示、补天提交包、编辑器）拿到它就是乱码。
+    清洗发生在**副本**上，`result.tool_log` 本身保持原样——
+    调用方可能还要拿它做别的渲染，不该在这里产生副作用。
+    """
     findings = result.findings or []
     verified = [item for item in findings if item.get("status") != "candidate"]
     candidates = [item for item in findings if item.get("status") == "candidate"]
@@ -164,16 +171,74 @@ def to_json(result: AgentResult, goal: str) -> dict:
         "artifacts_dir": result.artifacts_dir,
         "poc_paths": result.poc_paths,
         "sandbox": result.sandbox,
-        "tool_log": result.tool_log,
+        "tool_log": [_clean_tool_entry(entry) for entry in (result.tool_log or [])],
         "surface_stats": surface.stats() if surface else {},
         "coverage": surface.coverage_summary() if surface else {},
         "coverage_detail": surface.coverage_lines(200) if surface else [],
         "coverage_gate": result.coverage_gate,
         "diff": diff.to_dict() if diff else None,
         "owasp_coverage": surface.covered_owasp() if surface else {},
-        "final_summary": result.final_summary,
-        "steps": result.steps,
+        "final_summary": _clean(result.final_summary),
+        "steps": [_clean_step(step) for step in (result.steps or [])],
     }
+
+
+#: 工具证据里需要清洗的字段（其余字段是数字/短标识，不需要动）。
+_TOOL_TEXT_FIELDS = ("command", "original_command", "output", "script", "stdout", "stderr")
+
+
+def _clean_tool_entry(entry: dict) -> dict:
+    """复制一条工具证据并清洗其文本字段。"""
+    if not isinstance(entry, dict):
+        return entry
+    cleaned = dict(entry)
+    for field in _TOOL_TEXT_FIELDS:
+        if field in cleaned and cleaned[field]:
+            cleaned[field] = sanitize_terminal_text(str(cleaned[field]))
+    return cleaned
+
+
+def _clean_step(step: dict) -> dict:
+    """复制一条执行轨迹并清洗其文本字段（思考/观察都是模型与工具产出的原文）。"""
+    if not isinstance(step, dict):
+        return step
+    cleaned = dict(step)
+    for field in ("thought", "observation"):
+        if cleaned.get(field):
+            cleaned[field] = sanitize_terminal_text(str(cleaned[field]))
+    return cleaned
+
+
+def _clean(text: object) -> str:
+    """报告里的自由文本统一清洗：剥掉终端控制序列并归一换行。
+
+    报告是给人读的。真工具输出里的 SGR 配色、`\\x1b[?1049h`、裸 `\\r`
+    在 Markdown 里只会变成乱码（HANDOVER §7 记录的已知缺陷）。
+    """
+    return sanitize_terminal_text(str(text or "")).strip()
+
+
+def _tool_output_lines(entry: dict, *, collapse_chars: int) -> list[str]:
+    """渲染一条工具输出；超长时折叠，但**字符数按清理后计**。
+
+    统计口径必须与显示内容一致：先清理再判断长度，否则控制序列会把
+    "3000 字符"的阈值提前触发，读者看到的实际内容比标称的少。
+    """
+    output = _clean(entry.get("output"))
+    if not output:
+        return []
+    if len(output) > collapse_chars:
+        return [
+            f"<details><summary>工具输出（{len(output)} 字符，点击展开）</summary>",
+            "",
+            "```",
+            output,
+            "```",
+            "",
+            "</details>",
+            "",
+        ]
+    return ["```", output, "```", ""]
 
 
 def _tool_command_block(entry: dict) -> list[str]:
@@ -181,10 +246,14 @@ def _tool_command_block(entry: dict) -> list[str]:
 
     自定义脚本（sandbox_script）走单独分支：读者要看的是**脚本本身**——
     并发怎么发的、伪造令牌怎么签的，光给一条 base64 启动命令等于没给证据。
+
+    文本一律经 `sanitize_terminal_text` 清洗：真工具的命令回显里可能带
+    ANSI/OSC 序列（sqlmap 的 `\\x1b[?1049h` 就出现在 stderr 里），
+    报告是给人读的，控制序列在 Markdown 里就是乱码。
     """
-    script = str(entry.get("script") or "")
-    command = str(entry.get("command") or "")
-    original = str(entry.get("original_command") or "")
+    script = sanitize_terminal_text(str(entry.get("script") or ""))
+    command = sanitize_terminal_text(str(entry.get("command") or ""))
+    original = sanitize_terminal_text(str(entry.get("original_command") or ""))
     if script:
         lines = ["```python", script.rstrip(), "```"]
         # 只有**确实发生过地址映射**时才加说明。脚本正文的第一行不是"原始目标"——
@@ -309,21 +378,7 @@ def _finding_section(finding: dict, goal: str, index: int) -> list[str]:
             if command:
                 lines += _tool_command_block(entry)
                 lines.append("")
-            output = str(entry.get("output") or "").strip()
-            if output:
-                if len(output) > 3000:
-                    lines += [
-                        f"<details><summary>工具输出（{len(output)} 字符，点击展开）</summary>",
-                        "",
-                        "```",
-                        output,
-                        "```",
-                        "",
-                        "</details>",
-                        "",
-                    ]
-                else:
-                    lines += ["```", output, "```", ""]
+            lines += _tool_output_lines(entry, collapse_chars=3000)
         lines += [
             "> 以上命令可在隔离执行环境（容器 / WSL）中直接重跑复现。",
             "",
@@ -545,21 +600,7 @@ def to_markdown(result: AgentResult, goal: str) -> str:
             if purpose and purpose not in ("sandbox_script", "raw"):
                 headline += f" · {_cell(purpose[:80])}"
             lines += [headline, "", *_tool_command_block(entry), ""]
-            output = str(entry.get("output") or "").strip()
-            if output:
-                if len(output) > 2000:
-                    lines += [
-                        f"<details><summary>输出（{len(output)} 字符，点击展开）</summary>",
-                        "",
-                        "```",
-                        output,
-                        "```",
-                        "",
-                        "</details>",
-                        "",
-                    ]
-                else:
-                    lines += ["```", output, "```", ""]
+            lines += _tool_output_lines(entry, collapse_chars=2000)
 
     lines += [
         "",

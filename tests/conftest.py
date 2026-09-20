@@ -28,7 +28,14 @@ import dotenv  # noqa: E402
 dotenv.load_dotenv = lambda *args, **kwargs: False  # type: ignore[assignment]
 
 # 2) 运行产物 + 工作目录都落到临时目录
-_TEST_ROOT = Path(tempfile.mkdtemp(prefix="hexhound-tests-"))
+#    受限沙箱（只允许写工作区、且禁止在新建的随机名目录里再建子目录）可以设
+#    HEXHOUND_TEST_ROOT 预先指定一个已存在的可写目录，默认行为不变（mkdtemp）。
+_override = os.environ.get("HEXHOUND_TEST_ROOT")
+if _override:
+    _TEST_ROOT = Path(_override)
+    _TEST_ROOT.mkdir(parents=True, exist_ok=True)
+else:
+    _TEST_ROOT = Path(tempfile.mkdtemp(prefix="hexhound-tests-"))
 os.environ.setdefault("HEXHOUND_HOME", str(_TEST_ROOT / "home"))
 (_TEST_ROOT / "cwd").mkdir(parents=True, exist_ok=True)
 os.chdir(_TEST_ROOT / "cwd")

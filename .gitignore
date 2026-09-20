@@ -43,6 +43,8 @@ vulnlab/app.db
 
 # 本地临时文件
 tmp_*.txt
+.pytest-tmp/
+.probe/
 
 # 系统 / 编辑器
 .DS_Store

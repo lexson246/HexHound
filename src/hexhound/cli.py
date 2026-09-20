@@ -23,6 +23,7 @@ from .console import (
     MARK_OK,
     MARK_SKIP,
     MARK_WARN,
+    console_text,
     enable_utf8_console,
 )
 from .providers import (
@@ -82,6 +83,36 @@ def main() -> None:
     """HexHound：AI 驱动的漏洞挖掘 Agent（侦察 → 探测 → 复核 → 记录）。"""
     # 中文 Windows 控制台默认 GBK：不切 UTF-8 的话，输出任何非 GBK 字符都会崩。
     enable_utf8_console()
+    _install_echo_sanitiser()
+
+
+_ECHO_PATCHED = False
+
+
+def _install_echo_sanitiser() -> None:
+    """让**所有** `click.echo` 输出在到达终端前清掉终端控制序列。
+
+    为什么要在这一层做（而不是在每个调用点）：真工具的原始输出会经过事件回调
+    （`on_step` / `on_event`）与 `result.output` 直接流到终端——sqlmap 的
+    `\\x1b[?1049h`、whatweb 的 SGR 配色、进度行的裸 `\\r` 全都在里面。
+    逐个调用点加清理一定会漏（cli.py 有 90 多处 echo），而漏掉的那一处
+    就是用户看到乱码的地方。
+
+    只做一次（`_ECHO_PATCHED`），并且保留原函数以便测试断言。
+    """
+    global _ECHO_PATCHED
+    if _ECHO_PATCHED:
+        return
+    original = click.echo
+
+    def sanitising_echo(message=None, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if isinstance(message, (str, bytes)):
+            text = message.decode("utf-8", "replace") if isinstance(message, bytes) else message
+            message = console_text(text)
+        return original(message, *args, **kwargs)
+
+    click.echo = sanitising_echo  # type: ignore[assignment]
+    _ECHO_PATCHED = True
 
 
 def _llm_label(client: Any) -> str:

@@ -12,10 +12,17 @@ encode character '\u2713'`——打包成 exe 后尤其明显，因为 exe 常�
 
 另外 CLI 输出统一改用 ASCII 标记（`[OK]` / `[!!]` / `--`），
 不依赖控制台字体是否有对应字形。
+
+**终端文本清理**在 `console_text()` 里统一做：工具输出（sqlmap 的 `\\x1b[?1049h`、
+whatweb 的 SGR 配色、进度行里的裸 `\\r`）会经事件回调流到终端，
+不清理就会看到乱码。清理逻辑与报告、模型上下文共用 `sanitize` 模块，
+保证"同一个工具输出在终端/报告/上下文里长得一样"。
 """
 from __future__ import annotations
 
 import sys
+
+from .sanitize import sanitize_terminal_text
 
 
 def enable_utf8_console() -> bool:
@@ -41,6 +48,18 @@ def enable_utf8_console() -> bool:
             except Exception:  # noqa: BLE001 流被重定向成不支持重配置的对象
                 pass
     return ok
+
+
+def console_text(value: object) -> str:
+    """把任意值转成**可以安全打进终端**的一行（多行也允许，只是会占多行）。
+
+    - 剥掉 ANSI/OSC 与其它控制序列（否则终端上就是乱码）；
+    - 归一 `\\r\\n` 与裸 `\\r`（进度行原地刷新会把它糊成一坨）；
+    - 去除首尾空白。
+
+    不截断：截断由调用方决定（每个地方的合理长度不同）。
+    """
+    return sanitize_terminal_text(str(value)).strip()
 
 
 #: CLI 里使用的纯 ASCII 状态标记（不依赖字体，也不会触发编码问题）。

@@ -39,6 +39,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from .sanitize import clip_head_tail, decode_output, sanitize_terminal_text
+
 # ---------------------------------------------------------------------------
 # 默认镜像：优先本地已有；没有就按顺序拉
 # ---------------------------------------------------------------------------
@@ -177,9 +179,19 @@ class ExecResult:
 
     @property
     def output(self) -> str:
-        """合并输出（给 LLM 看的文本）。"""
-        parts = [part for part in (self.stdout, self.stderr) if part and part.strip()]
-        return "\n".join(parts).strip()
+        """合并输出（给 LLM 看的文本）。
+
+        这里再清理一次而不是只在 `_execute` 里清：`ExecResult` 也会被
+        `build_image` / 安装路径等地方直接构造，出口统一清理才能保证
+        「进报告、进模型上下文」的文本一定是干净的（见 `sanitize.py`）。
+        已经是清理过的文本时这是幂等操作，代价可忽略。
+        """
+        parts = [
+            sanitize_terminal_text(part)
+            for part in (self.stdout, self.stderr)
+            if part and part.strip()
+        ]
+        return "\n".join(part for part in parts if part.strip()).strip()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -793,6 +805,10 @@ class Sandbox:
         duration = time.time() - started
         stdout, cut_out = _clip(proc.stdout or "")
         stderr, cut_err = _clip(proc.stderr or "")
+        # 先清理再落盘：报告与模型上下文里都不该出现 ANSI/OSC 控制序列与裸 \r
+        # （sqlmap 带 `\x1b[?1049h`，进度行用 `\r` 原地刷新，实测都会污染输出）。
+        stdout = sanitize_terminal_text(stdout)
+        stderr = sanitize_terminal_text(stderr)
         result = ExecResult(
             ok=proc.returncode == 0,
             command=command,
@@ -1356,7 +1372,32 @@ class Sandbox:
         return self.run(command, timeout=timeout)
 
     def whatweb(self, url: str, *, timeout: int = 180) -> ExecResult:
-        return self.run(f"whatweb -q --no-errors {_quote(url)}", timeout=timeout)
+        """技术栈指纹（whatweb）。
+
+        **不能用 `-q`**（实测踩过的静默失效，代价是这个工具一直是"有输出但没人看"）：
+
+            $ whatweb -q --no-errors http://127.0.0.1:5000/
+            (空输出, exit=0)          ← -q 连结果行一起吞掉
+
+            $ whatweb --no-errors --color=never http://127.0.0.1:5000/
+            http://127.0.0.1:5000/ [200 OK] HTML5, HTTPServer[Werkzeug/3.0.1 …], Title[…]
+
+        `--quiet/-q` 的官方说明是 "Do not display brief logging to STDOUT"，
+        但实际实现里 brief logging **就是**结果输出本身，于是 `-q` 把
+        "你要的结果"和"你不想要的日志"一起吞了。这里改用 `--no-errors`
+        （只压错误噪音）+ `--color=never`（不给结果加 SGR 配色）——
+        既拿到完整结果，又不必依赖下游清理 ANSI。
+        """
+        flags = "--no-errors --color=never"
+        timeout_flag = f"--open-timeout={self._whatweb_timeout(timeout)}"
+        return self.run(
+            f"whatweb {flags} {timeout_flag} {_quote(url)}", timeout=timeout
+        )
+
+    @staticmethod
+    def _whatweb_timeout(timeout: int) -> int:
+        """whatweb 的连接超时：不超过整体超时的一半，且至少 5 秒。"""
+        return max(5, min(15, int(max(1, timeout) // 2)))
 
     def curl(self, args: str, *, timeout: int = 120) -> ExecResult:
         """原始 HTTP（用于核对证据）。args 里必须带 URL。"""
@@ -1379,10 +1420,52 @@ class Sandbox:
             self._counter += 1
             return f"X{self._counter}"
 
+    @staticmethod
+    def _host_env() -> dict[str, str]:
+        """执行子进程时的环境变量：把「输出编码」这件事钉死。
+
+        为什么需要（实测踩过的坑）：
+
+        - `wsl.exe` 自 Windows 10 1903 起会**嗅探**宿主控制台代码页来决定输出编码：
+          在 GBK 控制台下回 UTF-16LE/GBK，在 UTF-8 控制台下回 UTF-8。同一个发行版
+          在同一台机器上"有时乱码有时正常"就是这么来的。官方开关是 `WSL_UTF8=1`，
+          它强制 wsl.exe 输出 UTF-8。
+        - 沙箱里的 Python 脚本（`sandbox_script`）若在 GBK locale 下 `print` 中文，
+          会直接 `UnicodeEncodeError` 让脚本中途崩掉——那会被误读成"脚本有问题"。
+          `PYTHONIOENCODING=utf-8` + `PYTHONUTF8=1` 把它关掉。
+        - `LANG` / `LC_ALL` 影响 coreutils 与部分工具的错误信息语言与编码。
+
+        这些变量对 docker/podman 后端同样无害，因此不分后端统一设置。
+        """
+        env = dict(os.environ)
+        env["WSL_UTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        env.setdefault("LANG", "C.UTF-8")
+        env.setdefault("LC_ALL", "C.UTF-8")
+        return env
+
     def _run_host(self, args: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            args, capture_output=True, text=True, timeout=timeout, check=False,
-            encoding="utf-8", errors="replace",
+        """执行宿主侧子进程，**按字节取输出**再自行解码。
+
+        为什么不用 `text=True, encoding="utf-8"`：那等于把"解码"交给
+        `subprocess` 的通用回退逻辑，遇到非法字节仍然会出现替换字符甚至乱码，
+        而且无法在 UTF-8 / UTF-16LE 之间做二次判断（`wsl.exe -l -q` 就是后者）。
+        这里 `capture_output` 拿原始字节，交给 `sanitize.decode_output` 处理：
+        非法字节安全替换，UTF-16LE 嗅探，永不抛异常。
+        """
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+            env=self._host_env(),
+        )
+        return subprocess.CompletedProcess(
+            args=proc.args,
+            returncode=proc.returncode,
+            stdout=decode_output(proc.stdout),
+            stderr=decode_output(proc.stderr),
         )
 
     def exec_log(self) -> list[dict[str, Any]]:
@@ -1422,15 +1505,12 @@ def _dedupe_sqlmap_flags(command: str) -> str:
 
 
 def _clip(text: str, limit: int = MAX_OUTPUT_CHARS) -> tuple[str, bool]:
-    """裁剪过长输出，保留头尾。"""
-    if len(text) <= limit:
-        return text, False
-    head = limit * 2 // 3
-    tail = limit - head
-    return (
-        text[:head] + f"\n…[输出过长，省略 {len(text) - limit} 字符]…\n" + text[-tail:],
-        True,
-    )
+    """裁剪过长输出，保留头尾。
+
+    实现委托给 `sanitize.clip_head_tail`——沙箱与报告两处必须用**同一套**裁剪
+    语义（省略提示的措辞也一样），否则同一份输出在两处会显示不同的"省略了多少"。
+    """
+    return clip_head_tail(str(text or ""), limit)
 
 
 def sandbox_report(sandbox: Sandbox | None) -> dict[str, Any]:

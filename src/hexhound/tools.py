@@ -33,6 +33,7 @@ import httpx
 from . import knowledge as KB
 from .dedupe import dedupe_key, vuln_class
 from .memory import RunArtifacts
+from .sanitize import sanitize_terminal_text
 from .screenshot import capture_url
 from .surface import (
     AttackSurface,
@@ -160,6 +161,10 @@ def _govern(name: str, result: Any) -> tuple[str, dict[str, Any]]:
     """工具输出治理：返回 (给 LLM 的文本, 结构化结果)。
 
     结构化结果保留完整数据（报告与统计用），文本按体积分档压缩。
+
+    **清理在裁剪之前**：先剥掉 ANSI/OSC 与裸 `\\r`，再判断体积。
+    顺序反了会导致"控制序列撑大了体积、真正的结论被截掉"——
+    真工具输出里塞满 SGR 配色时，这几十个字节足以把结论行挤出保留窗口。
     """
     if isinstance(result, dict) and "llm" in result:
         text = str(result.get("llm") or "")
@@ -167,6 +172,7 @@ def _govern(name: str, result: Any) -> tuple[str, dict[str, Any]]:
     else:
         text = str(result)
         structured = {"llm": text}
+    text = sanitize_terminal_text(text)
     if len(text) <= GOVERNOR_SMALL_LIMIT:
         return text, structured
     total = len(text)
@@ -2309,22 +2315,83 @@ def _web_fingerprint(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
         return "错误：需要 url（必须在白名单内）。"
     result = sandbox.whatweb(url, timeout=int(args.get("timeout") or 240))
     exchange_id = _record_tool_evidence(ctx, result, f"whatweb {url}")
-    output = result.output.strip()
+    # 只取 stdout：stderr 是环境噪音（实测 WSL 会打印 "localhost 代理未镜像" 警告），
+    # 早先拿 result.output（stdout+stderr 合并）去分段解析，结果被警告行截断，
+    # tech 里出现 `Werkzeug: 3.0.1]\n\nwsl: 检测到…` 这种垃圾值。
+    output = sanitize_terminal_text(result.stdout).strip()
     if not output:
-        return f"[{exchange_id}] whatweb 无输出。"
-    for chunk in output.split(",")[:12]:
-        chunk = chunk.strip()
-        if chunk and "]" in chunk:
-            try:
-                name, _, version = chunk.partition("[")
-                ctx.surface.add_tech(name.strip(), version.rstrip("]")[:40])
-            except Exception:  # noqa: BLE001 指纹解析失败不影响返回
-                pass
-    return (
-        f"[{exchange_id}] whatweb 指纹：\n{output[:2500]}\n\n"
-        "判定提示：识别出组件与版本后，比对已知 CVE 属于 A06（脆弱组件），"
+        # 空输出必须说清是"没扫到"还是"命令本身产出为空"。
+        # 实测教训：`whatweb -q` 连结果行一起吞掉，工具一直返回"无输出"，
+        # 而调用方看起来只是"这个目标没什么指纹"——静默失效。
+        if result.ok:
+            return (
+                f"[{exchange_id}] whatweb 退出码 0 但没有任何输出（可能是 `-q` 之类的"
+                "参数把结果一起吞掉了）。请检查 sandbox.whatweb 的参数组合。"
+            )
+        return f"[{exchange_id}] whatweb 执行失败：{result.error or '未知原因'}"
+    plugins = _parse_whatweb_plugins(output)
+    for name, version in plugins:
+        ctx.surface.add_tech(name, version)
+    lines = [f"[{exchange_id}] whatweb 指纹：", output[:2500]]
+    if plugins:
+        named = "、".join(f"{name}{f'/{v}' if v else ''}" for name, v in plugins[:12])
+        lines.append(f"\n已登记到技术栈面：{named}")
+    lines.append(
+        "\n判定提示：识别出组件与版本后，比对已知 CVE 属于 A06（脆弱组件），"
         "证据里要注明版本来源。"
     )
+    return "\n".join(lines)
+
+
+#: whatweb 里描述**目标本身**而非"组件"的插件名——它们不是技术栈，
+#: 登记进 tech 只会污染 A06 判断（`Country[RESERVED]` 不是"脆弱组件"）。
+_WHATWEB_NON_TECH = frozenset({
+    "country", "ip", "title", "script", "meta-author", "meta-generator",
+    "html5", "open-graph", "cookies", "redirectlocation", "uncommonheaders",
+    "email", "account", "password", "httpvary", "httpd", "x-powered-by",
+    "robots", "frameset", "frame", "object", "passwordfield", "comment",
+})
+
+#: whatweb 的单个插件段：`Name[value]`。名字只允许字母数字与 `-_.+`，
+#: 避免把结束括号之后的内容（换行、警告行）吃进来。
+_WHATWEB_PLUGIN_RE = re.compile(r"(?<![\w\-.])([A-Za-z][A-Za-z0-9\-_.+]{1,40})\[([^\]\n]*)\]")
+
+
+def _parse_whatweb_plugins(output: str) -> list[tuple[str, str]]:
+    """从 whatweb 输出里提取 `(组件名, 版本)`。
+
+    实测输出形态（本机 WSL，靶场在 127.0.0.1:5000）::
+
+        http://127.0.0.1:5000/ [200 OK] Country[RESERVED][ZZ], HTML5,
+        HTTPServer[Werkzeug/3.0.1 Python/3.12.3], IP[127.0.0.1],
+        Python[3.12.3], Script, Title[HexHound 靶场], Werkzeug[3.0.1]
+
+    要点：
+
+    1. **不能按 `,` 分段**：`Title[HexHound 靶场]` 里的标题本身可能含逗号，
+       而且早先的实现把 stdout+stderr 合并后分段，一条警告就能把分段吃歪
+       （tech 里因此出现过 `Werkzeug: 3.0.1]\\n\\nwsl: 检测到…`）。
+       这里用正则直接匹配 `Name[value]` 结构，与分段方式无关。
+    2. 跳过描述目标本身而非组件的插件（Country/IP/Title/Script…）。
+    3. `HTTPServer[Werkzeug/3.0.1 Python/3.12.3]` 这种"一个槽里塞多个组件"
+       的值不进 tech（值里带 `/` 或空格说明它是描述而非版本号），
+       但同名组件在别处会以 `Werkzeug[3.0.1]` 单独出现，那条才是我们想要的。
+    """
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw_name, raw_value in _WHATWEB_PLUGIN_RE.findall(str(output or "")):
+        name = raw_name.strip()
+        value = raw_value.strip()
+        if name.lower() in _WHATWEB_NON_TECH:
+            continue
+        if name.lower() in seen:
+            continue
+        if " " in value or "/" in value:
+            # 复合值（"Werkzeug/3.0.1 Python/3.12.3"）——不是干净的版本号，跳过。
+            continue
+        seen.add(name.lower())
+        found.append((name, value[:40]))
+    return found
 
 
 def _sandbox_status(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
