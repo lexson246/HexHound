@@ -79,11 +79,22 @@ _REDIRECT_STATUS = {301, 302, 303, 307, 308}
 # 「工具输出淹没上下文窗口」会直接吃掉后续推理能力（自述最痛的失败模式之一）。
 # 这里的分档与 PentAGI 一致：≤16KB 原样；>16KB 走摘要（无 LLM 时退化为硬截断）；
 # >32KB 头部 + 尾部保留中间省略；并给出继续读取的精确参数。
+#
+# 与 PentAGI 的区别（也是对标 Strix 的补强）：**被压缩掉的内容不丢**。
+# 超过 16 KiB 时整段原文进本运行的 spill store，模型拿到一个 opaque 句柄，
+# 可以用 `spill_read` 按 offset/limit 分页读回、或做字面量搜索。
+# PentAGI 只做"摘要或截断"，Strix 落盘但只能靠通用 shell 读回；
+# 这里两条都补上（见 spill.py 的说明）。
 GOVERNOR_SMALL_LIMIT = 16 * 1024
 GOVERNOR_HARD_LIMIT = 32 * 1024
 GOVERNOR_KEEP_HEAD = 12 * 1024
 GOVERNOR_KEEP_TAIL = 4 * 1024
 GOVERNOR_ARG_LIMIT = 1024
+
+#: 单条工具证据在报告/JSON 里内联保留的字符数；超出部分进溢写存储。
+#: 与 `GOVERNOR_SMALL_LIMIT`（给模型的正文上限）分开：证据是给**人**看的，
+#: 保留得比上下文多一点（12 KB 与 16 KB 同量级，够放完整 sqlmap 结论）。
+EVIDENCE_OUTPUT_CHARS = 12_000
 
 #: 连接阶段的超时上限（秒）。整体读超时仍由 REQUEST_TIMEOUT 控制，
 #: 但"连不上"这件事不该等满 REQUEST_TIMEOUT——被防火墙静默丢弃的端口会一直挂着。
@@ -157,7 +168,7 @@ def _truncate_args(args: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
-def _govern(name: str, result: Any) -> tuple[str, dict[str, Any]]:
+def _govern(name: str, result: Any, ctx: "ToolRegistry | None" = None) -> tuple[str, dict[str, Any]]:
     """工具输出治理：返回 (给 LLM 的文本, 结构化结果)。
 
     结构化结果保留完整数据（报告与统计用），文本按体积分档压缩。
@@ -165,6 +176,10 @@ def _govern(name: str, result: Any) -> tuple[str, dict[str, Any]]:
     **清理在裁剪之前**：先剥掉 ANSI/OSC 与裸 `\\r`，再判断体积。
     顺序反了会导致"控制序列撑大了体积、真正的结论被截掉"——
     真工具输出里塞满 SGR 配色时，这几十个字节足以把结论行挤出保留窗口。
+
+    **超过单次正文上限时把整段原文存进 spill store**，并在给模型的文本里
+    附上 opaque 句柄与读回方法。这样"上下文有界"与"证据不丢"同时成立：
+    模型想看的细节一定读得到，但不会因为一次 `read_urls` 就把上下文塞满。
     """
     if isinstance(result, dict) and "llm" in result:
         text = str(result.get("llm") or "")
@@ -175,7 +190,26 @@ def _govern(name: str, result: Any) -> tuple[str, dict[str, Any]]:
     text = sanitize_terminal_text(text)
     if len(text) <= GOVERNOR_SMALL_LIMIT:
         return text, structured
+
     total = len(text)
+    # 原文整段进溢写（存的是清理后的可读版本；原始大小与 sha256 记在元数据里）。
+    notice = ""
+    if ctx is not None:
+        entry = ctx.spill(text, label=name, reasons=["governor_compressed"])
+        if entry.stored_bytes:
+            notice = (
+                f"\n[完整输出已保存] 句柄 {entry.handle}"
+                f"（{entry.total_chars} 字符 / {entry.original_bytes} 字节，"
+                f"sha256 {entry.sha256[:16]}…）。\n"
+                f"  读回方式：spill_read(handle=\"{entry.handle}\", offset=0, limit=8000) "
+                "分页读取；或 spill_read(handle=..., search=\"关键字\") 做字面量搜索。\n"
+            )
+        elif entry.reasons and "run_quota_exceeded" in entry.reasons:
+            notice = (
+                "\n[注意] 本次运行的溢写配额已用尽，这段输出的完整内容**未保存**；"
+                "下面的摘要即全部可用内容。\n"
+            )
+
     if len(text) > GOVERNOR_HARD_LIMIT:
         excerpt = (
             text[:GOVERNOR_KEEP_HEAD]
@@ -195,7 +229,9 @@ def _govern(name: str, result: Any) -> tuple[str, dict[str, Any]]:
     elif name == "http_request":
         hint = "（提示：响应体过大，考虑只看关键字段或换更小的端点）"
     governed = (
-        f"[输出治理] {name} 返回 {total} 字符，已压缩为摘要（保留头尾，中间省略）{hint}\n"
+        f"[输出治理] {name} 返回 {total} 字符，已压缩为摘要（保留头尾，中间省略）{hint}"
+        + notice
+        + "\n"
         + excerpt
     )
     return governed, structured
@@ -2104,7 +2140,15 @@ def _sandbox_ready(ctx: "ToolRegistry", tool: str) -> tuple[Any, str]:
 
 
 def _record_tool_evidence(ctx: "ToolRegistry", result: Any, note: str) -> str:
-    """把一次工具执行记成证据，返回证据编号（可被 record_finding 引用）。"""
+    """把一次工具执行记成证据，返回证据编号（可被 record_finding 引用）。
+
+    **失败的、超时的、只有部分输出的执行同样记录**——它们恰恰是最需要回看的：
+    "sqlmap 为什么没跑出结果"通常只能从它的报错里看出来。
+
+    输出超过 `EVIDENCE_OUTPUT_CHARS` 时，整段原文进本任务的溢写存储，
+    证据里只留裁剪版 + 一个 `spill` 元数据块（含句柄、原始大小、sha256）。
+    这样报告不用塞进几百 KB，而"原始输出在哪、怎么读回来"仍然可查。
+    """
     if result is None:
         return ""
     exchange_id = ctx.new_evidence_id("T")
@@ -2119,6 +2163,15 @@ def _record_tool_evidence(ctx: "ToolRegistry", result: Any, note: str) -> str:
             if candidate and candidate[0].isalpha():
                 tool = candidate
                 break
+    output = sanitize_terminal_text(str(getattr(result, "output", "") or ""))
+    spill_meta: dict[str, Any] = {}
+    stored_output = output
+    if len(output) > EVIDENCE_OUTPUT_CHARS:
+        entry = ctx.spill(output, label=f"{exchange_id} {note}".strip())
+        spill_meta = entry.to_dict()
+        stored_output = output[:EVIDENCE_OUTPUT_CHARS]
+        if not entry.stored_bytes:
+            spill_meta["note"] = "溢写配额用尽，本段输出未保存完整版本"
     ctx.sandbox_log.append(
         {
             "id": exchange_id,
@@ -2134,7 +2187,12 @@ def _record_tool_evidence(ctx: "ToolRegistry", result: Any, note: str) -> str:
             "script": script,
             "exit_code": getattr(result, "exit_code", None),
             "ok": bool(getattr(result, "ok", False)),
-            "output": str(getattr(result, "output", "") or "")[:20000],
+            "output": stored_output,
+            # 完整输出的定位信息（含 sha256，便于确认"拿到的就是当时那段"）
+            "spill": spill_meta,
+            # 执行失败的原因（超时 / 作用域拒绝 / 退出码），报告里要能看见
+            "error": str(getattr(result, "error", "") or ""),
+            "truncated": bool(getattr(result, "truncated", False)) or bool(spill_meta),
             "note": note,
             "duration": round(float(getattr(result, "duration", 0.0) or 0.0), 2),
         }
@@ -2449,6 +2507,81 @@ def _raw_command(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     )
 
 
+def _spill_read(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+    """读回被输出治理压缩掉的那部分原文（按句柄，分页或字面量搜索）。
+
+    三种用法（`handle` 必填，来自工具输出里的 `[完整输出已保存] 句柄 SO-…`）：
+
+    - `handle` + `offset`/`limit`：分页读取（offset 以字符计）；
+    - `handle` + `search`：字面量搜索，返回命中行的行号与偏移；
+    - `handle` 单独给：返回该条输出的元数据与开头一段。
+
+    **只能读本 RUN 里由工具写入的内容**：入口只有句柄，没有路径参数，
+    所以这个工具无法被诱导去读任意文件（对比：给模型一个通用 shell 让它
+    `sed -n` 读溢写文件，同时也给了它读 `/etc/passwd` 的能力）。
+    """
+    handle = str(args.get("handle") or "").strip()
+    if not handle:
+        handles = ctx.spill_store().handles()
+        if not handles:
+            return (
+                "错误：需要 handle。当前这次运行里还没有任何输出被压缩保存"
+                "（只有超过 16 KiB 的工具输出才会生成句柄）。"
+            )
+        listing = "、".join(handles[:10])
+        return f"错误：需要 handle。本次运行已保存的句柄：{listing}"
+
+    search = str(args.get("search") or "")
+    if search:
+        outcome = ctx.spill_store().search(handle, search, limit=int(args.get("limit") or 50))
+        if not outcome.get("ok"):
+            return f"错误：{outcome.get('error')}"
+        hits = outcome.get("hits") or []
+        head = (
+            f"[{handle}] 字面量搜索 {search!r}：命中 {len(hits)} 处"
+            + ("（已达上限，只显示前 50 处）" if outcome.get("truncated") else "")
+            + f"（原文共 {outcome.get('total_chars', 0)} 字符）"
+        )
+        if not hits:
+            return head + "\n（没有匹配。注意是**字面量**匹配，不是正则。）"
+        lines = [head]
+        for item in hits[:50]:
+            lines.append(
+                f"  line {item['line']} @ offset {item['offset']}: {item['text']}"
+            )
+        lines.append(
+            f"\n要继续看命中处的上下文，用 spill_read(handle=\"{handle}\", "
+            f"offset=<命中偏移 - 200>, limit=1000)。"
+        )
+        return "\n".join(lines)
+
+    result = ctx.spill_store().read(
+        handle, offset=int(args.get("offset") or 0), limit=int(args.get("limit") or 0)
+    )
+    if not result.ok:
+        return f"错误：{result.error}"
+    meta = result.metadata
+    lines = [
+        f"[{handle}] {meta.get('label') or '工具输出'} · "
+        f"原文 {meta.get('original_size')} 字节 / {result.total_chars} 字符"
+        + ("（本条超单条上限，已截断保存）" if meta.get("truncated") else "")
+        + f" · sha256 {str(meta.get('sha256') or '')[:16]}…",
+        f"本次返回字符 [{result.start}, {result.end})"
+        + (f"，后面还有 {result.total_chars - result.end} 字符" if result.has_more else "（已到末尾）"),
+    ]
+    if result.has_more:
+        lines.append(
+            f"继续读：spill_read(handle=\"{handle}\", offset={result.end}, limit={MAX_SPILL_PAGE})"
+        )
+    lines.append("")
+    lines.append(result.text)
+    return "\n".join(lines)
+
+
+#: `spill_read` 的默认分页大小（提示里给出的值，与 spill.MAX_READ_CHARS 一致）。
+MAX_SPILL_PAGE = 8000
+
+
 def _sandbox_script(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     """在沙箱里跑一段自定义 Python 脚本（用于并发竞态 / 多步状态机 / 密文分析）。
 
@@ -2660,6 +2793,14 @@ _DESC_CAPTURE_SCREENSHOT = (
     "对白名单内的目标 URL 截图并保存为证据。参数：{\"url\": 完整URL, \"label\": 截图说明(可选)}。"
     "返回截图编号 [Sn]，record_finding 可用 screenshot_ref 引用。"
 )
+_DESC_SPILL_READ = (
+    "读回被输出治理压缩掉的**完整工具输出**。参数：{\"handle\": \"SO-…（必填）\", "
+    "\"offset\": 起始字符位置(默认0), \"limit\": 读取字符数(默认8000，上限16384), "
+    "\"search\": 字面量搜索串(可选，给了就按搜索模式)}。"
+    "当某个工具的输出被压缩时，返回文本里会给出 `[完整输出已保存] 句柄 SO-…`，"
+    "用那个句柄读回即可。**只能读本次运行里保存过的输出**（没有路径参数，"
+    "不能读任意文件，也不能跨运行读）。搜索是字面量匹配，不是正则。"
+)
 _DESC_DYNAMIC_CRAWL = (
     "用无头浏览器真实执行页面并抓取渲染后 HTML、截图与网络请求（需 playwright）。"
     "参数：{\"url\": 页面URL, \"wait_ms\": 等待毫秒(默认2500), \"execute_js\": 要执行的JS(可选), "
@@ -2673,6 +2814,11 @@ _DESC_DYNAMIC_CRAWL = (
 #
 # 真工具（沙箱）按角色下发：侦察者拿指纹/端口/目录爆破，注入者拿 sqlmap/nuclei，
 # 复核者可以重跑工具确认（这是"复核"最强的形式）。
+#: 每个角色都能用的"读回被压缩掉的输出"工具。
+#: 输出治理是所有角色都会遇到的（侦察读 JS、注入跑 sqlmap、复核重跑工具都
+#: 可能产生大输出），所以它不属于任何专用角色，而是共享基础设施。
+_SPILL_TOOL = ("spill_read",)
+
 ROLE_TOOLS: dict[str, tuple[str, ...]] = {
     "recon": (
         "http_request", "compare_responses", "crawl", "discover_endpoints",
@@ -2682,7 +2828,7 @@ ROLE_TOOLS: dict[str, tuple[str, ...]] = {
         # 真工具
         "port_scan", "web_fingerprint", "dir_bruteforce", "template_scan",
         "sandbox_status", "raw_command",
-    ),
+    ) + _SPILL_TOOL,
     "injection": (
         "http_request", "compare_responses", "fuzz_params", "read_urls",
         "record_finding", "think", "leave_note", "record_coverage",
@@ -2691,7 +2837,7 @@ ROLE_TOOLS: dict[str, tuple[str, ...]] = {
         "sqlmap_scan", "template_scan", "raw_command", "sandbox_status",
         # 自定义脚本：竞态（并发窗口）与密文分析只能靠脚本表达
         "sandbox_script",
-    ),
+    ) + _SPILL_TOOL,
     "auth": (
         "http_request", "compare_responses", "auth_test", "check_default_creds",
         "use_account", "record_finding", "think", "leave_note", "record_coverage",
@@ -2700,7 +2846,7 @@ ROLE_TOOLS: dict[str, tuple[str, ...]] = {
         "sqlmap_scan", "port_scan", "sandbox_status", "raw_command",
         # 自定义脚本：会话/令牌伪造、多步状态机重放
         "sandbox_script",
-    ),
+    ) + _SPILL_TOOL,
     "verify": (
         "http_request", "compare_responses", "review_candidates", "record_finding",
         "capture_screenshot", "think", "leave_note", "record_coverage",
@@ -2709,13 +2855,13 @@ ROLE_TOOLS: dict[str, tuple[str, ...]] = {
         "sqlmap_scan", "template_scan", "raw_command", "sandbox_status",
         # 竞态类结论必须能复跑同一段并发脚本才算复核
         "sandbox_script",
-    ),
+    ) + _SPILL_TOOL,
     "source": (
         "list_files", "read_file", "search_code", "http_request", "compare_responses",
         "record_finding", "think", "leave_note", "record_coverage",
         "task_create", "task_list", "task_update", "capture_screenshot", "finish_task",
         "sandbox_status", "raw_command",
-    ),
+    ) + _SPILL_TOOL,
 }
 
 #: 依赖沙箱的工具（沙箱不可用时这些不下发，避免模型反复调用拿到"不可用"）
@@ -2784,6 +2930,8 @@ class ToolRegistry:
         #: 请求指纹 → 证据编号（识别重复请求，避免重发同一个请求）
         self.request_cache: dict[str, str] = {}
         self.request_cache_hits = 0
+        #: 本任务的溢写存储（懒创建；见 `spill_store`）。
+        self._spill: Any = None
         from .budget import Budget
 
         self.budget = budget if budget is not None else Budget()
@@ -2821,6 +2969,32 @@ class ToolRegistry:
             if wait > 0:
                 time.sleep(min(wait, 5.0))
             self._last_request = time.time()
+
+    # ---------- 溢写存储（超长工具输出）----------
+
+    def spill_store(self) -> Any:
+        """取本任务的溢写存储（懒创建，线程安全）。
+
+        每个 **worker** 一个存储：`run_dir` 相同但 worker_id 不同的两个任务
+        各自记账，句柄不会互相碰撞，"跨任务读取"也无从发生——
+        一个任务拿不到另一个任务的句柄（句柄是 128 位随机串，且只在
+        自己注册表的字典里查得到）。
+        """
+        with self._lock:
+            if self._spill is None:
+                from .spill import make_store
+
+                directory = None
+                if self.artifacts is not None and getattr(self.artifacts, "enabled", False):
+                    directory = Path(self.artifacts.dir) / "spill"
+                self._spill = make_store(
+                    label=self.worker_id, directory=directory, persist=directory is not None
+                )
+            return self._spill
+
+    def spill(self, content: str, *, label: str = "", reasons: list[str] | None = None) -> Any:
+        """把一段输出存进本任务的溢写存储，返回 `SpillEntry`。"""
+        return self.spill_store().store(content, label=label, reasons=reasons)
 
     # ---------- 工具注册 ----------
 
@@ -2865,6 +3039,8 @@ class ToolRegistry:
         add("raw_command", _DESC_RAW_COMMAND, lambda a: _raw_command(self, a))
         add("sandbox_script", _DESC_SANDBOX_SCRIPT, lambda a: _sandbox_script(self, a))
         add("sandbox_status", _DESC_SANDBOX_STATUS, lambda a: _sandbox_status(self, a))
+        # --- 输出治理配套：读回被压缩掉的原文 ---
+        add("spill_read", _DESC_SPILL_READ, lambda a: _spill_read(self, a))
 
         if self.role in ROLE_TOOLS:
             allowed = set(ROLE_TOOLS[self.role])
@@ -3014,7 +3190,7 @@ class ToolRegistry:
             result = tool.func(_truncate_args(action_input))
         except Exception as exc:  # noqa: BLE001 工具层兜底：任何异常都转成字符串喂回 agent
             return f"工具执行出错：{type(exc).__name__}: {exc}"
-        text, structured = _govern(name, result)
+        text, structured = _govern(name, result, self)
         if structured is not result:
             self.last_result = structured
         return text

@@ -184,7 +184,7 @@ def to_json(result: AgentResult, goal: str) -> dict:
 
 
 #: 工具证据里需要清洗的字段（其余字段是数字/短标识，不需要动）。
-_TOOL_TEXT_FIELDS = ("command", "original_command", "output", "script", "stdout", "stderr")
+_TOOL_TEXT_FIELDS = ("command", "original_command", "output", "script", "stdout", "stderr", "error")
 
 
 def _clean_tool_entry(entry: dict) -> dict:
@@ -223,12 +223,28 @@ def _tool_output_lines(entry: dict, *, collapse_chars: int) -> list[str]:
 
     统计口径必须与显示内容一致：先清理再判断长度，否则控制序列会把
     "3000 字符"的阈值提前触发，读者看到的实际内容比标称的少。
+
+    有溢写记录时额外给一行"完整输出去哪了"——句柄、原始大小、sha256。
+    否则读者看到被截断的输出会以为那就是全部（这正是 spill 要解决的问题）。
     """
+    lines: list[str] = []
+    spill = entry.get("spill") or {}
+    if spill:
+        handle = str(spill.get("handle") or "")
+        lines.append(
+            f"> **完整输出已保存**：`{handle}` · 原文 {spill.get('original_size', 0)} 字节 / "
+            f"{spill.get('total_chars', 0)} 字符 · {spill.get('lines', 0)} 行 · "
+            f"sha256 `{str(spill.get('sha256') or '')[:16]}…`"
+            + ("（**本条超单条上限，保存的是头尾**）" if spill.get("truncated") else "")
+        )
+        if spill.get("note"):
+            lines.append(f"> ⚠ {spill['note']}")
+        lines.append("")
     output = _clean(entry.get("output"))
     if not output:
-        return []
+        return lines
     if len(output) > collapse_chars:
-        return [
+        lines += [
             f"<details><summary>工具输出（{len(output)} 字符，点击展开）</summary>",
             "",
             "```",
@@ -238,7 +254,9 @@ def _tool_output_lines(entry: dict, *, collapse_chars: int) -> list[str]:
             "</details>",
             "",
         ]
-    return ["```", output, "```", ""]
+    else:
+        lines += ["```", output, "```", ""]
+    return lines
 
 
 def _tool_command_block(entry: dict) -> list[str]:
