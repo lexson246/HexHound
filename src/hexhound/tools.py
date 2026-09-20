@@ -150,12 +150,23 @@ def _summarize_args(action_input: dict[str, Any], limit: int = 400) -> str:
 
 def _validate_url(ctx: "ToolRegistry", url: str) -> tuple[Any, str | None]:
     """校验 URL 的主机白名单与协议，返回 (parsed, 错误信息)。"""
+    return validate_url_against(url, ctx.allowed_hosts)
+
+
+def validate_url_against(url: str, allowed_hosts: Any) -> tuple[Any, str | None]:
+    """`_validate_url` 的**无上下文**版本：只按给定的白名单校验。
+
+    为什么单独抽一个：API 规范导入（`apispec.load_spec_source` / 远程 `$ref`）
+    需要在**没有工具注册表**的地方做同一套校验。复制一份判断逻辑迟早会漂移
+    （一处改了另一处忘），所以两边共用这一个实现——
+    "规范 URL 与目标请求走同一份范围校验"必须是真的同一份。
+    """
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     if not host:
         return parsed, f"错误：无法从 URL 解析主机：{url}"
-    if host not in ctx.allowed_hosts:
-        allowed = ", ".join(sorted(ctx.allowed_hosts))
+    if host not in allowed_hosts:
+        allowed = ", ".join(sorted(allowed_hosts))
         return parsed, f"拒绝：主机 {host!r} 不在白名单（{allowed}）内，已阻止该请求。"
     if parsed.scheme not in ("http", "https"):
         return parsed, f"拒绝：不支持的协议 {parsed.scheme!r}。"

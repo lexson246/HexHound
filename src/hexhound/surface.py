@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import parse_qsl, urlparse, urlunparse
 
+from .apispec import Operation, SpecImport, build_operation_url  # noqa: F401
+
 SEVERITIES = ("critical", "high", "medium", "low", "info")
 SEVERITY_RANK = {name: index for index, name in enumerate(SEVERITIES)}
 
@@ -213,6 +215,12 @@ class AttackSurface:
         # 记录「测过什么、结论是什么」，让报告能说清覆盖到哪、哪里没覆盖。
         self.coverage: dict[str, dict[str, Any]] = {}
         self.agent_notes: list[dict[str, Any]] = []
+        # API 合约导入（OpenAPI/Swagger）：记录导入了哪些接口、每个接口声明了
+        # 哪些参数。用途有两层——提示词里给出"该测什么"，覆盖率闸门据此形成
+        # **参数级**盲区清单（导入但不测，报告里必须看得见）。
+        self.api_specs: list[dict[str, Any]] = []
+        self.api_spec_endpoints: set[str] = set()
+        self.api_spec_params: list[tuple[str, str]] = []
         self.started_at = time.time()
 
     # ---------- 覆盖率 / 笔记 ----------
@@ -330,6 +338,90 @@ class AttackSurface:
             self.add_endpoint(url, source=source)
         with self._lock:
             return len(self.endpoints) - before
+
+    def add_api_spec(self, spec_import: Any) -> dict[str, Any]:
+        """把一个 API 合约导入（`apispec.SpecImport`）登记进攻击面。
+
+        为什么必须进攻面（而不是只放进提示词）：注册了才算"待覆盖"，
+        覆盖率闸门才会**强制**有人去测这些接口。只写进提示词的话，
+        模型可以整份忽略，而报告里的覆盖率数字完全不体现——
+        "导入了 80 个接口，一个都没测"会看起来和"没导入"一样。
+
+        三件事：
+        1. 每个 operation 登记成端点（带 method 与参数名），来源标 `api_spec`；
+        2. 参数按位置记进 `api_params`（覆盖闸门据此形成**参数级**盲区清单）；
+        3. 记 spec 元信息（版本、规范声明的 servers、被跳过的条目）供报告使用。
+
+        **不把接口标记为"已测试"**：导入的是"应该测什么"，不是"已经测过"。
+        """
+        registered: list[str] = []
+        param_pairs: list[tuple[str, str]] = []
+        operations_registered = 0
+        for operation in getattr(spec_import, "operations", []) or []:
+            try:
+                url = build_operation_url(
+                    str(getattr(spec_import, "target", "") or ""),
+                    str(getattr(operation, "normalized_path", "") or operation.path),
+                )
+            except Exception:  # noqa: BLE001 单条接口构造失败不该让整次导入失败
+                continue
+            names = [
+                str(item.get("name"))
+                for item in (getattr(operation, "params", None) or [])
+                if isinstance(item, dict) and item.get("name")
+            ]
+            key = self.add_endpoint(
+                url,
+                methods=[str(getattr(operation, "method", "GET"))],
+                params=names,
+                source="api_spec",
+                note=str(getattr(operation, "summary", "") or "")[:120],
+            )
+            if key is None:
+                continue
+            registered.append(key)
+            operations_registered += 1
+            for name in names:
+                param_pairs.append((key, name))
+            # 接口文档已经给出了方法/参数，对"表单"这一层也登记一份，
+            # 让 injection 角色知道该按表单还是按 JSON 体发请求。
+            if getattr(operation, "has_body", False) and names:
+                self.add_form(key, str(getattr(operation, "method", "POST")), key, names)
+
+        with self._lock:
+            self.api_specs.append(dict(spec_import.to_dict()))
+            existing = set(self.api_spec_params)
+            for pair in param_pairs:
+                if pair not in existing:
+                    self.api_spec_params.append(pair)
+                    existing.add(pair)
+            self.api_spec_endpoints.update(registered)
+        self.add_note(
+            f"已从 API 规范导入 {operations_registered} 个接口"
+            f"（{getattr(spec_import, 'kind', None) and spec_import.kind.label or '未知格式'}，"
+            f"来源 {getattr(spec_import, 'source', '')}）——"
+            "这些接口已进入覆盖率闸门，必须有结论（finding 或 record_coverage）。"
+        )
+        return {
+            # 两个数字含义不同，都要给：同一路径的不同方法算"一个端点、多个接口"。
+            "operations": operations_registered,
+            "endpoints": len(set(registered)),
+            "params": len(param_pairs),
+            "skipped": len(getattr(spec_import, "skipped", []) or []),
+        }
+
+    def api_spec_summary(self) -> dict[str, Any]:
+        """API 规范导入的汇总（报告里单独一节）。"""
+        with self._lock:
+            imports = list(self.api_specs)
+            endpoints = sorted(self.api_spec_endpoints)
+            params = list(self.api_spec_params)
+        return {
+            "imports": imports,
+            "endpoints": len(endpoints),
+            "params": len(params),
+            "endpoint_sample": endpoints[:20],
+        }
 
     def add_form(
         self, url: str, method: str, action: str, inputs: Iterable[str], base_url: str = ""
@@ -784,6 +876,9 @@ class AttackSurface:
                 "agent_notes": list(self.agent_notes),
                 "candidates": [item.to_dict() | {"dedupe_key": item.dedupe_key} for item in self.candidates.values()],
                 "findings": [item.to_dict() | {"dedupe_key": item.dedupe_key} for item in self.findings],
+                "api_specs": list(self.api_specs),
+                "api_spec_endpoints": sorted(self.api_spec_endpoints),
+                "api_spec_params": [list(pair) for pair in self.api_spec_params],
                 "stats": self.stats(),
             }
 
@@ -856,6 +951,16 @@ class AttackSurface:
             surface.candidates[str(item.get("id") or surface.next_finding_id())] = _finding_from_dict(
                 item, default_status="candidate"
             )
+        # API 合约导入元信息（不重新解析规范——离线重渲染不该依赖原始规范文件）
+        surface.api_specs = [item for item in (raw.get("api_specs") or []) if isinstance(item, dict)]
+        surface.api_spec_endpoints = {
+            str(item) for item in (raw.get("api_spec_endpoints") or []) if item
+        }
+        surface.api_spec_params = [
+            (str(item[0]), str(item[1]))
+            for item in (raw.get("api_spec_params") or [])
+            if isinstance(item, (list, tuple)) and len(item) == 2
+        ]
         return surface
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用

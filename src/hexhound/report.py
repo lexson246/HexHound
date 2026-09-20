@@ -487,6 +487,46 @@ def to_markdown(result: AgentResult, goal: str) -> str:
     if diff is not None and not diff.is_empty():
         lines += render_diff_markdown(diff)
 
+    # API 合约导入单独成节：读者必须能看出"这次带了接口清单",
+    # 以及"规范里声明的 servers 被忽略了"——否则会以为接口是爬出来的。
+    api_summary = surface.api_spec_summary() if surface is not None else {}
+    if api_summary.get("imports"):
+        lines += ["## API 合约导入", ""]
+        for entry in api_summary["imports"]:
+            lines.append(
+                f"- **{entry.get('spec_label') or '未知格式'}**"
+                f"｜标题：{entry.get('title') or '（未命名）'}"
+                f"｜来源：`{entry.get('source')}`"
+                f"｜接口：{entry.get('operations')} 个"
+            )
+            if entry.get("security_schemes"):
+                lines.append(
+                    "  - 规范声明的认证方案：" + "、".join(entry["security_schemes"][:10])
+                )
+            if entry.get("declared_servers"):
+                lines.append(
+                    "  - ⚠ 规范里声明了 servers/host（"
+                    + "、".join(f"`{item}`" for item in entry["declared_servers"][:5])
+                    + "）——**这些值已被忽略**。所有接口都锚定到本次的 `--target`，"
+                    "规范不能扩大授权范围。"
+                )
+            for note in entry.get("notes") or []:
+                # servers/basePath 的说明上面已经渲染过一份（带实际值），
+                # 这里跳过同义重复，避免报告里同一件事说两遍。
+                if "已被忽略" in note:
+                    continue
+                lines.append(f"  - {note}")
+            if entry.get("skipped"):
+                lines.append(f"  - ⚠ 有 {len(entry['skipped'])} 条没能导入：")
+                lines += [f"    - {item}" for item in entry["skipped"][:10]]
+        lines += [
+            "",
+            f"导入的接口共 **{api_summary.get('endpoints', 0)}** 个端点、"
+            f"**{api_summary.get('params', 0)}** 个已声明参数，"
+            "已进入覆盖率闸门（导入 ≠ 已测试；未形成结论的会出现在下面的覆盖盲区里）。",
+            "",
+        ]
+
     if result.tasks:
         lines += ["## 子任务台账", "", "| 任务 | 角色 | 目标 | 状态 | 总结 |", "| --- | --- | --- | --- | --- |"]
         for task in result.tasks:

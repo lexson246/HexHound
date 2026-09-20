@@ -227,6 +227,8 @@ def _run_audit(
     use_sandbox: bool = True,
     map_loopback: bool = False,
     coverage_sweep: bool = True,
+    api_spec: str | None = None,
+    api_spec_remote_refs: bool = False,
 ) -> int:
     """审计的公共入口，被 audit 命令与 setup 向导复用。返回退出码。"""
     try:
@@ -307,6 +309,53 @@ def _run_audit(
             sandbox = None
     artifacts = RunArtifacts(target)
     surface = AttackSurface(target=target, mode=mode, path=artifacts.surface_path)
+
+    # ---- API 合约导入（OpenAPI 3 / Swagger 2）----
+    # 位置很关键：**在规划之前**导入。接口必须先进入攻面，规划者才看得到
+    # "有哪些接口要测"，覆盖率闸门也才会把它们算成待覆盖目标。
+    api_import = None
+    if api_spec:
+        from .apispec import RefPolicy, SpecError, import_spec, load_spec_source
+
+        def _validate_spec_remote(url: str) -> str:
+            """远程 $ref / 远程规范的校验：复用目标请求的**同一个**实现。"""
+            from .tools import validate_url_against
+
+            _parsed, err = validate_url_against(url, config.allowed_hosts)
+            return err or ""
+
+        try:
+            spec_text, spec_source, spec_root = load_spec_source(
+                api_spec,
+                allowed_hosts=config.allowed_hosts,
+                validate_url=_validate_spec_remote,
+            )
+            api_import = import_spec(
+                text=spec_text,
+                source=spec_source,
+                target=target,
+                policy=RefPolicy(
+                    root=spec_root,
+                    allow_remote=api_spec_remote_refs,
+                    validate_remote=_validate_spec_remote,
+                ),
+            )
+        except SpecError as exc:
+            # 解析失败必须给出可操作错误，**不能静默跳过**——
+            # 否则用户会以为"接口导进去了"，实际一个都没测。
+            raise click.ClickException(f"API 规范导入失败：{exc}") from exc
+        registered = surface.add_api_spec(api_import)
+        click.echo(
+            f"API 合约导入：{api_import.kind.label} · {registered['endpoints']} 个接口 / "
+            f"{registered['params']} 个已声明参数（来源 {api_import.source}）"
+        )
+        for note in api_import.notes:
+            click.echo(f"  {note}")
+        if api_import.skipped:
+            click.echo(f"  {MARK_WARN} 有 {len(api_import.skipped)} 条没能导入：")
+            for item in api_import.skipped[:5]:
+                click.echo(f"    - {item}")
+
     workers = parallel or MAX_PARALLEL
 
     def on_event(event: dict) -> None:
@@ -542,6 +591,19 @@ def _run_audit(
     help="收尾前对从未被触碰的端点做强制补扫（消除报告盲区；关掉更快但可能漏测）",
 )
 @click.option(
+    "--api-spec",
+    "api_spec",
+    default=None,
+    metavar="PATH_OR_URL",
+    help="导入 API 合约（OpenAPI 3 / Swagger 2 的 JSON 或 YAML，本地文件或已授权 URL）；"
+    "接口会锚定到 --target 并进入覆盖率闸门（规范里的 servers/host 一律忽略）",
+)
+@click.option(
+    "--api-spec-remote-refs",
+    is_flag=True,
+    help="允许规范里的远程 $ref（默认禁止；开启后每个远程引用仍要过 ALLOWED_HOSTS 校验）",
+)
+@click.option(
     "--fail-on",
     type=click.Choice(["critical", "high", "medium", "low", "info"], case_sensitive=False),
     default=None,
@@ -570,6 +632,8 @@ def audit(
     use_sandbox: bool,
     map_loopback: bool,
     coverage_sweep: bool,
+    api_spec: str | None,
+    api_spec_remote_refs: bool,
     output: str,
     verbose: bool,
 ) -> None:
@@ -597,6 +661,8 @@ def audit(
         use_sandbox=use_sandbox,
         map_loopback=map_loopback,
         coverage_sweep=coverage_sweep,
+        api_spec=api_spec,
+        api_spec_remote_refs=api_spec_remote_refs,
     )
     if code:
         raise SystemExit(code)

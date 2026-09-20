@@ -740,10 +740,12 @@ class Orchestrator:
         memory_brief = self.memory.briefing(6) if self.memory else ""
         sandbox_brief = self._sandbox_brief_for_planner()
         history_brief = self._history_brief_for_planner()
+        api_brief = self._api_spec_brief_for_planner()
         user = (
             f"<engagement>\n目标：{self.target}\n模式：{self.mode}（黑盒）\n任务总目标：{self.goal}\n</engagement>\n\n"
             f"<known_attack_surface>\n{brief}\n</known_attack_surface>\n\n"
             + (f"<long_term_memory>\n{memory_brief}\n</long_term_memory>\n\n" if memory_brief else "")
+            + (api_brief + "\n\n" if api_brief else "")
             + (history_brief + "\n\n" if history_brief else "")
             + (sandbox_brief + "\n\n" if sandbox_brief else "")
             + f"<constraints>\n最多 {self.max_tasks} 个任务；每个任务 4–20 步；"
@@ -843,6 +845,60 @@ class Orchestrator:
             "任务目标里写明工具名，执行者才会真的用它。\n"
             "</real_tools_available>"
         )
+
+    def _api_spec_brief_for_planner(self) -> str:
+        """把导入的 API 合约清单喂给规划者。
+
+        为什么要单独一段（而不是靠攻面简报）：攻面简报是"已发现的东西"的长列表，
+        API 规范给的是**权威的接口清单**——方法、参数、认证要求都写在里面。
+        规划者看不到这段，就不会为"规范里那 40 个没碰过的接口"安排任务，
+        导入也就白导了。
+        """
+        summary = getattr(self.surface, "api_spec_summary", None)
+        if not callable(summary):
+            return ""
+        info = summary()
+        imports = info.get("imports") or []
+        if not imports:
+            return ""
+        lines = ["<api_contract>"]
+        for entry in imports:
+            lines.append(
+                f"已导入 API 规范：{entry.get('spec_label') or '未知格式'}"
+                f"（来源 {entry.get('source')}）"
+                f"，标题《{entry.get('title') or '未命名'}》"
+                f"，共 {entry.get('operations')} 个接口。"
+            )
+            if entry.get("declared_servers"):
+                lines.append(
+                    "  规范里声明的 servers/host 已被**忽略**："
+                    "所有接口都锚定到本次的 target，规范不能扩大授权范围。"
+                )
+            if entry.get("security_schemes"):
+                lines.append(
+                    "  规范声明的认证方案：" + "、".join(entry["security_schemes"][:8])
+                )
+            if entry.get("skipped"):
+                lines.append(
+                    f"  ⚠ 有 {len(entry['skipped'])} 条没能导入（解析/安全策略拒绝），"
+                    "报告里会列出原因。"
+                )
+        lines.append(
+            f"这些接口已进入共享攻面（{info.get('endpoints', 0)} 个端点 / "
+            f"{info.get('params', 0)} 个已声明参数），**全部算覆盖率闸门的待测目标**："
+            "每个接口最终必须有结论（record_finding 或 record_coverage）。"
+        )
+        lines.append(
+            "规划要求：把**规范里声明了参数的接口**安排给 injection（参数级测试），"
+            "把声明了认证要求的接口安排给 auth（越权/未授权），"
+            "不要只依赖爬虫发现的端点——规范给出的接口列表比爬取结果更完整。"
+        )
+        sample = info.get("endpoint_sample") or []
+        if sample:
+            lines.append("接口样例：")
+            lines += [f"  - {url}" for url in sample[:15]]
+        lines.append("</api_contract>")
+        return "\n".join(lines)
 
     def _refine_plan(self, tasks: list[WorkerTask]) -> list[WorkerTask]:
         """对计划做确定性偏置：有带参端点却没安排注入任务时补一个（并指定 sqlmap）。
