@@ -31,6 +31,7 @@ from .prompts import ROLE_PROMPTS
 from .sandbox import sandbox_report
 from .surface import AttackSurface, normalize_endpoint, sort_urls
 from .tools import ToolRegistry
+from .trace import TraceRecorder, summarize_trace, write_snapshot
 
 VALID_ROLES = ("recon", "injection", "auth", "verify", "source")
 
@@ -157,6 +158,7 @@ class TaskWorker:
         callbacks: SwarmCallbacks | None = None,
         worker_id: str = "",
         sandbox: Any = None,
+        trace: Any = None,
     ) -> None:
         self.llm = llm
         self.task = task
@@ -172,6 +174,8 @@ class TaskWorker:
         self.callbacks = callbacks or SwarmCallbacks()
         self.worker_id = worker_id or task.id
         self.sandbox = sandbox
+        #: 运行级 trace（由编排器持有并注入；None = 走单代理/离线，不需要）。
+        self.trace = trace
         #: 本任务自己的用量账本（并发下唯一正确的"这个任务花了多少"）。
         self.task_usage = TaskUsage(label=task.id)
         self._recent_calls: list[str] = []
@@ -268,6 +272,7 @@ class TaskWorker:
             rate_limit=self.rate_limit,
             sandbox=self.sandbox,
             task_usage=self.task_usage,
+            trace=self.trace,
         )
         prior_exhausted = self.budget.exhausted_reason()
         # 监督器需要往对话里插话：用可变容器承接 ReActAgent 的消息列表引用。
@@ -294,6 +299,8 @@ class TaskWorker:
             if self.callbacks.on_step is not None:
                 self.callbacks.on_step(enriched)
             self._supervise(enriched, conversation["messages"])
+            if self.trace is not None:
+                self.trace.record_step(enriched, task=self.task.id, role=self.task.role)
 
         try:
             result = agent.run(
@@ -331,10 +338,33 @@ class TaskWorker:
         # 把本子任务的 **T 编号证据** 带上：报告附录必须能按 finding 里引用的编号查到命令，
         # 否则"证据可复核"就是一句空话（早先附录用的是沙箱内部 X 编号，两边对不上）。
         result.tool_log = list(registry.sandbox_log)
+        if self.trace is not None:
+            self._trace_tool_calls(result.tool_log)
+            for finding in result.findings:
+                self.trace.record_finding(finding, task=self.task.id)
         current = self.budget.exhausted_reason()
         if current and current != prior_exhausted:
             result.finish_reason = "budget"
         return result
+
+    def _trace_tool_calls(self, tool_log: list[dict[str, Any]]) -> None:
+        """把真工具调用写进 trace（参数摘要 + 状态 + 证据编号 + 溢写句柄）。"""
+        if self.trace is None:
+            return
+        for entry in tool_log:
+            spill = entry.get("spill") or {}
+            self.trace.record_tool_call(
+                task=self.task.id,
+                evidence_id=str(entry.get("id") or ""),
+                tool=str(entry.get("tool") or ""),
+                command=str(entry.get("command") or ""),
+                ok=bool(entry.get("ok")),
+                exit_code=entry.get("exit_code"),
+                duration=float(entry.get("duration") or 0.0),
+                output_chars=len(str(entry.get("output") or "")),
+                spill_handle=str(spill.get("handle") or ""),
+                error=str(entry.get("error") or ""),
+            )
 
 
 class StepAbort(RuntimeError):
@@ -579,6 +609,18 @@ class Orchestrator:
         self.verify = verify
         self.ledger = TaskLedger()
         self.events: list[dict[str, Any]] = []
+        #: 可离线审计的运行轨迹（trace.jsonl）。落在运行产物目录里，
+        #: 追加写、逐条 flush——运行被中断时"已经发生的事"仍然读得到。
+        trace_path = (
+            (self.artifacts.dir / "trace.jsonl") if self.artifacts.enabled else None
+        )
+        self.trace = TraceRecorder(
+            trace_path,
+            enabled=self.artifacts.enabled,
+            target=target,
+            goal=goal,
+            mode=mode,
+        )
         #: 本次运行开始前，跨运行记忆里已有的 findings（用于跨运行 diff）
         self.previous_findings: list[dict[str, Any]] = []
         self.previous_run_at: str = ""
@@ -625,6 +667,16 @@ class Orchestrator:
         with self._lock:
             self.events.append({"at": len(self.events), **payload})
         self.callbacks.emit(**payload)
+        # 编排层事件（计划/波次/任务起止/补扫/时间闸门）同样进 trace：
+        # 离线审计要回答的不只是"调了什么工具"，还有"为什么后来又开了一波"。
+        if self.trace is not None:
+            kind = str(payload.get("kind") or "event")
+            task = str((payload.get("task") or {}).get("id") or "") if isinstance(
+                payload.get("task"), dict
+            ) else ""
+            self.trace.record(f"orchestrator_{kind}", task=task, **{
+                key: value for key, value in payload.items() if key not in ("kind", "task")
+            })
 
     def _stopped(self) -> bool:
         if self.callbacks.should_stop is not None and self.callbacks.should_stop():
@@ -867,6 +919,7 @@ class Orchestrator:
             callbacks=self.callbacks,
             worker_id=self._next_worker_id(),
             sandbox=self.sandbox,
+            trace=self.trace,
         )
         try:
             task.result = worker.run()
@@ -1299,6 +1352,9 @@ class Orchestrator:
             coverage_gate=self.coverage_gate(),
             previous_findings=self.previous_findings,
             previous_run_at=self.previous_run_at,
+            trace_summary=(
+                summarize_trace(self.trace.events()) if self.trace is not None else {}
+            ),
         )
 
     def _finalise_coverage(self, findings: list[dict[str, Any]], tasks: list[WorkerTask]) -> None:
@@ -1455,6 +1511,10 @@ class Orchestrator:
         result = self._aggregate(done)
         self.artifacts.save_surface(self.surface)
         self.artifacts.save_ledger(self.ledger)
+        # 覆盖率收口事件进 trace：离线审计要能看出"最后关闸时还剩多少盲区"。
+        if self.trace is not None:
+            self.trace.record_coverage("__run__", "finished", detail=str(result.coverage_gate))
+            self.trace.record_budget(self.budget.snapshot())
         self.artifacts.save_summary(
             {
                 "target": self.target,
@@ -1467,8 +1527,29 @@ class Orchestrator:
                 "coverage": self.surface.coverage_summary(),
                 "usage": self.budget.snapshot(),
                 "deduped": result.deduped,
+                # 离线审计：报告重建快照 + trace 摘要（对象引用同一个 trace 文件）
+                "trace": {
+                    **self.trace.status(),
+                    "digest": self.trace.digest(),
+                    "summary": summarize_trace(self.trace.events()),
+                },
             }
         )
+        # 报告重建快照：`hexhound report --run <dir>` 以后从这里恢复，
+        # 而不是只拿 surface.json + tasks.json 拼一个缺了大半字段的 AgentResult。
+        snapshot_path = write_snapshot(
+            self.artifacts.dir,
+            result,
+            goal=self.goal,
+            target=self.target,
+            mode=self.mode,
+            budget=self.budget.snapshot(),
+            trace_digest=self.trace.digest(),
+            trace_events=len(self.trace.events()),
+            run_dir_name=self.artifacts.dir.name,
+        )
+        if snapshot_path is not None:
+            result.artifacts_dir = str(self.artifacts.dir)
         if self.memory is not None:
             self.memory.record_run(
                 tech=dict(self.surface.tech),

@@ -180,6 +180,8 @@ def to_json(result: AgentResult, goal: str) -> dict:
         "owasp_coverage": surface.covered_owasp() if surface else {},
         "final_summary": _clean(result.final_summary),
         "steps": [_clean_step(step) for step in (result.steps or [])],
+        # 可审计轨迹摘要（本体在 run 目录的 trace.jsonl 里）
+        "trace_summary": dict(result.trace_summary or {}),
     }
 
 
@@ -495,6 +497,65 @@ def to_markdown(result: AgentResult, goal: str) -> str:
                 f"| {_cell(str(task.get('summary') or task.get('error') or '')[:80])} |"
             )
         lines.append("")
+        # 收尾方式单独说明：`closing_no_finish` 是"系统给了受限收尾回合才收的尾"，
+        # 与"模型自己交的总结"含义不同，读者需要能区分（否则会高估模型的自律程度）。
+        assisted = [
+            task for task in result.tasks
+            if str(task.get("outcome")) == "closing_no_finish"
+        ]
+        if assisted:
+            lines += [
+                f"> 其中 {len(assisted)} 个子任务（"
+                + "、".join(str(task.get("id")) for task in assisted)
+                + "）在正常步数用尽后，由**受限收尾回合**固化产出并代写了总结；"
+                "它们的结论与其它任务同样有效，但日志中未主动收尾这一点如实保留。",
+                "",
+            ]
+
+    # 可审计轨迹：回答"这次运行到底发生了什么"，而不是只有结论。
+    # 轨迹本体在 run 目录的 trace.jsonl 里；这里放摘要与定位信息。
+    trace = result.trace_summary or {}
+    if trace:
+        lines += ["## 运行轨迹（可离线审计）", ""]
+        lines.append(
+            f"- 事件总数：**{trace.get('events', 0)}**"
+            f"｜schema v{trace.get('schema_version', 0)}"
+            f"｜子任务：{len(trace.get('tasks') or [])} 个"
+        )
+        kinds = trace.get("kinds") or {}
+        if kinds:
+            lines.append(
+                "- 事件构成：" + "、".join(f"{name}×{count}" for name, count in sorted(kinds.items()))
+            )
+        tools = trace.get("tools") or {}
+        if tools:
+            # 措辞要准确：这里是**所有**工具调用（含内置 HTTP 工具与沙箱真工具），
+            # 早先写成"真工具调用"会让人以为 sqlmap/nmap 跑了这么多次。
+            lines.append(
+                "- 工具调用（含内置探测工具）："
+                + "、".join(f"{name}×{count}" for name, count in tools.items())
+            )
+        actions = trace.get("actions") or {}
+        if actions:
+            lines.append(
+                "- 动作分布：" + "、".join(f"{name}×{count}" for name, count in actions.items())
+            )
+        if result.artifacts_dir:
+            lines.append(
+                f"- 轨迹文件：`{result.artifacts_dir}/trace.jsonl`"
+                "（每行一个事件，含模型步骤、工具调用、参数摘要、证据引用；"
+                "敏感字段已掩码）"
+            )
+            lines.append(
+                f"- 重建快照：`{result.artifacts_dir}/snapshot.json`"
+                "（`hexhound report --run <目录>` 从这里离线重渲染，不访问目标、不调用模型）"
+            )
+        lines += [
+            "",
+            "> 轨迹只记录**摘要**（观察截断、命令截断），完整原文在工具证据与溢写存储里，"
+            "按编号/句柄回查。这样做是为了让轨迹本身足够小、可以长期保留。",
+            "",
+        ]
 
     lines += ["## 已复核漏洞", ""]
     if not verified:

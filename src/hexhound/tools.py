@@ -125,6 +125,29 @@ def _resolve_within(base: Path, sub: str) -> Path | None:
     return candidate
 
 
+def _spill_prefix() -> str:
+    """溢写句柄前缀（延迟读，避免模块级循环依赖）。"""
+    from .spill import HANDLE_PREFIX
+
+    return HANDLE_PREFIX
+
+
+def _summarize_args(action_input: dict[str, Any], limit: int = 400) -> str:
+    """把工具参数压成一行摘要，用于 trace（不是给模型看的，是给审计看的）。
+
+    用 `json.dumps(..., sort_keys=True)` 而不是 `str(dict)`：
+    前者在同一次运行的两次相同调用之间产生**完全一致**的字符串，
+    于是"模型是不是在用同样的参数重复调用"这件事可以直接比对。
+    """
+    try:
+        text = json.dumps(action_input, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        text = str(action_input)
+    if len(text) > limit:
+        return text[:limit] + f"…(共 {len(text)} 字符)"
+    return text
+
+
 def _validate_url(ctx: "ToolRegistry", url: str) -> tuple[Any, str | None]:
     """校验 URL 的主机白名单与协议，返回 (parsed, 错误信息)。"""
     parsed = urlparse(url)
@@ -2898,6 +2921,7 @@ class ToolRegistry:
         rate_limit: float = 0.0,
         sandbox: Any = None,
         task_usage: Any = None,
+        trace: Any = None,
     ) -> None:
         self.base_dir = Path(base_dir).resolve()
         self.allowed_hosts = allowed_hosts
@@ -2937,6 +2961,15 @@ class ToolRegistry:
         self.budget = budget if budget is not None else Budget()
         #: 本任务自己的用量账本（并发下由任务自己累计，见 budget.TaskUsage）。
         self.task_usage = task_usage
+        #: 可审计轨迹（trace.TraceRecorder）；None = 不记录。
+        #:
+        #: 为什么在**注册表**这一层记而不是在沙箱层记：沙箱工具（sqlmap/nmap…）
+        #: 有自己的证据记录路径，但内置 HTTP 工具（http_request / fuzz_params /
+        #: crawl / auth_test…）才是绝大多数请求的来源，它们**没有**经过沙箱。
+        #: 早先 trace 只记沙箱工具，于是"工具调用"事件在纯 HTTP 运行里是空的——
+        #: 一份没有工具调用的审计轨迹，等于什么都没审计。
+        #: 在 execute() 里统一记，两个来源都覆盖到，且天然带时长与成败。
+        self.trace = trace
         self._tools: dict[str, Tool] = {}
         self._register_defaults()
 
@@ -3173,6 +3206,10 @@ class ToolRegistry:
         在同一把锁里）。早先的 `can_spend()` + 事后 `add_tool_call()` 是两步，
         N 个并发 worker 能一起穿过检查、一起记账，于是 `--max-tool-calls`
         会被超出（经典 TOCTOU）。
+
+        每次成功执行都会写一条 trace 的 `tool_call` 事件（名称、参数摘要、
+        时长、成败、输出大小、错误、溢写句柄）。**"拒绝执行"不写**——
+        没有发生的事不该出现在轨迹里。
         """
         tool = self._tools.get(name)
         if tool is None:
@@ -3186,11 +3223,49 @@ class ToolRegistry:
                 f"错误：预算已用尽，本次 {name} 调用未执行（{reason}）。"
                 "请立刻用 finish_task 交回已有结论，不要再发起新的工具调用。"
             )
+        started = time.time()
+        error = ""
         try:
             result = tool.func(_truncate_args(action_input))
         except Exception as exc:  # noqa: BLE001 工具层兜底：任何异常都转成字符串喂回 agent
-            return f"工具执行出错：{type(exc).__name__}: {exc}"
+            error = f"{type(exc).__name__}: {exc}"
+            self._trace_tool(name, action_input, started, output="", error=error)
+            return f"工具执行出错：{error}"
         text, structured = _govern(name, result, self)
         if structured is not result:
             self.last_result = structured
+        self._trace_tool(name, action_input, started, output=text)
         return text
+
+    def _trace_tool(
+        self,
+        name: str,
+        action_input: dict[str, Any],
+        started: float,
+        *,
+        output: str = "",
+        error: str = "",
+    ) -> None:
+        """把一次工具调用写进 trace（参数摘要 + 时长 + 结果规模 + 成败）。"""
+        if self.trace is None:
+            return
+        try:
+            handle = ""
+            # 输出里若出现溢写句柄，一并记下来——审计时能直接顺着句柄找完整原文。
+            match = re.search(rf"{_spill_prefix()}[0-9a-f]{{32}}", str(output or ""))
+            if match:
+                handle = match.group(0)
+            self.trace.record_tool_call(
+                task=self.worker_id,
+                evidence_id="",  # 内置工具的证据编号在工具自己的返回值里（R/T 编号）
+                tool=name,
+                command=_summarize_args(action_input),
+                ok=not error,
+                exit_code=None if not error else -1,
+                duration=time.time() - started,
+                output_chars=len(str(output or "")),
+                spill_handle=handle,
+                error=error,
+            )
+        except Exception:  # noqa: BLE001 记录轨迹失败不该影响工具调用
+            pass

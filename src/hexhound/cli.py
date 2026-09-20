@@ -630,6 +630,12 @@ def _load_env_file() -> dict[str, str]:
 @click.option("--exclude", multiple=True, help="从报告中剔除指定编号（可重复，如 --exclude HH-002）")
 @click.option("--output", default="reports/report.md", show_default=True, help="报告输出路径")
 @click.option("--json-out", default="", help="同时输出 JSON 报告（可选）")
+@click.option("--trace", "show_trace", is_flag=True, help="同时打印本次运行的可审计轨迹摘要")
+@click.option(
+    "--trace-out",
+    default="",
+    help="把轨迹事件导出成 JSON（可选；用于外部审计工具）",
+)
 def report_cmd(
     run_dir: str,
     target: str,
@@ -637,14 +643,23 @@ def report_cmd(
     exclude: tuple[str, ...],
     output: str,
     json_out: str,
+    show_trace: bool,
+    trace_out: str,
 ) -> None:
-    """离线重渲染报告：读取已保存的攻面快照，不发起任何请求、不调用 LLM。
+    """离线重渲染报告：读取已保存的运行快照，**不发起任何请求、不调用 LLM**。
 
-    用途：人工复核候选后，把确认的候选提升（--promote）、把误报剔除（--exclude），
-    再生成最终交付报告。
+    用途：
+    1. 人工复核候选后，把确认的候选提升（--promote）、把误报剔除（--exclude），
+       再生成最终交付报告；
+    2. 事后审计：从 `snapshot.json` + `trace.jsonl` 还原"当时到底发生了什么"。
+
+    数据来源优先级：`snapshot.json`（v0.6 起，字段最全）→
+    `surface.json` + `tasks.json`（旧格式，轨迹与工具证据不可用，报告里会写明）。
+    **两条路径都不碰网络、不调模型**——这是"可离线审计"的定义。
     """
     from .agent import AgentResult
     from .report import to_json  # 局部导入避免顶层循环依赖
+    from .trace import legacy_snapshot, load_trace, restore_run, summarize_trace
 
     path = _resolve_run_dir(run_dir, target)
     if path is None:
@@ -652,11 +667,69 @@ def report_cmd(
             "找不到运行产物目录。请用 --run 指定 ~/.hexhound/runs/<目录名>，"
             "或先跑一次 audit。"
         )
-    surface_file = path / "surface.json"
-    if not surface_file.exists():
-        raise click.ClickException(f"{path} 里没有 surface.json（该次运行可能未落盘攻面）。")
 
-    surface = AttackSurface.load(surface_file, target=target, mode="blackbox")
+    restored = restore_run(path)
+    for warning in restored.warnings:
+        click.echo(f"{MARK_WARN} {warning}", err=True)
+
+    if restored.ok:
+        snapshot = restored.payload
+        surface_file = path / "surface.json"
+        surface = (
+            AttackSurface.load(surface_file, target=target, mode="blackbox")
+            if surface_file.exists()
+            else AttackSurface(target=target, mode="blackbox")
+        )
+        result = AgentResult.from_snapshot(snapshot.get("result") or {}, surface=surface)
+        goal = str(snapshot.get("goal") or f"离线重渲染自 {path.name}")
+        budget_snapshot = snapshot.get("budget") or {}
+    else:
+        # 旧格式回退：只有 surface + tasks + run 三个文件。
+        surface_file = path / "surface.json"
+        if not surface_file.exists():
+            raise click.ClickException(
+                f"{path} 里既没有 snapshot.json 也没有 surface.json，无法重建报告。"
+            )
+        surface = AttackSurface.load(surface_file, target=target, mode="blackbox")
+        tasks: list[dict] = []
+        ledger_file = path / "tasks.json"
+        if ledger_file.exists():
+            try:
+                tasks = [
+                    {
+                        "id": record.get("task_id"),
+                        "role": record.get("role"),
+                        "objective": record.get("objective"),
+                        "outcome": record.get("status"),
+                        "summary": record.get("summary"),
+                        "error": record.get("error"),
+                    }
+                    for record in (
+                        json.loads(ledger_file.read_text(encoding="utf-8")).get("tasks") or []
+                    )
+                ]
+            except (OSError, json.JSONDecodeError):
+                tasks = []
+        run_summary: dict = {}
+        summary_file = path / "run.json"
+        if summary_file.exists():
+            try:
+                run_summary = json.loads(summary_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                run_summary = {}
+        goal = f"离线重渲染自 {path.name}"
+        snapshot = legacy_snapshot(
+            surface=surface,
+            tasks=tasks,
+            run_summary=run_summary,
+            target=target,
+            goal=goal,
+            mode=str(run_summary.get("mode") or "blackbox"),
+        )
+        result = AgentResult.from_snapshot(snapshot.get("result") or {}, surface=surface)
+        budget_snapshot = {}
+
+    # ---- 人工复核（仍然只改内存里的 surface / findings，不碰目标）----
     promoted: list[str] = []
     for ref in promote:
         candidate = surface.claim_candidate(ref)
@@ -677,34 +750,12 @@ def report_cmd(
             else:
                 kept.append(finding)
         findings = kept
+    result.findings = findings
 
-    tasks: list[dict] = []
-    ledger_file = path / "tasks.json"
-    if ledger_file.exists():
-        try:
-            tasks = [
-                {
-                    "id": record.get("task_id"),
-                    "role": record.get("role"),
-                    "objective": record.get("objective"),
-                    "outcome": record.get("status"),
-                    "summary": record.get("summary"),
-                    "error": record.get("error"),
-                }
-                for record in (json.loads(ledger_file.read_text(encoding="utf-8")).get("tasks") or [])
-            ]
-        except (OSError, json.JSONDecodeError):
-            tasks = []
+    events = load_trace(path / "trace.jsonl")
+    if events:
+        result.trace_summary = summarize_trace(events)
 
-    goal = f"离线重渲染自 {path.name}"
-    result = AgentResult(
-        findings=findings,
-        surface=surface,
-        tasks=tasks,
-        final_summary="（离线重渲染：未重新执行任何探测）",
-        finish_reason="offline",
-        artifacts_dir=str(path),
-    )
     output_path = Path(output)
     if not output_path.is_absolute():
         output_path = PROJECT_ROOT / output_path
@@ -714,19 +765,50 @@ def report_cmd(
         if not json_path.is_absolute():
             json_path = PROJECT_ROOT / json_path
         json_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = to_json(result, goal)
+        payload["offline"] = {
+            "restored_from": restored.source,
+            "run_dir": str(path),
+            "trace_events": len(events),
+            "budget": budget_snapshot,
+        }
         json_path.write_text(
-            json.dumps(to_json(result, goal), ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
         click.echo(f"JSON 报告：{json_path}")
+    if trace_out:
+        trace_path = Path(trace_out)
+        if not trace_path.is_absolute():
+            trace_path = PROJECT_ROOT / trace_path
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        trace_path.write_text(
+            json.dumps(events, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        click.echo(f"轨迹导出：{trace_path}")
 
     verified = [item for item in findings if item.get("status") != "candidate"]
     candidates = [item for item in findings if item.get("status") == "candidate"]
-    click.echo(f"来源：{path}")
+    click.echo(f"来源：{path}（{'snapshot.json' if restored.source == 'snapshot' else '旧格式 surface+tasks'}）")
+    if restored.migrated_from and restored.migrated_from < 2:
+        click.echo(f"  快照已从 schema v{restored.migrated_from} 迁移到 v2。")
     if promoted:
         click.echo(f"已提升候选：{', '.join(promoted)}")
     if dropped:
         click.echo(f"已剔除编号：{', '.join(dropped)}")
     click.echo(f"已复核 {len(verified)} 条 / 待复核 {len(candidates)} 条")
+    if show_trace or events:
+        summary = summarize_trace(events) if events else {}
+        if summary:
+            click.echo(
+                f"轨迹：{summary['events']} 条事件 / {len(summary['tasks'])} 个子任务"
+                + (
+                    "／工具：" + "、".join(f"{k}×{v}" for k, v in list(summary["tools"].items())[:6])
+                    if summary.get("tools")
+                    else ""
+                )
+            )
+        elif not events:
+            click.echo(f"{MARK_WARN} 没有 trace.jsonl（旧格式运行目录），过程审计不可用。")
     click.echo(f"报告：{out_path}")
 
 

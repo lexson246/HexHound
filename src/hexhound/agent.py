@@ -163,6 +163,81 @@ class AgentResult:
     closing: dict[str, Any] = field(default_factory=dict)
     #: 本任务**本地**用量（并发下由任务自己累计，不用全局前后差值）。
     usage: dict[str, Any] = field(default_factory=dict)
+    #: 可审计轨迹的统计摘要（{events, kinds, tasks, tools, schema_version}）。
+    #: 只在报告渲染"这次运行发生了什么"时用到，因此不参与 `to_snapshot`
+    #: （轨迹本体在 trace.jsonl 里，快照只记摘要，避免重复存储）。
+    trace_summary: dict[str, Any] = field(default_factory=dict)
+    #: 快照来源标记：snapshot / legacy / ""（本次运行）。
+    restored_from: str = ""
+
+    # ---------- 离线重建（见 trace.py）----------
+
+    def to_snapshot(self) -> dict[str, Any]:
+        """展平成可 JSON 化的字典，供 `snapshot.json` 与离线报告重建使用。
+
+        **不包含 surface**：findings/attempts/coverage 已经在 `surface.json` 里，
+        重复存会让运行目录体积翻倍。报告重建时由调用方把 surface 装回去。
+        """
+        return {
+            "steps": list(self.steps),
+            "findings": list(self.findings),
+            "final_summary": self.final_summary,
+            "finish_reason": self.finish_reason,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "cache_hit_tokens": self.cache_hit_tokens,
+            "cache_miss_tokens": self.cache_miss_tokens,
+            "total_tokens": self.total_tokens,
+            "estimated_cost": self.estimated_cost,
+            "steps_used": self.steps_used,
+            "tasks": list(self.tasks),
+            "artifacts_dir": self.artifacts_dir,
+            "poc_paths": dict(self.poc_paths),
+            "models": dict(self.models),
+            "sandbox": dict(self.sandbox),
+            "tool_log": list(self.tool_log),
+            "coverage_gate": dict(self.coverage_gate),
+            "deduped": self.deduped,
+            "previous_findings": list(self.previous_findings),
+            "previous_run_at": self.previous_run_at,
+            "closing": dict(self.closing),
+            "usage": dict(self.usage),
+        }
+
+    @classmethod
+    def from_snapshot(cls, data: dict[str, Any], *, surface: AttackSurface | None = None) -> "AgentResult":
+        """从快照字典重建 `AgentResult`（离线重渲染用）。
+
+        缺失字段一律取 dataclass 默认值——**旧快照不该因为少一个字段就渲染失败**，
+        缺什么由报告层标注"未记录"。
+        """
+        payload = data if isinstance(data, dict) else {}
+        return cls(
+            steps=list(payload.get("steps") or []),
+            findings=list(payload.get("findings") or []),
+            final_summary=str(payload.get("final_summary") or ""),
+            prompt_tokens=int(payload.get("prompt_tokens") or 0),
+            completion_tokens=int(payload.get("completion_tokens") or 0),
+            cache_hit_tokens=int(payload.get("cache_hit_tokens") or 0),
+            cache_miss_tokens=int(payload.get("cache_miss_tokens") or 0),
+            estimated_cost=float(payload.get("estimated_cost") or 0.0),
+            total_tokens=int(payload.get("total_tokens") or 0),
+            steps_used=int(payload.get("steps_used") or len(payload.get("steps") or [])),
+            finish_reason=str(payload.get("finish_reason") or ""),
+            surface=surface,
+            tasks=list(payload.get("tasks") or []),
+            artifacts_dir=str(payload.get("artifacts_dir") or ""),
+            poc_paths=dict(payload.get("poc_paths") or {}),
+            deduped=int(payload.get("deduped") or 0),
+            models=dict(payload.get("models") or {}),
+            sandbox=dict(payload.get("sandbox") or {}),
+            tool_log=list(payload.get("tool_log") or []),
+            coverage_gate=dict(payload.get("coverage_gate") or {}),
+            previous_findings=list(payload.get("previous_findings") or []),
+            previous_run_at=str(payload.get("previous_run_at") or ""),
+            closing=dict(payload.get("closing") or {}),
+            usage=dict(payload.get("usage") or {}),
+        )
 
 
 #: 收尾阶段允许调用的工具。**白名单，不是黑名单**——
