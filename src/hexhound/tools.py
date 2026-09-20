@@ -160,16 +160,23 @@ def validate_url_against(url: str, allowed_hosts: Any) -> tuple[Any, str | None]
     需要在**没有工具注册表**的地方做同一套校验。复制一份判断逻辑迟早会漂移
     （一处改了另一处忘），所以两边共用这一个实现——
     "规范 URL 与目标请求走同一份范围校验"必须是真的同一份。
+
+    **协议检查在主机检查之前**：`file:///etc/passwd` 根本没有主机名，
+    先查主机就会报"无法解析主机"——那是个误导性的原因，
+    读者看不出这次调用其实是**被协议策略拒绝**的。
     """
     parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return parsed, (
+            f"拒绝：不支持的协议 {parsed.scheme or '(无协议)'!r}（只允许 http/https）。"
+            "file:// 与 data: 会绕过作用域判断，一律不允许。"
+        )
     host = (parsed.hostname or "").lower()
     if not host:
         return parsed, f"错误：无法从 URL 解析主机：{url}"
     if host not in allowed_hosts:
         allowed = ", ".join(sorted(allowed_hosts))
         return parsed, f"拒绝：主机 {host!r} 不在白名单（{allowed}）内，已阻止该请求。"
-    if parsed.scheme not in ("http", "https"):
-        return parsed, f"拒绝：不支持的协议 {parsed.scheme!r}。"
     return parsed, None
 
 
@@ -2616,6 +2623,87 @@ def _spill_read(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
 MAX_SPILL_PAGE = 8000
 
 
+def _browser_verify_xss(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+    """用真实浏览器验证 XSS：**反射 / DOM / 真的执行了** 三级分明。
+
+    为什么必须是独立工具（而不是让 `dynamic_crawl` 顺手做）：这个工具的返回值
+    带**措辞约束**——只有观测到执行才允许写"确认的 XSS"。方向性错误的 XSS 结论
+    （把反射说成确认）是安全报告里最严重的错误类型，因此判据与措辞都由代码定，
+    不交给模型自由发挥。
+    """
+    from .xssverify import (
+        BrowserUnavailable,
+        BrowserVerifier,
+        ScopeRefused,
+        playwright_available,
+        summarize_verdict,
+    )
+
+    # **作用域校验先于一切**，包括"浏览器装没装"。
+    # 顺序反了会有一个很难看的后果：越界 URL 得到的是"浏览器不可用"，
+    # 读者（和模型）就看不出这次调用其实是**被作用域拒绝**的。
+    url = str(args.get("url") or "").strip()
+    if not url:
+        return "错误：需要 url（必须在白名单内）。"
+    _, err = _validate_url(ctx, url)
+    if err:
+        return err
+
+    ready, reason = playwright_available()
+    if not ready:
+        return (
+            "错误：浏览器执行验证不可用。\n"
+            f"{reason}\n"
+            "在装好之前，XSS 只能按「字符串反射」上报（工具 fuzz_params 的 xss 类别），"
+            "**不得**写成「确认的 XSS」。"
+        )
+    payload = str(args.get("payload") or "").strip()
+    param = str(args.get("param") or "").strip()
+    verifier = BrowserVerifier(
+        allowed_hosts=ctx.allowed_hosts,
+        timeout_ms=int(args.get("timeout_ms") or 20000),
+        wait_ms=int(args.get("wait_ms") or 1500),
+        channel=str(args.get("channel") or "").strip(),
+    )
+    try:
+        verdict = verifier.verify_xss(url, payload=payload, param=param)
+    except ScopeRefused as exc:
+        return f"拒绝：{exc}"
+    except BrowserUnavailable as exc:
+        return f"错误：浏览器不可用：{exc}"
+    except Exception as exc:  # noqa: BLE001 验证失败转成可读错误，别让子任务崩
+        return f"浏览器验证失败：{type(exc).__name__}: {exc}"
+
+    # 截图作为 S 编号证据（有就存，没有不影响结论）
+    shot_id = ""
+    if verdict.screenshot:
+        shot_id = ctx.new_evidence_id("S")
+        ctx.screenshots.append(
+            {
+                "id": shot_id,
+                "url": verdict.url,
+                "label": f"XSS 浏览器验证（结论 {verdict.level}）",
+                "mime_type": "image/png",
+                "data_base64": base64.b64encode(verdict.screenshot).decode("ascii"),
+            }
+        )
+    lines = [summarize_verdict(verdict)]
+    if shot_id:
+        lines.append(f"\n截图证据：{shot_id}（record_finding 可用 screenshot_ref 引用）")
+    if verdict.confirmed:
+        lines.append(
+            "\n入库建议：record_finding(vuln_type=\"反射型XSS\", verified=true, "
+            "evidence=<执行信号与截图说明>)。"
+        )
+    else:
+        lines.append(
+            "\n入库建议：**不要**用 verified=true 报 XSS。"
+            f"当前级别 {verdict.level!r} 最多只能作为候选（verified 留空），"
+            "或改用 record_coverage(status=\"no_issue_found\") 记「未见可执行上下文」。"
+        )
+    return "\n".join(lines)
+
+
 def _sandbox_script(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     """在沙箱里跑一段自定义 Python 脚本（用于并发竞态 / 多步状态机 / 密文分析）。
 
@@ -2840,6 +2928,17 @@ _DESC_DYNAMIC_CRAWL = (
     "参数：{\"url\": 页面URL, \"wait_ms\": 等待毫秒(默认2500), \"execute_js\": 要执行的JS(可选), "
     "\"label\": 截图说明(可选)}。可发现 JS 渲染内容、前端 API、弹窗。"
 )
+_DESC_BROWSER_VERIFY_XSS = (
+    "用真实浏览器验证一个 XSS 到底成不成立，返回**分级结论**（需 playwright）。"
+    "参数：{\"url\": 页面URL（白名单内）, \"param\": 要注入的参数名(可选，给了就自动拼查询串), "
+    "\"payload\": 自定义载荷(可选，默认用无破坏性的执行标记载荷), "
+    "\"wait_ms\": 等待毫秒(默认1500), \"channel\": \"msedge\"/\"chrome\"(可选，用系统浏览器)}。"
+    "级别含义：executed=真的执行了（**只有这一级能报确认的 XSS**）；"
+    "dom=进了渲染后的 DOM 但没执行；reflected=只在原始响应里出现（**只是反射，不能报 XSS**）；"
+    "blocked=被 CSP 拦下；absent=没反射。"
+    "会一并保存截图与 console 作为证据。"
+    "注意：反射型 XSS 的结论强度取决于这一级判定，**不要**把 reflected 写成确认漏洞。"
+)
 
 
 # 角色 → 工具名（未列出的角色拥有全部工具）。
@@ -2871,6 +2970,8 @@ ROLE_TOOLS: dict[str, tuple[str, ...]] = {
         "sqlmap_scan", "template_scan", "raw_command", "sandbox_status",
         # 自定义脚本：竞态（并发窗口）与密文分析只能靠脚本表达
         "sandbox_script",
+        # 浏览器验证：把 XSS 从"反射"提升到"确认执行"的唯一途径
+        "browser_verify_xss", "capture_screenshot",
     ) + _SPILL_TOOL,
     "auth": (
         "http_request", "compare_responses", "auth_test", "check_default_creds",
@@ -2889,6 +2990,8 @@ ROLE_TOOLS: dict[str, tuple[str, ...]] = {
         "sqlmap_scan", "template_scan", "raw_command", "sandbox_status",
         # 竞态类结论必须能复跑同一段并发脚本才算复核
         "sandbox_script",
+        # XSS 类结论必须能复跑浏览器验证才算复核（反射 ≠ 执行）
+        "browser_verify_xss",
     ) + _SPILL_TOOL,
     "source": (
         "list_files", "read_file", "search_code", "http_request", "compare_responses",
@@ -2897,6 +3000,13 @@ ROLE_TOOLS: dict[str, tuple[str, ...]] = {
         "sandbox_status", "raw_command",
     ) + _SPILL_TOOL,
 }
+
+#: 只有装了 playwright 才下发的工具。
+#:
+#: 与 `SANDBOX_TOOLS` 同一个思路（"能做什么就只给什么"）：没装浏览器时下发
+#: `browser_verify_xss`，模型每次调用都只会拿到一句"不可用"，白烧步数。
+#: 反过来，装了却不下发，模型就永远不知道可以把 XSS 从"反射"提升到"确认执行"。
+BROWSER_TOOLS: tuple[str, ...] = ("browser_verify_xss",)
 
 #: 依赖沙箱的工具（沙箱不可用时这些不下发，避免模型反复调用拿到"不可用"）
 SANDBOX_TOOLS: dict[str, str] = {
@@ -3074,6 +3184,7 @@ class ToolRegistry:
         add("finish_task", _DESC_FINISH_TASK, lambda a: _finish_task(self, a))
         add("capture_screenshot", _DESC_CAPTURE_SCREENSHOT, lambda a: _capture_screenshot(self, a))
         add("dynamic_crawl", _DESC_DYNAMIC_CRAWL, lambda a: _dynamic_crawl(self, a))
+        add("browser_verify_xss", _DESC_BROWSER_VERIFY_XSS, lambda a: _browser_verify_xss(self, a))
         # --- 真工具（沙箱）---
         add("port_scan", _DESC_PORT_SCAN, lambda a: _port_scan(self, a))
         add("sqlmap_scan", _DESC_SQLMAP_SCAN, lambda a: _sqlmap_scan(self, a))
@@ -3123,6 +3234,27 @@ class ToolRegistry:
                 self._tools.pop(name, None)
                 continue
             if required and not status.get(required, False):
+                self._tools.pop(name, None)
+        self._drop_unavailable_browser_tools()
+
+    def _drop_unavailable_browser_tools(self) -> None:
+        """没装 playwright 时摘掉浏览器验证工具。
+
+        摘掉不等于"XSS 不用管了"：`fuzz_params` 的 xss 类别仍然可用，
+        只是结论强度只能到"字符串反射"。报告与提示词里都写明了这一点，
+        所以读者不会把"没做浏览器验证"误当成"验证过了没问题"。
+        """
+        present = [name for name in BROWSER_TOOLS if name in self._tools]
+        if not present:
+            return
+        try:
+            from .xssverify import playwright_available
+
+            ready, _reason = playwright_available()
+        except Exception:  # noqa: BLE001 探测失败按不可用处理
+            ready = False
+        if not ready:
+            for name in present:
                 self._tools.pop(name, None)
 
     def sandbox_summary(self) -> dict[str, Any]:
@@ -3181,6 +3313,16 @@ class ToolRegistry:
                 "弱密钥或 alg=none、比对密文块找 ECB 特征。"
                 "看到「优惠券/余额/积分/限额/一次性令牌/重置密码」这类**先查后写**的接口，"
                 "不要只用单发请求下结论——用并发脚本实测是否可重复消费。"
+            )
+        if self.has("browser_verify_xss"):
+            lines.append(
+                "- `browser_verify_xss`：**XSS 结论的强度由它决定**。"
+                "真实浏览器跑一遍，返回分级结论：`executed`（真的执行了，可以报确认的 XSS）、"
+                "`dom`（进了渲染后的 DOM 但没执行）、`reflected`（只在原始响应里出现，"
+                "**只是反射，不能报 XSS**）、`blocked`（被 CSP 拦下）、`absent`（没反射）。"
+                "内置 `fuzz_params` 的 xss 类别只判到「字符串反射」；"
+                "要把 XSS 写成已复核结论，必须先用这个工具拿到 `executed`，并引用它保存的截图证据。"
+                "载荷默认无破坏性（只给 DOM 打个标记属性），不会改动目标数据。"
             )
         if not lines:
             return ""

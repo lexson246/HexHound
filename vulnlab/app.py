@@ -2,7 +2,10 @@
 
 覆盖的漏洞（HexHound 的检测能力验证集）：
 - /login             错误型 SQL 注入（SQL 错误 + 完整查询回显）
-- /reflect           反射型 XSS（name 未转义）
+- /reflect           反射型 XSS（name 未转义，**真实浏览器里会执行**）
+- /reflect-text      对照组：原样回显但 Content-Type 是 text/plain（不执行）
+- /reflect-dom       对照组：payload 进了 DOM 的 <textarea>（不执行）
+- /reflect-csp       对照组：原样回显但 CSP 禁止内联脚本（不执行）
 - /file              目录遍历 / 任意文件读取（可读 secret.txt、.env.demo）
 - /fetch             SSRF（url 参数由服务端发起请求）
 - /ping              命令注入（ip 参数拼接 shell）
@@ -143,9 +146,66 @@ def login() -> tuple[str, int] | str:
 
 @app.route("/reflect")
 def reflect() -> str:
-    """name 未转义直接回显（漏洞 2：反射型 XSS）。"""
+    """name 未转义直接回显（漏洞 2：反射型 XSS）。
+
+    **真的会执行**：payload 落在 HTML 正文上下文里，浏览器会解析它。
+    与下面几个"看起来也会 XSS 其实不会"的端点构成对照组——
+    这正是需要真实浏览器才能分辨的那一类差异。
+    """
     name = request.args.get("name", "")
     return f"<h1>你好，{name}</h1>"
+
+
+# ---------------------------------------------------------------------------
+# XSS 判据对照组（漏洞 2b）：**只有真实浏览器能分辨**
+#
+# 这三个端点都会把 payload 原样回显，字符串级别完全一样，
+# 但浏览器里的结果完全不同：
+#   /reflect        HTML 上下文        → 真的执行
+#   /reflect-text   Content-Type: text/plain → 不解析，只是纯文本
+#   /reflect-dom    进入 <textarea>    → 在 DOM 里但不可执行
+#   /reflect-csp    带 CSP 响应头      → 浏览器拒绝执行内联脚本
+# 把它们放在一起，是为了让"反射 ≠ 执行"这件事**可复核**：
+# 只做字符串匹配的工具会把四个都报成 XSS，而其中三个不是。
+# ---------------------------------------------------------------------------
+
+
+@app.route("/reflect-text")
+def reflect_text() -> tuple[str, int]:
+    """payload 原样回显，但响应是 text/plain（浏览器不解析 HTML）。"""
+    name = request.args.get("name", "")
+    return f"你好，{name}", 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
+@app.route("/reflect-dom")
+def reflect_dom() -> str:
+    """payload 进了 DOM，但**被 HTML 转义**后落在 `<textarea>` 里。
+
+    转义是刻意的：这样 payload 会以文本形式出现在渲染后的 DOM 中
+    （`innerText`/DOM 文本里查得到），但浏览器不会把它当标签解析、更不会执行。
+    这正是"字符串出现在 DOM 里"与"代码被执行"之间那道最容易被误判的界线——
+    `render_template_string` 会自动转义，这里用 f-string 所以显式 escape。
+    """
+    from markupsafe import escape
+
+    name = escape(request.args.get("name", ""))
+    return f"<h1>留言</h1><textarea name='msg'>{name}</textarea>"
+
+
+@app.route("/reflect-csp")
+def reflect_csp() -> tuple[str, int, dict[str, str]]:
+    """payload 进了 HTML 正文，但 CSP 禁止内联脚本执行。"""
+    name = request.args.get("name", "")
+    return (
+        f"<h1>你好，{name}</h1>",
+        200,
+        {
+            "Content-Security-Policy": (
+                "default-src 'self'; script-src 'self'; "
+                "object-src 'none'; base-uri 'none'"
+            )
+        },
+    )
 
 
 @app.route("/file")
