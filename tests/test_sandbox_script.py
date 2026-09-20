@@ -20,9 +20,9 @@ sys.path.insert(0, str(SRC))
 
 from hexhound.sandbox import ExecResult, Sandbox, ScopeViolation  # noqa: E402
 from hexhound.tools import (  # noqa: E402
+    _DESC_SANDBOX_SCRIPT,
     ROLE_TOOLS,
     SANDBOX_TOOLS,
-    _DESC_SANDBOX_SCRIPT,
 )
 
 

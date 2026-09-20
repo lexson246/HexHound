@@ -11,6 +11,7 @@ import os
 import sys
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import click
@@ -18,6 +19,13 @@ import click
 from . import __version__
 from .agent import ReActAgent
 from .budget import Budget, limits_from_config
+from .config import (
+    ROLES,
+    Config,
+    normalize_base_url,
+    resolve_provider,
+    write_env_file,
+)
 from .console import (
     MARK_FAIL,
     MARK_OK,
@@ -25,22 +33,6 @@ from .console import (
     MARK_WARN,
     console_text,
     enable_utf8_console,
-)
-from .providers import (
-    ROLE_ENV_SUFFIX,
-    ROLE_LABEL,
-    describe_presets,
-    env_key_name,
-    get_preset,
-    provider_keys,
-)
-from .config import (
-    DEFAULT_PROVIDER,
-    ROLES,
-    Config,
-    normalize_base_url,
-    resolve_provider,
-    write_env_file,
 )
 from .llm import LLMClient, build_llm_pool
 from .memory import HostMemory, RunArtifacts, data_home
@@ -51,8 +43,15 @@ from .orchestrator import (
     Orchestrator,
     SwarmCallbacks,
 )
+from .providers import (
+    ROLE_ENV_SUFFIX,
+    ROLE_LABEL,
+    describe_presets,
+    env_key_name,
+    get_preset,
+)
 from .report import build_diff, write_report
-from .sandbox import Sandbox, detect_runtime, sandbox_report
+from .sandbox import Sandbox, detect_runtime
 from .submission import write_butian_package
 from .surface import SEVERITY_RANK, AttackSurface
 from .tools import ToolRegistry
@@ -1043,7 +1042,7 @@ def sandbox_cmd() -> None:
 @sandbox_cmd.command("status")
 def sandbox_status() -> None:
     """探测当前机器上有哪些可用执行环境，以及装了哪些工具。"""
-    from .sandbox import TOOL_ALLOWLIST, detect_runtime
+    from .sandbox import TOOL_ALLOWLIST
 
     runtime = detect_runtime()
     if runtime is None:

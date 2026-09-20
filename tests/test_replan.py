@@ -759,6 +759,197 @@ class OrchestratorReplanIntegrationTests(unittest.TestCase):
         )
 
 
+class RealRunRegressionTests(unittest.TestCase):
+    """回归：一次**真实运行**暴露的三个缺陷（都不是靠读代码想出来的）。
+
+    实测现场：一次对靶场的 audit 里，两个子任务的 trace 记录抛
+    `TypeError: TraceRecorder.record() got multiple values for argument 'kind'`
+    （被判成"未预期错误中断"），随后波次边界的重规划抛
+    `AttributeError: 'WorkerTask' object has no attribute 'outcome_label'`
+    ——**整次 audit 以 exit 1 结束**，而那次运行其实已经发现了路径穿越与 SSRF
+    两条 critical 结论。
+
+    这些用例的共同点：**必须传入非空的 done 列表**才会走到出问题的那一行。
+    早先的测试都传 `done=[]`，于是分支根本没被执行到。
+    """
+
+    TARGET = "http://hexhound-test.invalid"
+    ALLOWED = frozenset({"127.0.0.1", "localhost", "hexhound-test.invalid"})
+
+    def make(self, **overrides):
+        from hexhound.budget import Budget, BudgetLimits
+        from hexhound.mockllm import ScriptedLLM
+        from hexhound.orchestrator import Orchestrator
+
+        settings = {
+            "target": self.TARGET,
+            "goal": "回归：真实运行暴露的缺陷",
+            "mode": "blackbox",
+            "base_dir": Path("."),
+            "allowed_hosts": self.ALLOWED,
+            "timeout": 1,
+            "max_tasks": 3,
+            "task_steps": 4,
+            "parallel": 1,
+            "budget": Budget(BudgetLimits(max_tool_calls=300)),
+        }
+        settings.update(overrides)
+        return Orchestrator(ScriptedLLM(), **settings)
+
+    def make_done(self, outcomes: list[str]):
+        """造一批**已执行过**的子任务（带 outcome），这才是真实运行的样子。"""
+        from hexhound.orchestrator import WorkerTask
+
+        return [
+            WorkerTask(
+                id=f"T{index}",
+                role="recon",
+                objective="测试",
+                url=self.TARGET,
+                outcome=outcome,
+            )
+            for index, outcome in enumerate(outcomes, 1)
+        ]
+
+    def test_replan_brief_handles_unfinished_tasks(self) -> None:
+        """回归：`outcome_label` 是 `to_dict()` 的派生字段，不是属性。
+
+        直接 `t.outcome_label` 会 AttributeError。
+        """
+        orchestrator = self.make()
+        done = self.make_done(["done", "max_steps", "closing_failed", "budget"])
+        brief = orchestrator._replan_brief(
+            {"touched": 1, "total": 4, "params_attempted": 0, "params_total": 2}, done
+        )
+        self.assertIn("已完成子任务：1 个", brief)
+        self.assertIn("未收尾：3 个", brief)
+        # 未收尾的任务要列出 id 与**可读**状态
+        self.assertIn("T2", brief)
+        self.assertIn("达到步数上限", brief)
+
+    def test_replan_brief_handles_all_closed_tasks(self) -> None:
+        orchestrator = self.make()
+        brief = orchestrator._replan_brief(
+            {"touched": 2, "total": 2, "params_attempted": 1, "params_total": 1},
+            self.make_done(["done", "closing_no_finish"]),
+        )
+        self.assertIn("未收尾：0 个", brief)
+
+    def test_replan_brief_with_empty_done(self) -> None:
+        orchestrator = self.make()
+        brief = orchestrator._replan_brief({"touched": 0, "total": 0}, [])
+        self.assertIn("<current_state>", brief)
+
+    def test_replan_round_routes_through_the_safe_wrapper(self) -> None:
+        """回归：重规划里任何异常都必须被兜住，不能冒到 CLI。
+
+        判据：故意让 `_replan_round_inner` 抛异常，外层必须返回 `[]` 并记录
+        `replan_error` 事件——而不是把整次 audit 变成 traceback。
+        """
+        from unittest.mock import patch
+
+        orchestrator = self.make()
+        with patch.object(
+            type(orchestrator),
+            "_replan_round_inner",
+            side_effect=AttributeError("'WorkerTask' object has no attribute 'outcome_label'"),
+        ):
+            added = orchestrator._run_replan_round({"untouched": 5}, [], [])
+        self.assertEqual(added, [])
+        errors = [
+            event for event in orchestrator.events if event.get("kind") == "replan_error"
+        ]
+        self.assertTrue(errors, "重规划出错必须留下事件")
+        self.assertIn("AttributeError", errors[0]["message"])
+
+    def test_supervisor_verdict_does_not_collide_with_trace_kind(self) -> None:
+        """回归：`Verdict.to_dict()` 的 `kind` 与 `record(kind=...)` 撞名。
+
+        现场报错：`TraceRecorder.record() got multiple values for argument 'kind'`。
+        这里用一个会在第一步就告警的场景触发它（重复调用同一工具）。
+        """
+        import tempfile
+
+        from hexhound.memory import RunArtifacts
+        from hexhound.mockllm import ScriptedLLM
+        from hexhound.orchestrator import Orchestrator, TaskWorker, WorkerTask
+        from hexhound.surface import AttackSurface
+        from hexhound.trace import load_trace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifacts = RunArtifacts(self.TARGET, home=Path(tmp))
+            recorder = Orchestrator(
+                ScriptedLLM(),
+                target=self.TARGET,
+                goal="trace kind 撞名",
+                mode="blackbox",
+                base_dir=Path("."),
+                allowed_hosts=self.ALLOWED,
+                timeout=1,
+                budget=__import__("hexhound.budget", fromlist=["Budget"]).Budget(),
+                artifacts=artifacts,
+            ).trace
+            task = WorkerTask(id="T1", role="recon", objective="x", steps=8)
+            worker = TaskWorker(
+                ScriptedLLM(),
+                task=task,
+                base_dir=Path("."),
+                allowed_hosts=self.ALLOWED,
+                timeout=1,
+                surface=AttackSurface(target=self.TARGET),
+                budget=SearchBudget(),
+                artifacts=None,
+                auth_profiles={},
+                trace=recorder,
+            )
+            step = {"action": "http_request", "action_input": {"url": self.TARGET + "/x"},
+                    "observation": "普通响应"}
+            for _ in range(4):  # 触发 stall 告警
+                worker._supervise(step, [])
+            events = load_trace(artifacts.dir / "trace.jsonl")
+            supervisor_events = [e for e in events if e.get("kind") == "supervisor"]
+            self.assertTrue(supervisor_events, "监督器判定必须写进 trace（且不能抛异常）")
+            self.assertIn("verdict_kind", supervisor_events[0]["data"])
+
+    def test_orchestrator_events_reach_the_trace(self) -> None:
+        """回归：编排事件里的 `kind` 同样会与 `record(kind=...)` 撞名。"""
+        import tempfile
+
+        from hexhound.memory import RunArtifacts
+        from hexhound.mockllm import ScriptedLLM
+        from hexhound.orchestrator import Orchestrator
+        from hexhound.trace import load_trace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifacts = RunArtifacts(self.TARGET, home=Path(tmp))
+            orchestrator = Orchestrator(
+                ScriptedLLM(),
+                target=self.TARGET,
+                goal="编排事件进 trace",
+                mode="blackbox",
+                base_dir=Path("."),
+                allowed_hosts=self.ALLOWED,
+                timeout=1,
+                max_tasks=1,
+                task_steps=3,
+                parallel=1,
+                budget=SearchBudget(),
+                artifacts=artifacts,
+            )
+            orchestrator._event(kind="custom_stage", message="测试事件", count=7)
+            events = load_trace(artifacts.dir / "trace.jsonl")
+            custom = [e for e in events if e.get("kind") == "orchestrator_custom_stage"]
+            self.assertTrue(custom)
+            self.assertEqual(custom[0]["data"]["message"], "测试事件")
+            self.assertEqual(custom[0]["data"]["count"], 7)
+
+
+def SearchBudget():
+    from hexhound.budget import Budget, BudgetLimits
+
+    return Budget(BudgetLimits(max_tool_calls=300))
+
+
 class PatchResultShapeTests(unittest.TestCase):
     def test_result_serialises_for_trace(self) -> None:
         result = PatchResult(ok=True, applied=[{"op": "add", "id": "R-1"}], rejected=[])

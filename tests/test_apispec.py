@@ -26,7 +26,6 @@ sys.path.insert(0, str(SRC))
 from hexhound.apispec import (  # noqa: E402
     MAX_REF_DEPTH,
     RefPolicy,
-    RefResolutionError,
     SpecError,
     build_operation_url,
     detect_spec_kind,

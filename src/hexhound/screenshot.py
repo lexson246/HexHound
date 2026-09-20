@@ -5,7 +5,6 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-
 _BROWSER_CANDIDATES = [
     r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
     r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",

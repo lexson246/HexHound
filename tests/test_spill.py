@@ -363,8 +363,10 @@ class GovernorSpillIntegrationTests(unittest.TestCase):
 
     def test_spilled_spill_is_not_recursively_spilled(self) -> None:
         """`spill_read` 自己的输出不该再触发一次溢写（会无限套娃）。"""
-        from hexhound.tools import _DESC_SPILL_READ  # noqa: F401
-        from hexhound.tools import _govern
+        from hexhound.tools import (
+            _DESC_SPILL_READ,  # noqa: F401
+            _govern,
+        )
 
         registry = self.make_registry()
         entry = registry.spill("Z" * 40000)

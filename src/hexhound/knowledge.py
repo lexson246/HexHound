@@ -464,7 +464,6 @@ PARAM_PAYLOAD_HINTS: dict[str, tuple[str, ...]] = {
     "proxy": ("ssrf",),
     # /fetch?url= 这类端点参数名就是路径/功能名，值得直接试 SSRF。
     "fetch": ("ssrf",),
-    "proxy": ("ssrf",),
     "curl": ("ssrf",),
     "load": ("ssrf", "path"),
     "file": ("path",),

@@ -34,7 +34,7 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -724,7 +724,7 @@ class Sandbox:
         self._run_host([runtime.path, *action], timeout=120)
         self._container = ""
 
-    def __enter__(self) -> "Sandbox":
+    def __enter__(self) -> Sandbox:
         self.start()
         return self
 

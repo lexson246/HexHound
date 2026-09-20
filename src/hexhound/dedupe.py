@@ -14,7 +14,8 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 from .surface import SEVERITY_RANK, host_of, normalize_path, param_names
 

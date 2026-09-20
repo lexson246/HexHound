@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 from .budget import Budget
 from .llm import LLMClient, estimate_cost
@@ -205,7 +206,7 @@ class AgentResult:
         }
 
     @classmethod
-    def from_snapshot(cls, data: dict[str, Any], *, surface: AttackSurface | None = None) -> "AgentResult":
+    def from_snapshot(cls, data: dict[str, Any], *, surface: AttackSurface | None = None) -> AgentResult:
         """从快照字典重建 `AgentResult`（离线重渲染用）。
 
         缺失字段一律取 dataclass 默认值——**旧快照不该因为少一个字段就渲染失败**，

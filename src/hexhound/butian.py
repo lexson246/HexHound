@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 WEB = "web漏洞"
 IOT = "IoT漏洞"
 ICS = "工控漏洞"

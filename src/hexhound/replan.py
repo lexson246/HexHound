@@ -23,8 +23,9 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any
 from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
@@ -61,7 +62,7 @@ def deterministic_task_id(role: str, url: str, objective: str, *, salt: str = ""
     而内容派生只取决于内容。这让"两次运行的任务 id 一致"成为可验证的性质，
     而不是巧合。前缀 `R` 标明它来自重规划，便于在台账里一眼区分。
     """
-    material = f"{role}\x00{url}\x00{objective}\x00{salt}".encode("utf-8")
+    material = f"{role}\x00{url}\x00{objective}\x00{salt}".encode()
     digest = hashlib.sha256(material).hexdigest()[:8]
     return f"R-{digest}"
 

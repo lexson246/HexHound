@@ -17,10 +17,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
-from .dedupe import dedupe_key, vuln_class
+from .dedupe import dedupe_key
 
 #: 指纹前缀 → 人读的类别名（复用 dedupe 的分类规则）
 _LABEL = {
@@ -151,7 +151,7 @@ def diff_findings(
     still = {str(item) for item in (still_affected or set())}
     result = RunDiff(
         target=target,
-        current_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        current_at=datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC"),
     )
 
     def fingerprint_of(item: dict[str, Any]) -> str:
@@ -168,7 +168,9 @@ def diff_findings(
             continue
         previous_fps.append(fp)
         previous_items.append(item)
-    previous_map = dict(zip(previous_fps, previous_items))
+    # `strict=True`：两个列表必须等长——不等长说明上面的去重逻辑漏了分支，
+    # 那是**逻辑缺陷**，应该立刻报错而不是静默截断成较短的那个。
+    previous_map = dict(zip(previous_fps, previous_items, strict=True))
 
     current_items: list[dict[str, Any]] = []
     seen_current: set[str] = set()

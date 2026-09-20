@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from .llm import estimate_cost
@@ -181,7 +181,7 @@ class Budget:
         """设置是否打印每一步（供 CLI 中途切换）。"""
         self.verbose = verbose
 
-    def child(self) -> "Budget":
+    def child(self) -> Budget:
         """子代理视图：共享同一账本与限制（避免各自重复计数）。"""
         return self
 

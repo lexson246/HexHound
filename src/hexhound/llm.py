@@ -105,7 +105,7 @@ def classify_error(exc: Exception) -> tuple[str, str]:
 
 def build_llm_pool(
     config: Any, *, verbose: bool = False, echo: Any = None
-) -> tuple["LLMClient", dict[str, "LLMClient"]]:
+) -> tuple[LLMClient, dict[str, LLMClient]]:
     """按配置构建「默认客户端 + 按角色的客户端池」。
 
     只有被显式覆盖的角色才新建客户端；未覆盖的角色直接复用默认客户端，

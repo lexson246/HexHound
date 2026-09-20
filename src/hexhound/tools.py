@@ -22,10 +22,11 @@ import os
 import re
 import threading
 import time
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -36,9 +37,9 @@ from .memory import RunArtifacts
 from .sanitize import sanitize_terminal_text
 from .screenshot import capture_url
 from .surface import (
+    SEVERITIES,
     AttackSurface,
     Finding,
-    SEVERITIES,
     host_of,
     normalize_endpoint,
     param_names,
@@ -148,7 +149,7 @@ def _summarize_args(action_input: dict[str, Any], limit: int = 400) -> str:
     return text
 
 
-def _validate_url(ctx: "ToolRegistry", url: str) -> tuple[Any, str | None]:
+def _validate_url(ctx: ToolRegistry, url: str) -> tuple[Any, str | None]:
     """校验 URL 的主机白名单与协议，返回 (parsed, 错误信息)。"""
     return validate_url_against(url, ctx.allowed_hosts)
 
@@ -209,7 +210,7 @@ def _truncate_args(args: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
-def _govern(name: str, result: Any, ctx: "ToolRegistry | None" = None) -> tuple[str, dict[str, Any]]:
+def _govern(name: str, result: Any, ctx: ToolRegistry | None = None) -> tuple[str, dict[str, Any]]:
     """工具输出治理：返回 (给 LLM 的文本, 结构化结果)。
 
     结构化结果保留完整数据（报告与统计用），文本按体积分档压缩。
@@ -283,7 +284,7 @@ def _govern(name: str, result: Any, ctx: "ToolRegistry | None" = None) -> tuple[
 # ---------------------------------------------------------------------------
 
 
-def _list_files(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _list_files(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     sub = str(args.get("path") or ".")
     target = _resolve_within(ctx.base_dir, sub)
     if target is None:
@@ -313,7 +314,7 @@ def _list_files(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     return "\n".join(lines) if lines else "(空目录)"
 
 
-def _read_file(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _read_file(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     sub = str(args.get("path") or "")
     if not sub:
         return "错误：缺少 path 参数。"
@@ -371,7 +372,7 @@ def _iter_source_files(base: Path):
                 yield Path(dirpath) / fname
 
 
-def _search_code(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _search_code(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     pattern = str(args.get("pattern") or "")
     if not pattern:
         return "错误：缺少 pattern 参数。"
@@ -427,7 +428,7 @@ def _proxy_kwargs() -> dict[str, Any]:
 
 
 def _send(
-    ctx: "ToolRegistry",
+    ctx: ToolRegistry,
     method: str,
     url: str,
     *,
@@ -467,7 +468,7 @@ def _send(
         return None
 
 
-def _log_exchange(ctx: "ToolRegistry", response: httpx.Response, note: str = "") -> str:
+def _log_exchange(ctx: ToolRegistry, response: httpx.Response, note: str = "") -> str:
     """把一次 HTTP 请求/响应完整快照存入日志，返回编号（如 W1-R3）。"""
     request = response.request
     exchange_id = ctx.new_evidence_id("R", store=False)
@@ -492,7 +493,7 @@ def _log_exchange(ctx: "ToolRegistry", response: httpx.Response, note: str = "")
     return exchange_id
 
 
-def _pick_tool_evidence(ctx: "ToolRegistry", refs: Any) -> list[dict[str, Any]]:
+def _pick_tool_evidence(ctx: ToolRegistry, refs: Any) -> list[dict[str, Any]]:
     """按 evidence_ref 挑选真工具执行记录（T 编号），未指定时用最近一次。
 
     真工具证据的价值在于**工具级的可复现性**：sqlmap 给出的不只是"有注入"，
@@ -510,7 +511,7 @@ def _pick_tool_evidence(ctx: "ToolRegistry", refs: Any) -> list[dict[str, Any]]:
     return [by_id[str(ref)] for ref in refs if str(ref) in by_id]
 
 
-def _pick_http_evidence(ctx: "ToolRegistry", refs: Any) -> list[dict[str, Any]]:
+def _pick_http_evidence(ctx: ToolRegistry, refs: Any) -> list[dict[str, Any]]:
     """按 evidence_ref 挑选要附到漏洞上的请求/响应，未指定时用最近一次。"""
     if not ctx.http_log:
         return []
@@ -527,7 +528,7 @@ def _pick_http_evidence(ctx: "ToolRegistry", refs: Any) -> list[dict[str, Any]]:
     return selected
 
 
-def _pick_code_evidence(ctx: "ToolRegistry", refs: Any) -> list[dict[str, Any]]:
+def _pick_code_evidence(ctx: ToolRegistry, refs: Any) -> list[dict[str, Any]]:
     """按 code_ref 挑选代码证据，未指定时用最近一次 read_file。"""
     if not ctx.code_evidence:
         return []
@@ -539,7 +540,7 @@ def _pick_code_evidence(ctx: "ToolRegistry", refs: Any) -> list[dict[str, Any]]:
     return [by_id[str(ref)] for ref in refs if str(ref) in by_id]
 
 
-def _pick_screenshots(ctx: "ToolRegistry", refs: Any) -> list[dict[str, Any]]:
+def _pick_screenshots(ctx: ToolRegistry, refs: Any) -> list[dict[str, Any]]:
     """按 screenshot_ref 挑选截图，未指定时用最近一张截图。"""
     if not ctx.screenshots:
         return []
@@ -552,7 +553,7 @@ def _pick_screenshots(ctx: "ToolRegistry", refs: Any) -> list[dict[str, Any]]:
 
 
 def _merge_auth_headers(
-    ctx: "ToolRegistry", headers: dict[str, Any], account: Any
+    ctx: ToolRegistry, headers: dict[str, Any], account: Any
 ) -> dict[str, str]:
     """按 account 参数合并账号 A/B 的 Cookie/Authorization 等请求头。"""
     merged = {str(key): str(value) for key, value in headers.items()}
@@ -563,7 +564,7 @@ def _merge_auth_headers(
     return merged
 
 
-def _detect_tech(ctx: "ToolRegistry", response: httpx.Response, body: str) -> None:
+def _detect_tech(ctx: ToolRegistry, response: httpx.Response, body: str) -> None:
     """登记技术栈指纹，并提示可能的高危版本（组件类证据）。"""
     for header in ("server", "x-powered-by", "x-aspnet-version", "via"):
         value = response.headers.get(header)
@@ -581,7 +582,7 @@ def _detect_tech(ctx: "ToolRegistry", response: httpx.Response, body: str) -> No
             ctx.surface.add_tech(name, match.group(1))
 
 
-def _analyze_body(ctx: "ToolRegistry", url: str, body: str) -> list[str]:
+def _analyze_body(ctx: ToolRegistry, url: str, body: str) -> list[str]:
     """从响应体里抽取可用的情报（报错泄露 / PII / 技术栈版本）。"""
     notes: list[str] = []
     if KB.ERROR_PAGE_SIGNAL.search(body):
@@ -615,7 +616,7 @@ def _request_fingerprint(
     return hashlib.sha1(payload.encode("utf-8", errors="replace")).hexdigest()
 
 
-def _http_request(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _http_request(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     url = str(args.get("url") or "")
     _, err = _validate_url(ctx, url)
     if err:
@@ -691,7 +692,7 @@ def _http_request(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _compare_responses(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _compare_responses(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """基线 vs 注入请求的精确对比：差异点即漏洞证据。
 
     比「人眼比对两段 HTML」可靠得多：返回状态码、长度、响应头差异与
@@ -844,7 +845,7 @@ def _same_host(url: str, host: str) -> bool:
     return host_of(url) == host
 
 
-def _crawl(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _crawl(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     parsed, err = _validate_url(ctx, str(args.get("url") or ""))
     if err:
         return err
@@ -939,7 +940,7 @@ _HARVEST_NOISE = frozenset(
 
 
 def _harvest_endpoints(
-    ctx: "ToolRegistry", text: str, *, base_url: str, host: str, source: str
+    ctx: ToolRegistry, text: str, *, base_url: str, host: str, source: str
 ) -> list[str]:
     """从一段文本（HTML / JS / 配置）里提取同域路径并登记进攻面。
 
@@ -968,7 +969,7 @@ def _harvest_endpoints(
     return sort_urls(found, 60)
 
 
-def _discover_endpoints(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _discover_endpoints(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """从页面与同域 JS 中提取疑似 API/接口路径，并写入攻面。"""
     parsed, err = _validate_url(ctx, str(args.get("url") or ""))
     if err:
@@ -1011,7 +1012,7 @@ def _discover_endpoints(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _enumerate_common(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _enumerate_common(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """分档探测常见/敏感路径，并用随机路径基线过滤「假 404」。"""
     parsed, err = _validate_url(ctx, str(args.get("base_url") or ""))
     if err:
@@ -1116,7 +1117,7 @@ def _content_marker(path: str, body: str) -> str:
     return ""
 
 
-def _read_urls(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _read_urls(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """批量读取白名单内的文本资源（JS / 配置 / robots），用于提取线索与密钥。"""
     urls = args.get("urls")
     if isinstance(urls, str):
@@ -1175,7 +1176,7 @@ def _read_urls(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     }
 
 
-def _capture_screenshot(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _capture_screenshot(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     url = str(args.get("url") or "")
     _, err = _validate_url(ctx, url)
     if err:
@@ -1198,7 +1199,7 @@ def _capture_screenshot(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     return f"[{shot_id}] 已截图 {url}（PNG，{len(data)} 字节，label={label}）"
 
 
-def _dynamic_crawl(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _dynamic_crawl(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """用无头浏览器真实执行页面，收集渲染 DOM、截图与网络请求。"""
     url = str(args.get("url") or "")
     _, err = _validate_url(ctx, url)
@@ -1351,7 +1352,7 @@ def _reflects_and_ran(
     return marker not in baseline.text
 
 
-def _fuzz_params(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _fuzz_params(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """对参数批量注入 payload；按参数语义选类别，并跳过已试过的组合。"""
     url = str(args.get("url") or "")
     _, err = _validate_url(ctx, url)
@@ -1388,7 +1389,7 @@ def _fuzz_params(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     already_hit: list[str] = []
     tried = 0
     skipped = 0
-    for name, sample in list(params.items())[:8]:
+    for name, _sample in list(params.items())[:8]:
         chosen: list[str] = list(categories) if categories else list(
             KB.PARAM_PAYLOAD_HINTS.get(str(name).lower(), ())
         )
@@ -1504,7 +1505,7 @@ def _fuzz_params(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _check_security_headers(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _check_security_headers(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     url = str(args.get("url") or "")
     _, err = _validate_url(ctx, url)
     if err:
@@ -1576,7 +1577,7 @@ def _login_success_reason(
     return ""
 
 
-def _check_default_creds(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _check_default_creds(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """尝试常见默认凭据；命中的会话会自动注册为账号 C（供越权对比）。"""
     url = str(args.get("url") or "")
     _, err = _validate_url(ctx, url)
@@ -1659,7 +1660,7 @@ def _check_default_creds(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _use_account(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _use_account(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """切换当前默认账号（A/B/C），后续请求自动带上该身份。"""
     name = str(args.get("account") or "").strip().upper()
     if name not in ("A", "B", "C", ""):
@@ -1677,7 +1678,7 @@ def _use_account(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     return f"当前身份已切换为账号 {name}（请求头字段：{fields}）。之后 http_request / compare_responses / auth_test 默认使用它。"
 
 
-def _auth_test(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _auth_test(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """用两个账号发起同一请求并比较响应，辅助发现越权/IDOR。"""
     url = str(args.get("url") or "")
     _, err = _validate_url(ctx, url)
@@ -1739,7 +1740,7 @@ def _auth_test(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _record_finding(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _record_finding(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """记录一条漏洞。
 
     - 默认（verified 未显式设为 true）：登记为**候选**，进报告但标注「待复核」；
@@ -1954,14 +1955,14 @@ def _record_finding(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     )
 
 
-def screenshot_available(ctx: "ToolRegistry", args: dict[str, Any]) -> bool:
+def screenshot_available(ctx: ToolRegistry, args: dict[str, Any]) -> bool:
     """是否已有截图证据（避免重复截图）。"""
     if args.get("screenshot_ref") is not None:
         return True
     return bool(ctx.screenshots)
 
 
-def _review_candidates(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _review_candidates(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """列出候选池（复核角色用）：返回指纹、证据编号与建议复核动作。"""
     include_tried = bool(args.get("include_tried"))
     candidates = ctx.surface.pending_candidates()
@@ -2039,7 +2040,7 @@ def _cvss_score(vector: str) -> float | None:
     return math.ceil(total * 10) / 10
 
 
-def _task_create(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _task_create(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """建立任务清单（对标 Strix 的 todos）：把要做的事显式写下来，逐条推进。"""
     items = args.get("items")
     if isinstance(items, str):
@@ -2059,7 +2060,7 @@ def _task_create(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     return "已建立任务清单：" + "；".join(created) + "。用 task_update 推进状态，用 task_list 查看。"
 
 
-def _task_list_tool(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _task_list_tool(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """查看任务清单与状态。"""
     if not ctx.task_list:
         return "任务清单为空（可用 task_create 建立）。"
@@ -2074,7 +2075,7 @@ def _task_list_tool(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _task_update(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _task_update(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """更新任务状态（pending / doing / done / blocked）。"""
     item_id = str(args.get("id") or "").strip()
     status = str(args.get("status") or "").strip().lower()
@@ -2088,7 +2089,7 @@ def _task_update(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     return f"错误：没有任务 {item_id!r}（用 task_list 查看现有编号）。"
 
 
-def _think(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _think(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """显式思考（对标 Strix 的 think 工具）：把推理写下来但不产生副作用。
 
     对弱模型很有用：强制它先梳理「已知事实 → 假设 → 下一步」，减少乱打工具。
@@ -2103,7 +2104,7 @@ def _think(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     )
 
 
-def _leave_note(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _leave_note(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """给其他子代理留条线索（写在共享攻面上，跨代理可读）。"""
     text = str(args.get("text") or "").strip()
     if not text:
@@ -2112,7 +2113,7 @@ def _leave_note(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     return f"已记录线索（{len(ctx.surface.agent_notes)} 条），其他子代理与复核阶段可见。"
 
 
-def _record_coverage(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _record_coverage(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """记录覆盖结论（对标 Strix 的 record_coverage），让报告能说清"没发现"的部分。"""
     target = str(args.get("target") or "").strip()
     status = str(args.get("status") or "").strip().lower()
@@ -2131,7 +2132,7 @@ def _record_coverage(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     )
 
 
-def _save_artifact(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _save_artifact(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """把内容存进本次运行的产物目录（payload 列表、字典、脚本片段）。"""
     name = str(args.get("name") or "").strip()
     content = str(args.get("content") or "")
@@ -2143,7 +2144,7 @@ def _save_artifact(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     return f"已保存产物：{path}（{len(content)} 字符）"
 
 
-def _finish_task(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _finish_task(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """结束当前子任务并给出结论（子代理的标准收尾动作）。"""
     summary = str(args.get("summary") or "").strip()
     ctx.finish_summary = summary
@@ -2155,7 +2156,7 @@ def _finish_task(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _sandbox_ready(ctx: "ToolRegistry", tool: str) -> tuple[Any, str]:
+def _sandbox_ready(ctx: ToolRegistry, tool: str) -> tuple[Any, str]:
     """检查沙箱与指定工具是否可用，返回 (sandbox, 错误信息)。"""
     sandbox = getattr(ctx, "sandbox", None)
     if sandbox is None:
@@ -2180,7 +2181,7 @@ def _sandbox_ready(ctx: "ToolRegistry", tool: str) -> tuple[Any, str]:
     return sandbox, ""
 
 
-def _record_tool_evidence(ctx: "ToolRegistry", result: Any, note: str) -> str:
+def _record_tool_evidence(ctx: ToolRegistry, result: Any, note: str) -> str:
     """把一次工具执行记成证据，返回证据编号（可被 record_finding 引用）。
 
     **失败的、超时的、只有部分输出的执行同样记录**——它们恰恰是最需要回看的：
@@ -2241,7 +2242,7 @@ def _record_tool_evidence(ctx: "ToolRegistry", result: Any, note: str) -> str:
     return exchange_id
 
 
-def _port_scan(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _port_scan(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """nmap 端口与服务发现（真工具）。"""
     sandbox, err = _sandbox_ready(ctx, "nmap")
     if err:
@@ -2262,7 +2263,7 @@ def _port_scan(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     )
 
 
-def _sqlmap_scan(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _sqlmap_scan(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """sqlmap 注入确认与只读取证（真工具）。
 
     这是 HexHound 从"疑似信号"跨到"证明"的关键：sqlmap 会给出可复现的 payload、
@@ -2323,7 +2324,7 @@ def _sqlmap_scan(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     return f"[{exchange_id}] sqlmap 结果（{url}，耗时 {result.duration:.0f}s）：\n{body}\n\n{verdict}"
 
 
-def _template_scan(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _template_scan(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """nuclei 模板化扫描（真工具）。"""
     sandbox, err = _sandbox_ready(ctx, "nuclei")
     if err:
@@ -2372,7 +2373,7 @@ def _template_scan(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     )
 
 
-def _dir_bruteforce(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _dir_bruteforce(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """ffuf 目录爆破（真工具）。"""
     sandbox, err = _sandbox_ready(ctx, "ffuf")
     if err:
@@ -2404,7 +2405,7 @@ def _dir_bruteforce(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     )
 
 
-def _web_fingerprint(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _web_fingerprint(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """whatweb 技术栈指纹（真工具）。"""
     sandbox, err = _sandbox_ready(ctx, "whatweb")
     if err:
@@ -2493,7 +2494,7 @@ def _parse_whatweb_plugins(output: str) -> list[tuple[str, str]]:
     return found
 
 
-def _sandbox_status(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _sandbox_status(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """报告真工具沙箱状态：执行环境、已安装工具、宿主地址映射。"""
     sandbox = getattr(ctx, "sandbox", None)
     if sandbox is None:
@@ -2531,7 +2532,7 @@ def _sandbox_status(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _raw_command(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _raw_command(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """在沙箱里执行一条白名单工具命令（受作用域与禁止参数双重约束）。"""
     sandbox = getattr(ctx, "sandbox", None)
     if sandbox is None or not sandbox.available():
@@ -2548,7 +2549,7 @@ def _raw_command(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     )
 
 
-def _spill_read(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _spill_read(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """读回被输出治理压缩掉的那部分原文（按句柄，分页或字面量搜索）。
 
     三种用法（`handle` 必填，来自工具输出里的 `[完整输出已保存] 句柄 SO-…`）：
@@ -2623,7 +2624,7 @@ def _spill_read(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
 MAX_SPILL_PAGE = 8000
 
 
-def _browser_verify_xss(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _browser_verify_xss(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """用真实浏览器验证 XSS：**反射 / DOM / 真的执行了** 三级分明。
 
     为什么必须是独立工具（而不是让 `dynamic_crawl` 顺手做）：这个工具的返回值
@@ -2704,7 +2705,7 @@ def _browser_verify_xss(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _sandbox_script(ctx: "ToolRegistry", args: dict[str, Any]) -> str:
+def _sandbox_script(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     """在沙箱里跑一段自定义 Python 脚本（用于并发竞态 / 多步状态机 / 密文分析）。
 
     为什么单开一个工具而不是让模型随便写命令：这三类问题**一条命令表达不出来**——

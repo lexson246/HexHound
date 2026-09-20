@@ -24,7 +24,6 @@ import sys
 
 from .sanitize import sanitize_terminal_text
 
-
 _UTF8_READY = False
 
 

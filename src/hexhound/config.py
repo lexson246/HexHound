@@ -256,7 +256,7 @@ class Config:
     # ---------- 构建 ----------
 
     @classmethod
-    def from_env(cls) -> "Config":
+    def from_env(cls) -> Config:
         """从环境变量构建并校验配置。"""
         provider = resolve_provider()
         base_url = _legacy_or_preset_base_url(provider)

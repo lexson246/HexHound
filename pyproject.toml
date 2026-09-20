@@ -43,6 +43,11 @@ packages = ["src/hexhound"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# 说明：源码与测试里的注释/提示词是中文，而 E501 按**字符数**计算行长，
+# 于是大量"读起来并不长"的中文行会被判超长。项目选择关掉 E501，
+# 而不是为了过 lint 去硬折中文句子（折行会破坏提示词与注释的可读性，收益为负）。
+# 真正有价值的规则（F/UP/B/I 等）全部保留，见下面的 lint 配置。
+extend-exclude = ["build", "dist", ".tmp", ".pytest-tmp", ".pytest_cache"]
 
 [tool.pytest.ini_options]
 # 注意：不要在这里写相对 testpaths —— `tests/conftest.py` 会把工作目录切到临时目录
@@ -52,6 +57,7 @@ addopts = "-q"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 # gui.py 内联了 HTML/CSS/JS 模板字符串，长行不可避免。

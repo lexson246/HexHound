@@ -30,10 +30,11 @@ import json
 import re
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 #: trace 格式版本。**改变事件结构时必须递增**，并同时在 `migrate_snapshot`
 #: 里加一条迁移分支——否则旧运行目录会在新版本里渲染出错误内容。
@@ -134,7 +135,7 @@ def redact(value: Any, *, key: str = "", depth: int = 0) -> Any:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + "Z"
+    return datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + "Z"
 
 
 @dataclass

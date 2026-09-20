@@ -30,10 +30,11 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
-from urllib.parse import urljoin, urlparse
+from typing import Any
+from urllib.parse import urlparse
 
 #: 单份规范的最大字节数（防止拿一个巨型文件把内存吃满）。
 MAX_SPEC_BYTES = 8 * 1024 * 1024
@@ -814,7 +815,6 @@ def extract_operations(
             "（而不是 Postman 集合或 API 文档页面）。"
         )
     components = spec.get("components") if isinstance(spec.get("components"), dict) else {}
-    definitions = spec.get("definitions") if isinstance(spec.get("definitions"), dict) else {}
     schemes = spec.get("securityDefinitions")
     if not isinstance(schemes, dict):
         schemes = (components or {}).get("securitySchemes")

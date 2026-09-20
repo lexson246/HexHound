@@ -25,13 +25,10 @@ from .config import (
     resolve_provider,
     write_env_file,
 )
-from .llm import LLMClient, build_llm_pool
+from .llm import LLMClient
 from .login import capture_login_state
 from .memory import HostMemory, RunArtifacts
 from .orchestrator import (
-    DEFAULT_TASK_STEPS,
-    MAX_PARALLEL,
-    MAX_TASKS,
     Orchestrator,
     SwarmCallbacks,
 )
@@ -50,6 +47,7 @@ from .submission import write_butian_package
 from .surface import AttackSurface
 from .tools import ToolRegistry
 from .vision import VisionClient
+
 
 def _project_root() -> Path:
     if getattr(sys, "frozen", False):
@@ -960,6 +958,12 @@ def _run_audit(settings: dict, token: int) -> None:
         mode = settings.get("mode", "blackbox")
         swarm = str(settings.get("swarm", "1")) not in ("0", "false", "no", "")
         base_dir = Path(settings.get("path") or "vulnlab") if mode == "source" else Path.cwd()
+        # 必须用**同一个**客户端池构造函数：CLI 走 `cli._build_llm_pool`
+        # （内含按角色解析 key/base_url 的逻辑），这里是同一个入口。
+        # 回归：此处曾调用一个**从未导入**的 `_build_llm_pool`，
+        # 于是"从 GUI 启动审计"必定 NameError——GUI 长期没有自动化测试才没被发现。
+        from .cli import _build_llm_pool
+
         llm, llm_pool = _build_llm_pool(config)
         auth_profiles = {
             "A": _parse_auth_profile(settings.get("auth_a", "")),

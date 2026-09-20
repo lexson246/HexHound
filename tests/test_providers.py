@@ -12,7 +12,6 @@ from unittest.mock import patch
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
-from hexhound import providers as providers_module  # noqa: E402
 from hexhound.config import (  # noqa: E402
     Config,
     normalize_base_url,

@@ -21,7 +21,6 @@ sys.path.insert(0, str(SRC))
 from hexhound.xssverify import (  # noqa: E402
     CONFIRMED_LEVEL,
     DEFAULT_PAYLOADS,
-    EXECUTION_FLAG,
     MARKER_ATTRIBUTE,
     BrowserUnavailable,
     BrowserVerifier,
@@ -296,7 +295,6 @@ class EscapedOutputTests(unittest.TestCase):
         )
 
     def test_url_encoded_payload_is_detected(self) -> None:
-        from urllib.parse import quote
 
         encoded = quote(PAYLOAD, safe="")
         level = classify(

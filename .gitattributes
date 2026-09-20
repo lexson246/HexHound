@@ -1,0 +1,32 @@
+# 统一换行符：源码一律 LF。
+#
+# 为什么必须显式声明（而不是靠 git 的 core.autocrlf）：
+# 这个项目在 Windows 上开发、在 WSL/Linux 与 CI 里跑测试。
+# `core.autocrlf` 的默认值在两个平台不同（Windows true / Linux input），
+# 于是同一个文件在两边 checkout 出来的换行不一样，diff 里会出现整文件级别的
+# "改动"——真实改动被淹没在里面，review 与 git blame 都会失效。
+# 实测踩过：一次 ruff --fix 把若干文件从 LF 改成 CRLF，diff 直接变成 +3078/-3078。
+#
+# 显式声明后："仓库里是什么换行，checkout 出来就是什么"，两端一致。
+* text=auto eol=lf
+
+# 二进制文件不要做任何换行/文本处理
+*.exe   binary
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.db    binary
+*.sqlite binary
+*.sqlite3 binary
+*.pyc   binary
+
+# 需要保留 CRLF 的脚本（Windows 批处理对 LF 敏感）
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# shell 脚本必须是 LF（CRLF 会让 WSL/bash 直接报 bad interpreter）
+*.sh    text eol=lf
+
+# 生成的锁文件不要参与 diff 统计
+pnpm-lock.yaml -diff
+package-lock.json -diff

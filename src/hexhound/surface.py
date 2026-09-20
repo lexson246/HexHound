@@ -17,10 +17,11 @@ import json
 import re
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
-from urllib.parse import parse_qsl, urlparse, urlunparse
+from typing import Any
+from urllib.parse import parse_qsl, urlparse
 
 from .apispec import Operation, SpecImport, build_operation_url  # noqa: F401
 
@@ -117,7 +118,7 @@ class Endpoint:
     note: str = ""
     first_seen: float = field(default_factory=time.time)
 
-    def merge(self, other: "Endpoint") -> None:
+    def merge(self, other: Endpoint) -> None:
         for method in other.methods:
             if method not in self.methods:
                 self.methods.append(method)
@@ -897,7 +898,7 @@ class AttackSurface:
         return target
 
     @classmethod
-    def load(cls, path: str | Path, target: str = "", mode: str = "blackbox") -> "AttackSurface":
+    def load(cls, path: str | Path, target: str = "", mode: str = "blackbox") -> AttackSurface:
         """从磁盘恢复攻面；文件不存在或损坏时返回空攻面。"""
         surface = cls(target=target, mode=mode, path=Path(path))
         try:

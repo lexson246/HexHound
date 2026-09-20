@@ -33,10 +33,8 @@ Strix 通过 CDP 驱动 headless Chromium，能做 a11y 快照、截图、网络
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import urlparse
 
 #: 验证结论的级别（从弱到强）。

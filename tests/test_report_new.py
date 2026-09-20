@@ -13,7 +13,7 @@ sys.path.insert(0, str(SRC))
 
 from hexhound.agent import AgentResult  # noqa: E402
 from hexhound.report import to_json, to_markdown, write_report  # noqa: E402
-from hexhound.surface import AttackSurface, Finding  # noqa: E402
+from hexhound.surface import AttackSurface  # noqa: E402
 
 
 def build_result() -> AgentResult:

@@ -10,6 +10,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 SRC = Path(__file__).resolve().parents[1] / "src"

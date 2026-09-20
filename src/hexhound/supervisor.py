@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 #: 同一 (工具, 参数) 重复到这个次数 → 告警（对齐 PentAGI 的 3 次）。

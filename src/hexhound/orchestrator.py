@@ -16,11 +16,11 @@ HexHound 的落地方式：一个进程内的**分波并行**模型——
 from __future__ import annotations
 
 import json
-import re
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from dataclasses import dataclass
+from typing import Any
 
 from .agent import AgentResult, ReActAgent, extract_json, harvest_findings
 from .budget import Budget, TaskUsage
@@ -37,8 +37,8 @@ from .replan import (
     parse_patch,
 )
 from .sandbox import sandbox_report
-from .surface import AttackSurface, normalize_endpoint, sort_urls
 from .supervisor import Supervisor
+from .surface import AttackSurface, normalize_endpoint, sort_urls
 from .tools import ToolRegistry
 from .trace import TraceRecorder, summarize_trace, write_snapshot
 
@@ -252,11 +252,18 @@ class TaskWorker:
         self._step_notice(step, messages)
         verdict = self.supervisor.observe(step)
         if self.trace is not None and verdict.level != "ok":
+            # `Verdict.to_dict()` 里带一个 `kind` 键（repeat/stall/failure_loop），
+            # 而 `TraceRecorder.record(kind=...)` 的第一个关键字参数**也叫 kind**。
+            # 直接 `**verdict.to_dict()` 会 TypeError（"got multiple values for
+            # argument 'kind'"）——实测把两个子任务打成"未预期错误中断"。
+            # 所以这里显式改名，把判定类别放进 data 里。
+            verdict_data = verdict.to_dict()
+            verdict_data["verdict_kind"] = verdict_data.pop("kind", "")
             self.trace.record(
                 "supervisor",
                 task=self.task.id,
                 role=self.task.role,
-                **verdict.to_dict(),
+                **verdict_data,
             )
         if verdict.abort:
             raise StepAbort(f"{verdict.reason}；{verdict.directive}")
@@ -683,12 +690,18 @@ class Orchestrator:
         # 离线审计要回答的不只是"调了什么工具"，还有"为什么后来又开了一波"。
         if self.trace is not None:
             kind = str(payload.get("kind") or "event")
-            task = str((payload.get("task") or {}).get("id") or "") if isinstance(
-                payload.get("task"), dict
-            ) else ""
-            self.trace.record(f"orchestrator_{kind}", task=task, **{
-                key: value for key, value in payload.items() if key not in ("kind", "task")
-            })
+            task = (
+                str((payload.get("task") or {}).get("id") or "")
+                if isinstance(payload.get("task"), dict)
+                else ""
+            )
+            # 同理：payload 里也有 `kind`，与 `record(kind=...)` 撞名，必须改名。
+            data = {
+                ("event_kind" if key == "kind" else key): value
+                for key, value in payload.items()
+                if key != "task"
+            }
+            self.trace.record(f"orchestrator_{kind}", task=task, **data)
 
     def _stopped(self) -> bool:
         if self.callbacks.should_stop is not None and self.callbacks.should_stop():
@@ -1762,14 +1775,22 @@ class Orchestrator:
         unattacked = [f"{url} 参数[{param}]" for url, param in self.unattacked_params()[:15]]
         finished = [task for task in done if task.outcome in CLOSED_OUTCOMES]
         unfinished = [task for task in done if task.outcome not in CLOSED_OUTCOMES]
+        # 用 `OUTCOME_LABEL.get(task.outcome)` 而不是 `task.outcome_label`：
+        # `WorkerTask` 只有 `to_dict()` 里的派生字段 `outcome_label`，
+        # 直接当属性读会 AttributeError——实测把整次 audit 打挂了
+        # （异常发生在波次边界的重规划里，一路冒到 CLI）。
+        unfinished_text = (
+            "（"
+            + "、".join(
+                f"{t.id}({OUTCOME_LABEL.get(t.outcome, t.outcome)})" for t in unfinished[:6]
+            )
+            + "）"
+            if unfinished
+            else ""
+        )
         lines = [
             "<current_state>",
-            f"已完成子任务：{len(finished)} 个；未收尾：{len(unfinished)} 个"
-            + (
-                "（" + "、".join(f"{t.id}({t.outcome_label})" for t in unfinished[:6]) + "）"
-                if unfinished
-                else ""
-            ),
+            f"已完成子任务：{len(finished)} 个；未收尾：{len(unfinished)} 个{unfinished_text}",
             f"端点覆盖：{gate.get('touched')}/{gate.get('total')}"
             f"；参数覆盖：{gate.get('params_attempted')}/{gate.get('params_total')}",
         ]
@@ -1790,7 +1811,32 @@ class Orchestrator:
     def _run_replan_round(
         self, gate: dict[str, Any], done: list[WorkerTask], plan: list[WorkerTask]
     ) -> list[WorkerTask]:
-        """执行一轮重规划，返回新增的任务（不修改入参）。"""
+        """执行一轮重规划，返回新增的任务（不修改入参）。
+
+        **整轮包在 try 里**：重规划是"锦上添花"的可选阶段，它的任何缺陷都
+        不该让一次已经跑出结论的审计崩掉。实测教训：`_replan_brief` 里的一个
+        AttributeError 一路冒到 CLI，把整次 audit 变成 exit 1——
+        而那次运行其实已经发现了路径穿越与 SSRF 两条 critical。
+        失败时记 `replan_error` 事件并返回空列表，主流程按原计划继续。
+        """
+        try:
+            return self._replan_round_inner(gate, done, plan)
+        except Exception as exc:  # noqa: BLE001 重规划不得影响主流程
+            self._event(
+                kind="replan_error",
+                message=(
+                    f"重规划阶段出错，已跳过（按原计划继续）：{type(exc).__name__}: {exc}"
+                ),
+            )
+            if self.trace is not None:
+                self.trace.record_error(
+                    f"重规划阶段出错：{type(exc).__name__}: {exc}", kind="replan_error"
+                )
+            return []
+
+    def _replan_round_inner(
+        self, gate: dict[str, Any], done: list[WorkerTask], plan: list[WorkerTask]
+    ) -> list[WorkerTask]:
         policy: ReplanPolicy = self.replan_policy
         if not policy.can_replan():
             return []

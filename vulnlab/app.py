@@ -105,7 +105,10 @@ def index() -> str:
       <li><a href="/api/users">/api/users</a> —— 未授权访问 / IDOR</li>
       <li><a href="/wallet">/wallet</a> —— 余额（配合 /coupon 验证竞态）</li>
       <li><a href="/coupon">/coupon</a> —— 竞态：单次优惠券并发重复兑换（POST code=HH-RACE-100）</li>
-      <li>/cart、/cart/total、/order/prepare、/order/confirm —— 业务逻辑：价格篡改 / 负数数量 / 跳过步骤 / 重复提交</li>
+      <li><a href="/cart">/cart</a> —— 业务逻辑：接受客户端价格 + 不校验数量正负</li>
+      <li><a href="/cart/total">/cart/total</a> —— 购物车合计（按客户端价格算）</li>
+      <li><a href="/order/prepare">/order/prepare</a> —— 下单前置步骤（**不被校验**）</li>
+      <li>/order/confirm —— 业务逻辑：跳过步骤 / 价格篡改 / 重复提交（POST，见 /cart 说明）</li>
       <li><a href="/api/admin/export">/api/admin/export</a> —— JWT 保护的管理员导出</li>
     </ul>
     <form method="POST" action="/login">

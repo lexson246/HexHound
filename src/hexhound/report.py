@@ -13,8 +13,7 @@ v0.2 的报告结构（对标 Strix 的 findings/coverage 分离与 PentAGI 的�
 from __future__ import annotations
 
 import json
-import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -92,7 +91,7 @@ _OWASP_EXPECTED = ("A01", "A02", "A03", "A05", "A06", "A07", "A10")
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def _cell(text: object) -> str:
