@@ -299,6 +299,137 @@ $ bash poc/HH-002.sh
 实际发出的请求数: 1 | 缓存命中: 2
 ```
 
+## 输出有界、原文不丢、过程可离线审计
+
+三件事针对同一个失效模式：**Agent 看到的东西比它产出的少，而没人知道它到底做了什么。**
+
+**1. 超长工具输出有上限，但绝不丢。** 超过 16 KiB 的内容会压缩给模型看，
+同时整段原文进本次运行的 spill store，模型拿到一个 opaque 句柄，
+可以用**专用工具**读回：
+
+```bash
+# 工具返回值里会写：[完整输出已保存] 句柄 SO-3b4bf44073ddfd7c0f2d30c145daaeec
+spill_read(handle="SO-3b4bf4…", offset=0, limit=8000)     # 分页
+spill_read(handle="SO-3b4bf4…", search="injectable")      # 字面量搜索
+```
+
+句柄是 `SO-` + 128 位随机数——不是自增序号、不是内容哈希，也不含路径，
+因此**没有路径参数可以被滥用**，也读不到别的运行的内容（默认按运行存在内存里）。
+配额分三级（单条 256 KiB / 单次运行 32 MiB / 累计 512 MiB），用尽时**如实报告**
+而不是假装存下了。元数据记录 `original_size` / `stored_size` / `truncated` / `sha256`，
+复核者可以确认"拿到的就是当时那段"。失败、超时、被作用域拒绝的输出**同样保存**——
+"sqlmap 为什么什么都没跑出来"只能从报错里看出来。
+
+**2. 每次运行都写 `trace.jsonl`。** 追加写、逐条 flush，所以运行被中断也读得到
+中断前发生了什么。每行是一个事件：模型步骤（动作、参数摘要、观察摘要、阶段、
+证据引用）、工具调用（名称、耗时、退出码、输出大小、溢写句柄、错误）、
+finding、coverage、预算快照，或编排事件（计划、波次、补扫、时间闸门拒绝、重规划决策）。
+敏感字段**写盘前**就掩码：按键名（`Authorization`/`Cookie`/`token`/`password`…）、
+按值的形态（`sk-…`、JWT、`AKIA…`、PEM 头）、以及自由文本里的 `hh_session=…`。
+键名与长度保留——审计仍能看出"当时带了这个头"，但还原不出原值。
+
+**3. 报告可以在不碰目标、不叫模型的情况下重渲染。** `snapshot.json` 存了渲染器
+需要的全部状态：
+
+```bash
+hexhound report --run latest --target http://127.0.0.1:5000 \
+  --output reports/final.md --trace --trace-out reports/trace.json
+```
+
+测试用**会抛异常的** `httpx.request` 与 LLM 客户端替身来证明这条路径真的离线。
+快照带自己的 schema 版本与迁移链（无版本 → v1 → v2）；比快照更早的运行目录会回退到
+`surface.json` + `tasks.json`，并在报告里**明说**轨迹与工具证据当时没有记录——
+而不是让读者以为那部分本来就是空的。
+
+## API 合约导入（OpenAPI 3 / Swagger 2）
+
+```bash
+hexhound audit --target http://127.0.0.1:5000 --mode blackbox \
+  --api-spec ./openapi.yaml --output reports/api.md
+```
+
+导入的接口会写进**共享攻面**，因此覆盖率闸门会强制它们：算作未触碰端点、
+声明的参数进入参数级盲区清单，而且**导入本身不把任何东西标成已测**。
+规划者会收到独立的 `<api_contract>` 段落。
+
+安全模型刻意与 Strix 相反：规范是**不可信输入**，所以它的
+`servers` / `host` / `schemes` / `basePath` 会被记进报告、然后**被忽略**——
+每个接口都锚定在你指定的 `--target` 上。外部 `$ref` 默认拒绝；本地引用必须留在
+规范根目录内（先文本查 `..`，再用解析后的路径做归属复核）；可选的远程引用走
+**与目标请求同一份** `ALLOWED_HOSTS` 校验。协议相对路径（`//evil.example.com/x`）
+与绝对 URL 直接拒绝，不以 `/` 开头的路径**报错而不是静默补斜杠**。
+每一条被跳过的接口/参数都会写明原因。YAML 用自实现的子集解析，并**主动拒绝**
+锚点、别名、自定义标签与多文档——那是 YAML 炸弹与 `!!python/object` 反序列化的入口——
+拒绝时给出具体行号。
+
+## 浏览器实跑的 XSS：反射不等于执行
+
+```bash
+pip install playwright && python -m playwright install chromium   # 可选
+```
+
+`browser_verify_xss` 用真实浏览器打开页面，返回**分级**结论——因为
+"payload 在响应里"和"payload 执行了"是两个不同的发现：
+
+| 级别 | 证据 | 报告里可以怎么写 |
+| --- | --- | --- |
+| `executed` | DOM 标记被改写 / 全局变量被设置 / 弹出对话框 | **确认的 XSS** |
+| `dom` | payload 进了渲染后的 DOM，没有任何执行 | 进了 DOM，未确认执行 |
+| `reflected` | payload 只在原始响应里 | 反射——**不是** XSS |
+| `blocked` | 出现了但被 CSP/浏览器策略拦下 | 不可利用 |
+| `absent` | 哪儿都没有 | 未反射 |
+
+只有 `executed` 会置 `confirmed`，且每个级别的**措辞在代码里写死并回显在工具结果里**，
+模型无法把"反射"升级成"确认 XSS"。作用域在**打开页面之前**校验一次，
+并按重定向后的最终 URL **再校验一次**（一次跳转就足以离开范围）；
+只允许 http/https，`file:` 与 `data:` 直接拒绝。默认载荷无破坏性——
+只给自己的 DOM 打一个标记属性，并且避开 `alert()`（headless 下会阻塞页面）
+与裸 `<script>`（只有在直接注入解析流时才执行，会把属性上下文与 innerHTML 注入误判成"不执行"）。
+每次验证都保存原始响应体、渲染后 DOM、console、对话框、网络、Cookie 与 PNG 截图，
+截图作为 `S` 编号证据。Playwright 保持可选：没装就**不下发**这个工具，
+而 `fuzz_params` 的 xss 类别照常可用，所以"没装浏览器"永远不会悄悄变成"XSS 没测"。
+
+靶场里有一组**对照组**让这个区分可复核：`/reflect`、`/reflect-text`、
+`/reflect-dom`、`/reflect-csp` 四个端点都会原样回显，字符串级别完全一样，
+但**只有 `/reflect` 会执行**。
+
+## 收敛：受限收尾回合、有界重规划、监督器
+
+子任务把步数用光却没调 `finish_task` 时，现在会得到**最多两个受限收尾回合**，
+工具白名单是 `record_finding` / `record_coverage` / `leave_note` / `finish_task`。
+其它动作会被拒绝**且不执行**，所以多出来的轮次不可能变成新一轮扫描——
+总 LLM 请求数是 `max_steps + 2`，是算术而不是承诺。模型仍不总结时，
+系统按**已落库的事实**代写一份（步数、动作分布、finding 与 coverage 计数），
+该任务标为 `closing_no_finish`：产出保住了，但"模型自己收的尾"与
+"系统不得不代收"仍然分得清。provider 报错、预算中止、监督器中止都是明确终态，
+且保留已经记录的步骤、发现与覆盖。
+
+重规划**只在波次边界**发生，且只能用结构化 patch（增/改/删），上限写在代码里：
+每次最多新增 3 个任务、最多 3 轮、总任务 40、依赖深度 4。
+`update` 改不了 id/role/url——那会让台账、证据归属或攻击目标与实际执行对不上。
+**重规划不能扩大授权范围**：新增任务的主机必须等于本次运行的目标主机，
+这比"在白名单内"更严，因为一次运行可能白名单里有多个主机而只授权其中一个。
+任务 ID 由内容派生，同一输入得到同一组 ID，因此一次运行可重放。
+
+监督器盯三类停滞，各有告警与中止两个阈值：完全相同的工具调用、
+连续多步没有新证据、同一个失败反复出现。判定与动作分离，
+每次干预都写进 trace，中止是**优雅**的——告诉子代理固化发现并收尾，而不是直接掐断。
+
+## 自己验证一遍
+
+```bash
+python -m pytest                                    # 664 passed, 1 skipped
+python -m ruff check src tests                      # All checks passed
+python examples/tool_selftest.py                    # 31 项检出能力，不需要 key
+SWARM_MOCK=1 python examples/swarm_demo.py          # 完整编排，不调模型
+wsl -d Ubuntu-24.04 -u root -- bash /mnt/c/.../tools/verify_lab_new_vulns.sh      # 5/5
+wsl -d Ubuntu-24.04 -u root -- bash /mnt/c/.../tools/verify_lab_business_logic.sh # 7/7
+```
+
+> WSL 里的靶场是**独立副本**：在 Windows 侧改 `vulnlab/app.py` 不会影响
+> `/opt/hexhound-lab/app.py`。要先把文件拷过去、再重启靶场（按**端口**杀进程，
+> 不要按命令行匹配），新端点才会存在。
+
 ## 常见命令
 
 ```bash
@@ -697,13 +828,20 @@ windowed 模式会把这些全部吞掉。打包后向导与设置面板把 `.en
 │   ├── vision.py             # 多模态识图客户端
 │   ├── gui.py                # Flask 图形化界面（hexhound gui）
 │   ├── desktop.py            # pywebview 桌面版
-│   └── cli.py                # click CLI（audit / report / providers / setup / gui）
-├── vulnlab/                  # 故意带漏洞的 Flask 靶场（10 类漏洞）
+│   ├── sanitize.py           # ANSI/OSC/C0 清理、UTF-8 安全解码、头尾裁剪
+│   ├── spill.py              # 有界、按运行隔离的超长输出存储（opaque 句柄）
+│   ├── trace.py              # 审计轨迹 + 报告重建快照 + 脱敏 + 迁移
+│   ├── apispec.py            # OpenAPI 3 / Swagger 2 导入（$ref 安全策略、YAML 子集）
+│   ├── replan.py             # 有界运行中计划 patch（增/改/删 + 硬上限）
+│   ├── supervisor.py         # 停滞 / 重复 / 失败循环检测与优雅中止
+│   ├── xssverify.py          # 浏览器实跑 XSS 分级（反射 vs DOM vs 执行）
+│   └── cli.py                # click CLI（audit/report/providers/sandbox/memory/setup/gui）
+├── vulnlab/                  # 故意带漏洞的 Flask 靶场（17 类，含业务逻辑）
 ├── examples/
 │   ├── tool_selftest.py      # 工具检出能力自检（31 项，无需 API key）
 │   ├── swarm_demo.py         # 端到端编排演练（SWARM_MOCK=1 可离线运行）
 │   └── mock_demo.py          # 单代理模式最小演示
-└── tests/                    # 144 个单元测试（纯本地，无网络）
+└── tests/                    # 664 个单元测试（纯本地，无网络）
 ```
 
 ## 安全边界与免责声明
@@ -738,10 +876,16 @@ windowed 模式会把这些全部吞掉。打包后向导与设置面板把 `.en
 - [x] **跨运行 diff + 回归复核**：新增 / 仍存在 / 疑似已修复 / 状态未知，且**绝不把"没测到"当"已修复"**
 - [x] **记忆维护命令**（`hexhound memory --list/--forget/--before/--reset`）
 - [x] **脚本通道 + 三类 playbook（竞态 / 业务逻辑 / 加密与认证实现）**：确定性派任务，靶场可手工复核
-- [ ] 运行中动态调整任务计划（增量 subtask patch）
-- [ ] 超长工具输出落盘 + 按需回读（spill store）
+- [x] **有界工具输出 + 按运行隔离的 spill store**：用专用分页/搜索工具回读（不需要 shell）
+- [x] **可离线审计的 trace + 报告重建**（`trace.jsonl` / `snapshot.json`、脱敏、schema 迁移）
+- [x] **API 合约导入**（OpenAPI 3 / Swagger 2）：锚定 `--target`，`$ref` 安全策略有测试锁定
+- [x] **浏览器实跑的 XSS 验证**（Playwright 可选）：反射 / DOM / **真的执行了** 三级分开判定
+- [x] **有界运行中重规划**（只在波次边界、结构化 patch、硬上限）+ 停滞/失败循环监督
+- [x] **靶场业务逻辑场景**（`/cart`、`/order/confirm`：价格篡改 / 负数数量 / 跳过步骤 / 重复提交），人工脚本 7/7
+- [x] **CI**（Windows/Linux × py3.11/3.12 的 lint + 测试 + 免 key 自检）
+- [ ] spill/snapshot 的长期保留策略（长驻安装的清理）
+- [ ] 浏览器验证覆盖 POST 请求体（当前只做 GET）
 - [ ] 更多靶场漏洞类型（反序列化 / 原型链污染）
-- [ ] 浏览器实跑的 XSS 确认（当前只做到字符串原样回显，不执行 JS）
 
 ## License
 
