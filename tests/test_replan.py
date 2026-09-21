@@ -498,6 +498,70 @@ class SupervisorTests(unittest.TestCase):
         )
         self.assertEqual(supervisor.stall_steps, 0)
 
+    def test_state_changing_requests_count_as_progress(self) -> None:
+        """回归：**误杀**——一次业务逻辑任务被"无进展"判据中止了。
+
+        实测现场的 7 步（每一步都在推进）：
+            1-4  GET 探路 / POST /login 拿会话 / POST /cart 加购
+            5    GET /catalog → 观察 1602 字符（真的取回了商品目录）
+            6-7  继续 POST 下单
+        全部被判"无进展" → 连续 8 步后直接中止。原因是旧判据只看
+        "record_* 动作 + 少数中文进展词"，而多步业务逻辑靠 POST 推进、
+        既不产生命中信号也不含那些标记。
+
+        该收尾的被中止、该中止的没被中止，是同一类失效。
+        """
+        supervisor = Supervisor()
+        steps = [
+            {"action": "http_request", "action_input": {"url": "/cart"}, "observation": "401"},
+            {"action": "http_request",
+             "action_input": {"url": "/login", "method": "POST", "data": {"username": "x"}},
+             "observation": "登录成功"},
+            {"action": "http_request",
+             "action_input": {"url": "/cart", "method": "POST",
+                              "data": {"sku": "SKU-1002", "qty": 1, "price": 0.01}},
+             "observation": "已加入购物车"},
+            {"action": "http_request", "action_input": {"url": "/catalog"},
+             "observation": "x" * 1602},
+        ]
+        for step in steps:
+            verdict = supervisor.observe(step)
+            self.assertNotEqual(verdict.kind, "stall", verdict.reason)
+        self.assertEqual(supervisor.stall_steps, 0)
+
+    def test_substantial_observation_counts_as_progress(self) -> None:
+        supervisor = Supervisor()
+        supervisor.observe(
+            {"action": "http_request", "action_input": {"url": "/catalog"},
+             "observation": "商品目录内容 " * 100}
+        )
+        self.assertEqual(supervisor.stall_steps, 0)
+
+    def test_request_body_without_method_counts_as_progress(self) -> None:
+        """没写 method 但带了 data → 实际语义是提交，也算推进。"""
+        supervisor = Supervisor()
+        supervisor.observe(
+            {"action": "http_request",
+             "action_input": {"url": "/cart", "data": {"sku": "SKU-1001"}},
+             "observation": "ok"}
+        )
+        self.assertEqual(supervisor.stall_steps, 0)
+
+    def test_short_get_responses_still_count_as_no_progress(self) -> None:
+        """放宽判据**不能**把真停滞也放过：短响应的重复 GET 仍应触发停滞。"""
+        supervisor = Supervisor()
+        verdicts = []
+        for index in range(STALL_ABORT_STEPS):
+            verdicts.append(
+                supervisor.observe(
+                    {"action": "http_request",
+                     "action_input": {"url": f"/nope{index}", "method": "GET"},
+                     "observation": "404 NOT FOUND"}
+                )
+            )
+        self.assertEqual(verdicts[-1].kind, "stall")
+        self.assertTrue(verdicts[-1].abort)
+
     def test_progress_markers_count_too(self) -> None:
         """观察文本里出现"新增端点"也算进展（模型不必显式调记录类工具）。"""
         supervisor = Supervisor()

@@ -169,6 +169,40 @@ class LabBusinessLogicTests(unittest.TestCase):
         self.assertEqual(anonymous.get("/cart").status_code, 401)
         self.assertEqual(anonymous.post("/order/confirm", json={}).status_code, 401)
 
+    def test_catalog_is_public_and_lists_skus(self) -> None:
+        """回归：**目录必须可发现**，否则整条下单链路无法验证。
+
+        实测踩到的靶场设计缺陷：服务端知道真实单价，但 Agent 无从知道 SKU——
+        首页没列、`app.js` 里没有、`/catalog` 与 `/products` 都 404。
+        于是它识别出了"价格由客户端决定"，却构造不出
+        "1299 元的商品以 0.01 元成交"的最终对比，只能把结论记成待复核候选。
+        入口发现不了的漏洞等于不存在。
+        """
+        response = self.client.get("/catalog")
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertTrue(body["items"], "目录不能是空的")
+        skus = {item["sku"] for item in body["items"]}
+        self.assertIn("SKU-1002", skus)
+        for item in body["items"]:
+            self.assertIn("price", item)
+            self.assertIn("stock", item)
+
+    def test_catalog_needs_no_login(self) -> None:
+        anonymous = LAB.app.test_client()
+        self.assertEqual(anonymous.get("/catalog").status_code, 200)
+
+    def test_catalog_sku_can_complete_the_price_tampering_chain(self) -> None:
+        """端到端：从目录拿 SKU → 低价加购 → 低价下单（这才是完整证据）。"""
+        sku = self.client.get("/catalog").get_json()["items"][1]
+        self.assertEqual(sku["sku"], "SKU-1002")
+        server_price = sku["price"]
+        self.add(sku=sku["sku"], qty=1, price=0.01)
+        order = self.client.post("/order/confirm", json={}).get_json()
+        self.assertEqual(order["code"], 0)
+        self.assertEqual(order["total"], 0.01)
+        self.assertLess(order["total"], float(server_price) / 100)
+
     def test_shop_reset_requires_admin_and_restores_state(self) -> None:
         self.add(sku="SKU-1003", qty=2, price=29)
         # 普通用户不能重置

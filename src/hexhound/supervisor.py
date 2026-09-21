@@ -46,6 +46,10 @@ _PROGRESS_MARKERS = (
     "新增端点", "已记录", "已登记", "命中信号", "发现", "[OK]",
     "已写入", "已保存",
 )
+#: 会**改变服务端状态**的 HTTP 方法：多步业务逻辑测试靠它们推进。
+_STATE_CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+#: 观察文本达到这个长度就认为"取回了实质内容"（大响应体 = 有新信息）。
+_SUBSTANTIAL_OBSERVATION_CHARS = 400
 #: 视为"失败"的观察特征（用于相同失败循环判定）。
 _FAILURE_MARKERS = (
     "工具执行出错", "请求失败", "拒绝：", "已拒绝执行", "错误：",
@@ -89,17 +93,42 @@ def _signature(action: str, action_input: Any) -> str:
 
 
 def _looks_like_progress(step: dict[str, Any]) -> bool:
-    """这一步是否产生了"进展"（新证据、新结论、新端点）。
+    """这一步是否推进了工作（新证据、新结论、新端点、或取回了实质内容）。
 
-    判据刻意保守：只有明确的记录类动作、或观察文本里的进展标记才算。
-    "没进展"是**正**判据（连续多步没进展才干预），因此宁可漏判——
-    误判成"卡住"会把正常的长任务砍掉。
+    判据要**既不误杀也要能抓真停滞**。早先只看"记录类动作 + 少数中文进展词"，
+    结果误杀了一次业务逻辑任务（实测）：
+
+        步骤 1-4  GET 探路 / POST /login 拿会话 / POST /cart 加购
+        步骤 5    GET /catalog  → 观察 1602 字符（真的取回了商品目录）
+        步骤 6-7  继续 POST 下单
+        → 被判"连续 8 步无进展"**直接中止**
+
+    那 7 步每一步都在推进，只是观察文本里既没有"新增端点"这类中文标记，
+    也不是 record_* 动作。**该收尾的被中止、该中止的没被中止是同一类失效**：
+    判据错了的时候，越自动化越危险。所以补两条与领域无关的信号：
+
+    - 请求方法会改变服务端状态（POST/PUT/PATCH/DELETE）——多步业务逻辑
+      正是靠这些请求推进，它们不产生"命中信号"，但必须算进展；
+    - 观察文本足够长（>= `_SUBSTANTIAL_OBSERVATION_CHARS`）——说明取回了实质内容。
     """
     action = str(step.get("action") or "")
     if action in _PROGRESS_ACTIONS:
         return True
     observation = str(step.get("observation") or "")
-    return any(marker in observation for marker in _PROGRESS_MARKERS)
+    if any(marker in observation for marker in _PROGRESS_MARKERS):
+        return True
+    if len(observation) >= _SUBSTANTIAL_OBSERVATION_CHARS:
+        return True
+    action_input = step.get("action_input")
+    if isinstance(action_input, dict):
+        method = str(action_input.get("method") or "").upper()
+        if method in _STATE_CHANGING_METHODS:
+            return True
+        # 没写 method 但带了请求体 → 按提交处理（http_request 默认 GET，
+        # 但带 data/json 时客户端的实际语义是提交）
+        if action_input.get("data") or action_input.get("json"):
+            return True
+    return False
 
 
 def _failure_signature(step: dict[str, Any]) -> str:
