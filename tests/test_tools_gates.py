@@ -462,6 +462,38 @@ class SharedSessionCaptureTests(unittest.TestCase):
             "另一子代理必须能看到已登记的会话",
         )
 
+    def test_injection_role_can_switch_accounts(self) -> None:
+        """回归：`use_account` 曾经**不在 injection 角色的工具集里**。
+
+        后果很直接：注入/业务逻辑常常要先登录才碰得到逻辑（购物车、订单、券码），
+        而会话是 auth 角色拿到的——没有 `use_account`，注入角色只能看着 401
+        反复重试，最后把业务逻辑记成 `blocked`。实测就是这么发生的
+        （见 docs/WORK-REPORT-ROUND2.md §4.1）。
+        """
+        from hexhound.tools import ROLE_TOOLS
+
+        self.assertIn("use_account", ROLE_TOOLS["injection"])
+        for role in ("auth", "verify"):
+            self.assertIn("use_account", ROLE_TOOLS[role])
+
+    def test_use_account_lists_available_identities(self) -> None:
+        """切换失败时要列出**已有身份**，让模型知道 C 已经存在。"""
+        from hexhound.tools import _use_account
+
+        registry = self.make_registry(profiles={"C": {"Cookie": "hh_session=x:tok-x-demo"}})
+        message = _use_account(registry, {"account": "A"})
+        self.assertIn("已有身份", message)
+        self.assertIn("C", message)
+        self.assertIn("自动注册", message)
+
+    def test_use_account_switches_to_c(self) -> None:
+        from hexhound.tools import _use_account
+
+        registry = self.make_registry(profiles={"C": {"Cookie": "hh_session=x:tok-x-demo"}})
+        message = _use_account(registry, {"account": "C"})
+        self.assertEqual(registry.active_account, "C")
+        self.assertIn("Cookie", message)
+
 
 if __name__ == "__main__":
     unittest.main()

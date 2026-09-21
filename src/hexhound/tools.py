@@ -1715,14 +1715,28 @@ def _use_account(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     known = {key: value for key, value in ctx.auth_profiles.items() if value}
     if name and name not in known:
         return (
-            f"错误：账号 {name} 未配置。已有身份：{', '.join(sorted(known)) or '无'}。"
-            "账号 A/B 在 GUI 的「登录态」里手动抓取或粘贴 Cookie；账号 C 由 check_default_creds 命中后自动注册。"
+            f"错误：账号 {name} 未配置。已有身份：{', '.join(sorted(known)) or '无'}。\n"
+            "账号来源：\n"
+            "  - **A / B**：GUI 的「登录态」里手动抓取，或直接贴 Cookie；\n"
+            "  - **C**：**自动注册**——任何请求只要响应里下发了 `Set-Cookie` 或 token，"
+            "就会被登记为账号 C（包括你自己用 http_request 发起的登录、"
+            "SQL 注入绕过登录、`/api/jwt_login` 拿到的令牌）。\n"
+            "如果 C 还不存在，说明**还没有任何一次成功建立会话的响应**："
+            "先自己登录一次（或绕过登录），会话会自动进来，然后再切到 C。"
         )
     ctx.active_account = name
     if not name:
         return "已清空当前身份（后续请求为匿名）。"
     fields = ", ".join(sorted(known[name]))
-    return f"当前身份已切换为账号 {name}（请求头字段：{fields}）。之后 http_request / compare_responses / auth_test 默认使用它。"
+    return (
+        f"当前身份已切换为账号 {name}（请求头字段：{fields}）。"
+        "之后 http_request / compare_responses / auth_test 默认使用它。"
+        + (
+            "（提示：需要登录态的端点，直接用这个身份重试之前 401 的请求。）"
+            if name == "C"
+            else ""
+        )
+    )
 
 
 def _auth_test(ctx: ToolRegistry, args: dict[str, Any]) -> str:
@@ -2848,10 +2862,17 @@ _DESC_CHECK_DEFAULT_CREDS = (
     "对登录端点尝试常见默认凭据。参数：{\"url\": 登录端点, \"username_field\": 用户名字段(可选，自动猜), "
     "\"password_field\": 密码字段(可选), \"extra_fields\": {其它必填字段}}。"
     "命中后会把会话自动注册为账号 C，可用 use_account 切换身份继续验证越权。"
+    "注意：账号 C 也会由**其它**路径自动登记（任何响应下发 Set-Cookie 或 token），"
+    "所以开始试默认口令前先说一句「已有身份：…」看看 C 是不是已经有了。"
 )
 _DESC_USE_ACCOUNT = (
     "切换当前默认身份。参数：{\"account\": \"A\"/\"B\"/\"C\"/\"\"}。"
-    "A/B 来自 GUI 登录态捕获，C 来自 check_default_creds 命中会话；切换后 http_request 等自动带该身份。"
+    "A/B 来自 GUI 登录态捕获；**C 是自动注册的**——任何响应只要下发了 `Set-Cookie` "
+    "或 token 就会被登记为 C（包括你自己用 http_request 登录成功、"
+    "SQL 注入绕过登录、`/api/jwt_login` 拿到的令牌）。"
+    "切换后 http_request / compare_responses / auth_test 自动带该身份。"
+    "**遇到 401 需要登录态的端点时，先看有没有账号 C 可用**，"
+    "不要重新试一遍登录。"
 )
 _DESC_AUTH_TEST = (
     "用两个账号对同一接口发请求并比较响应，发现越权/IDOR。参数：{\"url\": 完整URL, \"method\": \"GET/POST\", "
@@ -3014,6 +3035,11 @@ ROLE_TOOLS: dict[str, tuple[str, ...]] = {
         "http_request", "compare_responses", "fuzz_params", "read_urls",
         "record_finding", "think", "leave_note", "record_coverage",
         "task_create", "task_list", "task_update", "save_artifact", "finish_task",
+        # 身份切换：**必需，不是可选**。注入/业务逻辑常常要先登录才能碰到逻辑
+        # （订单、购物车、券码都是登录后可见），而会话是由**别的**子代理
+        # （auth 角色）拿到的。没有 use_account，注入角色就只能干看着 401 重试，
+        # 然后把业务逻辑记成 blocked——实测踩过（见 docs/WORK-REPORT-ROUND2.md §4.1）。
+        "use_account", "auth_test",
         # 真工具
         "sqlmap_scan", "template_scan", "raw_command", "sandbox_status",
         # 自定义脚本：竞态（并发窗口）与密文分析只能靠脚本表达
@@ -3034,6 +3060,9 @@ ROLE_TOOLS: dict[str, tuple[str, ...]] = {
         "http_request", "compare_responses", "review_candidates", "record_finding",
         "capture_screenshot", "think", "leave_note", "record_coverage",
         "task_create", "task_list", "task_update", "finish_task",
+        # 复核越权/IDOR 类结论必须能切换身份：不切身份就没法重放
+        # "A 能看到、B 看不到"这个差异，只能凭候选里的描述下判断。
+        "use_account", "auth_test",
         # 复核者可以重跑真工具——最硬的复核方式
         "sqlmap_scan", "template_scan", "raw_command", "sandbox_status",
         # 竞态类结论必须能复跑同一段并发脚本才算复核
