@@ -275,6 +275,95 @@ class BusinessLogicDispatchTests(unittest.TestCase):
         ]
         self.assertTrue(dispatched, "编排过程中应当派发业务逻辑任务")
 
+    # ---------- 确定性侦察兜底（业务入口的**上游**）----------
+    #
+    # 实测踩了三次的真正根因：业务逻辑/竞态任务**全部以攻面为输入**，
+    # 而攻面里有没有 /cart 取决于"这一轮有没有哪个子代理真的去 crawl 首页"。
+    # 规划者是 LLM，看到历史记忆里的回归目标时完全可能一个 recon 都不排，
+    # 于是入口发现不了 → 业务任务派不出来 → 报告看不出根因。
+
+    def test_recon_is_added_when_the_plan_has_none(self) -> None:
+        orchestrator = self.make(max_tasks=4)
+        from hexhound.orchestrator import WorkerTask
+
+        plan = [
+            WorkerTask(id="T1", role="injection", objective="复测已知注入", url=self.TARGET),
+            WorkerTask(id="T2", role="auth", objective="复测已知越权", url=self.TARGET),
+        ]
+        refined = orchestrator._refine_plan(plan)
+        self.assertTrue(
+            any(task.role == "recon" for task in refined),
+            "没有侦察任务的计划必须被补上侦察",
+        )
+        recon = next(task for task in refined if task.role == "recon")
+        # 目标里要点名业务入口，否则 recon 只会爬首页、抓不到下游路径
+        for token in ("/cart", "coupon", "wallet"):
+            self.assertIn(token, recon.objective)
+        self.assertIn("leave_note", recon.objective)
+
+    def test_existing_recon_is_left_alone(self) -> None:
+        orchestrator = self.make(max_tasks=4)
+        from hexhound.orchestrator import WorkerTask
+
+        plan = [
+            WorkerTask(id="T1", role="recon", objective="我自己的侦察计划", url=self.TARGET),
+        ]
+        refined = orchestrator._refine_plan(plan)
+        recons = [task for task in refined if task.role == "recon"]
+        self.assertEqual(len(recons), 1)
+        self.assertEqual(recons[0].id, "T1", "已有侦察任务时不应再插一个")
+
+    def test_recon_guard_rewrites_the_weakest_task_when_full(self) -> None:
+        """名额满了要**改写**最弱的注入/认证任务，而不是硬塞——max_tasks 是软约束。
+
+        回归：早先的改写条件是 `len(objective) < 120`，而真实运行里规划者产出的
+        目标普遍在 200 字符上下（它会把"复测哪几个端点、用什么 payload"写全），
+        于是**一条都没匹配上、改写分支静默失效**——实测那次 3 个任务全是回归复测、
+        一个侦察都没有，`/cart` 因此从未进入攻面，业务逻辑一条都没测。
+        """
+        orchestrator = self.make(max_tasks=3)
+        from hexhound.orchestrator import WorkerTask
+
+        long_objective = "复测已知注入端点并给出结论：" + "要点" * 80  # 远超 120 字符
+        plan = [
+            WorkerTask(id="T1", role="injection", objective=long_objective, url=self.TARGET),
+            WorkerTask(id="T2", role="injection", objective=long_objective, url=self.TARGET),
+            WorkerTask(id="T3", role="auth", objective=long_objective, url=self.TARGET),
+        ]
+        refined = orchestrator._refine_plan(plan)
+        # 不超名额，但必须有侦察
+        self.assertLessEqual(len(refined), 3)
+        recons = [task for task in refined if task.role == "recon"]
+        self.assertEqual(len(recons), 1, "无论目标多长，都必须有一个侦察任务")
+        self.assertIn("/cart", recons[0].objective)
+        # 改写必须留下事件，否则"为什么这个任务变了"查不出来
+        self.assertTrue(
+            any(event.get("kind") == "plan_refine" for event in orchestrator.events)
+        )
+
+    def test_recon_guard_inserts_when_nothing_can_be_rewritten(self) -> None:
+        """只剩 verify/source 角色且名额已满时，仍然插入侦察。
+
+        `max_tasks` 是预算软约束；而"没有攻面"会让后面所有以攻面为输入的
+        确定性派发（业务逻辑/竞态/认证）**全部失效**——那个代价更大。
+        """
+        orchestrator = self.make(max_tasks=1)
+        from hexhound.orchestrator import WorkerTask
+
+        plan = [WorkerTask(id="V1", role="verify", objective="复核候选", url=self.TARGET)]
+        refined = orchestrator._refine_plan(plan)
+        self.assertEqual(refined[0].role, "recon")
+        self.assertEqual(refined[0].id, "R0")
+
+    def test_recon_objective_names_the_business_path_tier(self) -> None:
+        """侦察目标要明确让模型去枚举 business 档位（词表里有券码/订单词汇）。"""
+        orchestrator = self.make(max_tasks=4)
+        refined = orchestrator._refine_plan([])
+        recon = next(task for task in refined if task.role == "recon")
+        self.assertIn("business", recon.objective)
+        self.assertIn("enumerate_common", recon.objective)
+        self.assertIn("read_urls", recon.objective)
+
 
 class VerifyScriptTests(unittest.TestCase):
     """人工验证脚本必须存在且覆盖四类缺陷（脚本本身在 WSL 里跑）。"""

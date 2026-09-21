@@ -90,9 +90,27 @@ wsl -d Ubuntu-24.04 -u root -- bash /mnt/c/.../tools/verify_lab_business_logic.s
 4. **`gui.py` 调用从未导入的 `_build_llm_pool`** → 从 GUI 启动审计必定 NameError。
    （这解释了 HANDOVER 为什么把 GUI 列为"未验证"。）
 
-5. **业务逻辑端点根本没被发现**：`/cart` 等在靶场首页里写成了纯文本而不是
-   `<a href>`，爬虫抓不到 → `business_logic_tasks()` 按攻面派发，于是什么都没派。
-   已改成真链接。**教训与 HANDOVER 早先记的一致：发现不了的业务入口等于没测。**
+5. **业务逻辑端点根本没被发现**（踩了三次，是本轮最贵的一个坑）。
+   一开始是靶场首页把 `/cart` 等写成了纯文本而不是 `<a href>`，爬虫抓不到；
+   改成真链接后**仍然**发现不了——真正的根因更深：
+
+   > `business_logic_tasks()` / S1 / K1 这些确定性派发**全部以攻面为输入**。
+   > 攻面里没有 `/cart`，就没有业务逻辑任务。而攻面里有没有 `/cart`，
+   > 完全取决于"这一轮有没有哪个子代理真的去 crawl 首页"。
+   > 规划者是 LLM——它看到历史记忆里的回归目标时，**完全可能一个 recon 都不排**。
+   > 实测：一次排了 4 个任务全是回归复测，一次排了 2 个，两次都没有爬首页，
+   > 两次 `/cart` 都不在攻面里。
+
+   修法：新增 `Orchestrator._ensure_recon()` 作为**确定性兜底**——计划里没有
+   侦察任务就补一个（名额满了就改写一个最不具体的任务），且侦察目标里
+   **点名**业务入口（`/cart`、`/order*`、`/coupon`、`/wallet`、`/reset*`）
+   与 `business` 词表档位。与"有带参端点却没注入任务就补一个"同一个思路：
+   **报告的可信度不能依赖模型这次心情好不好。**
+   同时把 B1 任务的步数预算从 `3*端点数+8`（实测只有 14 步）提高到
+   `4*端点数+10`：B1 必须串完"拿到会话 → 加购 → 四种缺陷各测一遍 → 逐条记录"，
+   14 步时它在第 13 步用尽预算，只完成前置侦察就结束了
+   （覆盖记录里留下的正是 `not_tested`「步数耗尽前仅完成前置侦察」——
+   **测不完**与**测不出**在报告里长得一样，但成因完全不同）。
 
 6. **靶场自身的两个边界被 `or` 吞掉**：`data.get("qty") or 1` 把 `qty=0` 变成 1、
    `data.get("price") or catalog` 把 `price=0` 变成目录价——而 0 正是攻击者会试的值。
@@ -108,14 +126,48 @@ wsl -d Ubuntu-24.04 -u root -- bash /mnt/c/.../tools/verify_lab_business_logic.s
 ## 4. 明确未达成 / 未验证的事项（**不要当成已完成**）
 
 1. **【未达成】「Agent 至少能发现一个新增业务逻辑漏洞」**。
-   靶场侧已用人工脚本证明四类缺陷真实存在（7/7），但两次真实 Agent 运行
-   都**没有**报出业务逻辑漏洞：
-   - 第 1 次运行：被 §3 第 2/3 条缺陷打挂（exit 1，未出报告）。
-   - 第 2 次运行（¥0.2851 / 206s / 8 条已复核）：**没有测到 `/cart`**，因为
-     当时靶场首页那几个端点是纯文本、爬虫发现不了。已修发现性，**但修复后
-     没有重跑**（电量原因停在这里）。
-   下一次接手时应当先做这一件事：确认 `/cart` 进入攻面 → 看到 `B1` 任务被派发
-   → 看它是否真的能测出价格篡改/负数数量。**不要跳过这步直接写"已完成"。**
+   为此跑了 **5 次真实运行**（约 ¥1.3）。靶场侧已用人工脚本证明四类缺陷真实存在
+   （`tools/verify_lab_business_logic.sh` **7/7**），但 Agent 侧仍未测出来。
+   逐次的真实原因（每一个都已修，但每次暴露的是**下一层**问题）：
+
+   | 次 | 结果 | 真实原因 | 修法 |
+   | --- | --- | --- | --- |
+   | 1 | exit 1，无报告 | 我自己新代码的两个缺陷（§3.2/§3.3） | 修 + 回归测试 |
+   | 2 | 8 条结论，无业务逻辑 | 靶场首页把 `/cart` 写成**纯文本**，爬虫抓不到 | 改成 `<a href>` |
+   | 3 | 10 条结论，无业务逻辑 | 规划者一个 recon 都没排（攻面为空） | 加 `_ensure_recon` 兜底 |
+   | 4 | 8 条结论，无业务逻辑 | B1 派发了但**14 步不够**，只够"确认端点 + 登录" | 步数提到 `4*端点+10` |
+   | 5 | 15 个子任务 | B1 到了 `/cart`、**页面自曝**四类缺陷、也拿到了会话，仍未测 | 见下 |
+
+   **第 5 次的具体卡点（已定位、已部分修复、仍需再验一次）**：
+   - `B1` 到 `/cart` 拿到 401，自己试了常见口令 / SQL 绕过 / actuator 泄露的口令 /
+     `/api/jwt_login` **全都不通**；
+   - 而**同一轮**的 `T3(auth)` 用 SQLi 绕过 `/login` **成功**并拿到了
+     `Set-Cookie: hh_session=alice:tok-alice-demo`（证据 R23）；
+   - 根因：`ToolRegistry.__init__` 把 `auth_profiles` 做了浅拷贝，
+     于是编排器"注入同一个字典、一处登记处处可见"的共享语义**被破坏了**；
+     而且只有 `check_default_creds` 会登记会话，**其它任何方式**（包括 SQLi 绕过）
+     拿到的会话都不会被共享。
+     → 已修：注册表不再拷贝（改成按引用持有，与 surface/budget 一致）；
+       新增 `_capture_session()`，任何响应下发的 `Set-Cookie`/token 都登记为账号 C。
+   - **仍未修完的一环**：`_login_success_reason()` 存在，但只在
+     `check_default_creds` 里被调用——`http_request` 发起的登录不会走"判定成功"
+     这条路径，因此第 5 次那次的会话**没有被自动登记**（报告里 `账号 C` 出现 0 次）。
+     下一步就是把它接上，并且让 `use_account` 能列出**已有哪些账号**（现在模型
+     不知道 C 存在就不会去用）。
+   - 另一个次要问题：报告里出现了 `/cart（受保护，值得进一步探测）` 这种**带自然
+     语言后缀的假路径**（来自 coverage 记录被当成端点登记），属于数据卫生问题。
+
+   **不要跳过这一步直接写"已完成"**：下一次接手时按上面两条改完，
+   重跑一次（建议 `--max-tasks 4 --task-steps 16 --parallel 4 --max-cost 1.0`），
+   看 `B1` 的覆盖记录里是否出现 `价格篡改 / 负数数量 / 跳过步骤 / 重复提交`
+   四类的**实际结论**（而不是 `not_tested`/`blocked`）。
+
+   **已经确定成立的部分**（可以作为已完成报告）：
+   - 靶场四类缺陷真实存在 → 人工脚本 7/7；
+   - 确定性派发链路通了 → `/cart` 进攻面后 `B1` 被派出并执行（run6/run7 均可见）；
+   - Agent 能**认出**这是一条下单链路、并说出要测哪四类（run6/run7 的 B1 目标与
+     执行记录里都写明了"页面自曝：/cart 接受客户端价格且不校验数量"）；
+   - 会话共享的机制缺陷已定位并修掉了一半（见上）。
 
 2. **README.md / README_ZH.md 尚未同步本轮行为变化**。需要补：
    `--api-spec` / `--api-spec-remote-refs` 两个参数、溢写句柄与 `spill_read`、
@@ -123,10 +175,13 @@ wsl -d Ubuntu-24.04 -u root -- bash /mnt/c/.../tools/verify_lab_business_logic.s
    Playwright 可选、业务逻辑靶场与两个验证脚本、收尾回合与新的终态文案。
    中英文必须同步（这是项目自己的约束）。
 
-3. **PyInstaller 产物未重建**：`hexhound.exe` 仍是 8cb2843 时的构建。
-   改了 `cli.py`/`gui.py`，所以它**已经过期**。重建命令：
-   `python -m PyInstaller --noconfirm --clean HexHound.spec` 然后
-   `Copy-Item dist\hexhound.exe .\hexhound.exe -Force`。
+3. **PyInstaller 产物已重建**（本轮完成）：`python -m PyInstaller --noconfirm --clean
+   HexHound.spec` → `dist/hexhound.exe`（87 MB）→ 拷到根目录。
+   实测 `hexhound.exe --version` / `providers` / `audit --help` 均正常，
+   且新的 `--api-spec` 参数已出现在帮助里（说明打进去的是当前代码，不是旧产物）。
+   注意：PowerShell 里 `.\hexhound.exe providers 2>&1 | Select-Object -First 3`
+   会因为管道被提前关闭而报 `[exit code: 1]`——那是 **PowerShell 的行为**，
+   不是程序失败（`providers *> $null; $LASTEXITCODE` 实测为 0）。
 
 4. **GUI 自动化测试仍缺**（本轮只修了那个 NameError，没加测试）。
    CI 里也没有 GUI 冒烟测试。
@@ -141,6 +196,11 @@ wsl -d Ubuntu-24.04 -u root -- bash /mnt/c/.../tools/verify_lab_business_logic.s
 
 7. **浏览器验证只覆盖了 GET 注入**；POST 表单/JSON 体的 XSS 需要扩展。
    另外 `channel="msedge"` 是本机默认，跨平台需要按环境调整。
+
+8. **覆盖率记录会被当成端点登记**：报告里出现过
+   `/cart（受保护，值得进一步探测）` 这种带自然语言后缀的假端点。
+   属于数据卫生问题（coverage 的 target 字段直接进了端点表），
+   会让"端点覆盖"数字虚高。需要过滤或分离。
 
 ---
 

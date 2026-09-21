@@ -616,6 +616,49 @@ def _request_fingerprint(
     return hashlib.sha1(payload.encode("utf-8", errors="replace")).hexdigest()
 
 
+def _capture_session(ctx: ToolRegistry, url: str, response: httpx.Response) -> str:
+    """把响应里下发的会话/令牌登记进**共享**的 auth_profiles["C"]，返回说明。
+
+    为什么需要（实测踩到的真问题）：`check_default_creds` 命中默认口令时会登记，
+    但**其它任何方式**拿到的会话都不会被共享——最典型的是模型用 SQL 注入绕过登录
+    （`username=admin' OR '1'='1`）成功后拿到的 `Set-Cookie`。
+    实测现场：一次运行里 `T3(auth)` 用 SQLi 绕过了 `/login`，而同一轮里
+    `B1(injection)` 要测 `/cart` 却一直 401，它自己试了常见口令、SQL 绕过、
+    actuator 泄露的口令、`/api/jwt_login` 全都不通，最后只能把业务逻辑四项
+    如实记成 `blocked`——**同一个进程里，一个子代理已经拿到的会话，
+    另一个子代理完全不知道**。
+
+    `auth_profiles` 由编排器持有并注入每个 `ToolRegistry`，因此在这里写入
+    等于对所有子代理可见。只在**成功建立会话**时登记（有 Set-Cookie 或令牌），
+    避免把失败响应的噪音当凭据。
+    """
+    profile: dict[str, str] = {}
+    try:
+        cookies = response.headers.get_list("set-cookie")
+    except Exception:  # noqa: BLE001 头部读取失败就当没有 cookie
+        cookies = []
+    if cookies:
+        profile["Cookie"] = "; ".join(item.split(";", 1)[0] for item in cookies)
+    token = re.search(
+        r'"(?:token|access_token|accessToken)"\s*:\s*"([^"]{8,})"', response.text or ""
+    )
+    if token:
+        profile["Authorization"] = f"Bearer {token.group(1)}"
+    if not profile:
+        return ""
+    with ctx._lock:
+        # 不覆盖已有账号 A/B（那可能是模型显式设置的固定身份），只更新 C。
+        existing = dict(ctx.auth_profiles.get("C") or {})
+        existing.update(profile)
+        ctx.auth_profiles["C"] = existing
+        seen = ctx.session_notes
+        note = f"{url} → 已把响应下发的会话登记为账号 C（{'、'.join(sorted(profile))}）"
+        if note not in seen:
+            seen.append(note)
+            del seen[:-10]
+    return f"（已登记会话为账号 C：{'、'.join(sorted(profile))}，其它子代理可用 account=\"C\" 复用）"
+
+
 def _http_request(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     url = str(args.get("url") or "")
     _, err = _validate_url(ctx, url)
@@ -675,6 +718,8 @@ def _http_request(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     body = response.text
     _detect_tech(ctx, response, body)
     notes = _analyze_body(ctx, url, body)
+    # 成功建立的会话（Set-Cookie / token）登记进共享账号池，供其它子代理复用。
+    session_note = _capture_session(ctx, url, response)
     ctx.surface.add_endpoint(
         url, methods=[method], params=param_names(url), source="http_request",
         status=response.status_code,
@@ -689,6 +734,8 @@ def _http_request(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     ]
     if notes:
         lines.append("情报：" + "；".join(notes))
+    if session_note:
+        lines.append("会话：" + session_note)
     return "\n".join(lines)
 
 
@@ -3049,8 +3096,20 @@ class ToolRegistry:
         self.allowed_hosts = allowed_hosts
         self.timeout = timeout
         self.mode = mode
-        self.auth_profiles = {k: dict(v) for k, v in (auth_profiles or {}).items()}
+        # `auth_profiles` **按引用持有，不复制**（与 surface/budget 同样的约定）。
+        #
+        # 早先这里做了一次 `{k: dict(v) ...}` 的浅拷贝，看似"更安全"（不污染调用方），
+        # 实际把跨子代理共享会话这件事**彻底破坏了**：编排器把同一个 dict 注入每个
+        # 子代理的注册表，指望"一处登记、处处可见"，而每次构造都拷一份的话，
+        # A 拿到的会话 B 永远看不到。
+        # 实测后果：`T3(auth)` 用 SQLi 绕过 `/login` 拿到会话，同轮 `B1(injection)`
+        # 测 `/cart` 却一直 401，只能把业务逻辑四项记成 `blocked`。
+        #
+        # 想隔离请由**调用方**传自己的副本；注册表这一层不该偷偷改变共享语义。
+        self.auth_profiles = auth_profiles if auth_profiles is not None else {}
         self.active_account = ""
+        #: 会话登记说明（每发现一次记一条，报告/提示里可回看"账号 C 是怎么来的"）。
+        self.session_notes: list[str] = []
         self.worker_id = str(worker_id or "W1")
         self.role = role
         self.surface = surface if surface is not None else AttackSurface(mode=mode)

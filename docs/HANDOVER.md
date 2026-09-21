@@ -1,5 +1,19 @@
 # HexHound — handover to Codex
 
+> **⚠ 本文件描述的是 `8cb2843` 基线。** 基线之后已经落地了一整轮工作
+> （9→11 个提交，测试 254 → 653）。**先读
+> [`docs/WORK-REPORT-ROUND2.md`](WORK-REPORT-ROUND2.md)**，它记录了：
+> 新增的 7 个模块、每项行为变化的验证方式、7 个真实运行暴露的缺陷、
+> **明确未达成的事项**（含唯一一条未通过的验收标准）、以及本轮踩到的坑。
+> 下面的内容仍然有效（架构、约束、陷阱、验证协议），但有两处已过时：
+>
+> 1. §0 第 1 条说"这不是 git 仓库"——**已过时**，现在是 git 仓库，
+>    基线提交 `8cb2843`，本轮结束于 `847c166`。**不要修改或覆盖基线提交。**
+> 2. §7 表格里"whatweb 乱码 / `sandbox_script` 静默失败"两条——**已修复**，
+>    见 `docs/WORK-REPORT-ROUND2.md` §3。
+>
+> 测试数字请以实际运行为准（`python -m pytest`），不要引用本文里的 254。
+
 Audience: an AI coding agent picking this repo up cold. Everything below was verified on
 2026-09-20 in this working copy; where something is *not* verified, it says so explicitly.
 
@@ -11,9 +25,12 @@ remembered.
 
 ## 0. Six things that will bite you first
 
-1. **This is not a git repository.** `git rev-parse` fails; there is no history and no rollback.
-   Before changing anything, `git init` + commit a baseline (`.gitignore` is already correct and
-   ignores `.env`, `reports/`, `build/`, `dist/`, `*.db`). Nothing else in this doc matters as much.
+1. ~~**This is not a git repository.**~~ **已过时 —— 现在是 git 仓库。**
+   `git log --oneline` 从 `8cb2843 chore: capture project handover baseline` 开始，
+   之后是本轮的工作提交。**基线提交不可修改/覆盖**；每个阶段一个提交，
+   便于逐条回滚。`.gitignore` 仍然正确（忽略 `.env`、`reports/`、`build/`、`dist/`、`*.db`），
+   并新增了 `.gitattributes` 统一行尾（见 `WORK-REPORT-ROUND2.md` §3）。
+   —— 除此之外本文其它内容仍然适用于当前代码，但**测试数字已变**（见文首提示）。
 2. **`.env` contains a live LLM API key** and the production target allowlist
    (`ALLOWED_HOSTS=lingdayun.cn,127.0.0.1,localhost`). Never print it, never commit it, never
    widen `ALLOWED_HOSTS` without the user asking.

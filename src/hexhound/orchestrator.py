@@ -925,12 +925,100 @@ class Orchestrator:
         lines.append("</api_contract>")
         return "\n".join(lines)
 
-    def _refine_plan(self, tasks: list[WorkerTask]) -> list[WorkerTask]:
-        """对计划做确定性偏置：有带参端点却没安排注入任务时补一个（并指定 sqlmap）。
+    def _ensure_recon(self, tasks: list[WorkerTask]) -> list[WorkerTask]:
+        """**确定性兜底：永远先做一次侦察。**
 
-        为什么必须做：规划在侦察之前，编排者看不到"有 /login?username= 这种端点"，
-        于是经常只安排侦察和越权任务——真工具永远没机会上场（实测复现过）。
+        为什么必须有（实测踩了三次）：`business_logic_tasks()` / S1 / K1 这些
+        确定性派发全部**以攻面为输入**——攻面里没有 `/cart`，就不会有业务逻辑任务。
+        而攻面里有没有 `/cart`，完全取决于"这一轮有没有哪个子代理真的去 crawl 首页"。
+        规划者是 LLM，它看到历史记忆里有回归目标时，完全可能只排"复测已知漏洞"
+        的任务、一个 recon 都不排，于是：
+
+            首页链接着 /cart、/order/confirm  →  没人爬  →  攻面里没有
+            →  business_logic_tasks() 返回 []  →  业务逻辑一条都没测
+            →  报告显示"覆盖不全"，但看不出**根因是没人爬首页**
+
+        实测三次运行里有两次就是这样（一次排 4 个任务全是回归复测，一次排 2 个）。
+        "发现不了的入口等于没测"——这跟当初 `/coupon` 从没被发现是同一类失效，
+        所以同样用**确定性**手段兜：没有 recon 任务就补一个（名额满了就改写
+        一个最不具体的任务）。
+
+        这条兜底与"有带参端点却没注入任务就补一个"（`_refine_plan`）是同一个思路：
+        **报告的可信度不能依赖模型这次心情好不好。**
         """
+        if any(task.role == "recon" for task in tasks):
+            return tasks
+        objective = (
+            f"侦察 {self.target} 的**入口面**（这一步不能跳过）："
+            "crawl 首页拿全部同源链接、表单、参数与 JS 引用，"
+            "read_urls 读同域 JS（接口清单与硬编码密钥常在里面），"
+            "enumerate_common 探测 business/leak/admin/api 档位。"
+            "**重点是把业务入口找出来**：购物车/下单/订单确认（/cart、/order*）、"
+            "券码兑换（/coupon）、余额/积分（/wallet）、重置令牌（/reset*）"
+            "——这些入口通常只在首页链接或前端 JS 里出现，"
+            "**不爬就永远发现不了，而后续的业务逻辑/竞态任务全部以攻面为输入**。"
+            "发现的可疑点用 leave_note 留给注入/认证角色。"
+        )
+        task = WorkerTask(
+            id="R0", role="recon", objective=objective, url=self.target,
+            steps=max(8, min(self.task_steps + 4, 18)),
+        )
+        # 名额满了就改写一个已有的注入/认证任务（它们的价值依赖攻面，
+        # 而攻面正是侦察的产物）。
+        #
+        # 阈值刻意放宽到 240 字符：早先写 120，而真实运行里规划者产出的目标
+        # 全都在 200 字符上下（它会把"复测哪几个端点、用什么 payload"都写进去），
+        # 于是**一条都没匹配上、改写分支静默失效**——实测那次计划里 3 个任务
+        # 全是回归复测、一个侦察都没有，`/cart` 因此从未进入攻面。
+        # 宁可改写一个长目标，也不能让"没有侦察"这件事悄悄溜过去。
+        candidates = [item for item in tasks if item.role in ("injection", "auth")]
+        if candidates:
+            victim = min(candidates, key=lambda item: len(item.objective))
+            if len(tasks) < self.max_tasks:
+                self._event(
+                    kind="plan_refine",
+                    message="计划里没有任何侦察任务，已自动补一个（否则业务入口发现不了）",
+                )
+                return [task] + tasks
+            previous = victim.id
+            victim.role = "recon"
+            victim.objective = objective
+            victim.url = self.target
+            victim.steps = task.steps
+            self._event(
+                kind="plan_refine",
+                message=(
+                    f"计划里没有任何侦察任务，已把 {previous} 改写为侦察 "
+                    "（业务入口只出现在首页链接与前端 JS 里，不爬就发现不了）"
+                ),
+            )
+            return tasks
+        # 计划里全是非注入/认证角色（例如 verify/source）且名额已满：
+        # 仍然把侦察插进去——`max_tasks` 是预算软约束，而"没有攻面"
+        # 会让后面所有以攻面为输入的确定性派发（业务逻辑/竞态/认证）全部失效。
+        self._event(
+            kind="plan_refine",
+            message=(
+                "计划里没有任何侦察任务且无注入/认证任务可改写，"
+                f"已额外插入侦察任务（任务数 {len(tasks)} → {len(tasks) + 1}）"
+            ),
+        )
+        return [task] + tasks
+
+    def _refine_plan(self, tasks: list[WorkerTask]) -> list[WorkerTask]:
+        """对计划做确定性偏置。
+
+        两条偏置，都是"不能靠模型自觉"的东西：
+
+        1. **先保证有侦察任务**（`_ensure_recon`）：业务入口只出现在首页链接与
+           前端 JS 里，不爬就发不现，而业务逻辑/竞态任务全部以攻面为输入；
+        2. **有带参端点却没注入任务就补一个**（并指定 sqlmap）：规划发生在侦察之前，
+           编排者看不到"有 /login?username= 这种端点"，于是真工具永远没机会上场。
+
+        第 2 条之所以要放在第 1 条**之后**：侦察可能刚刚补进新端点，
+        先跑注入偏置会看不到它们。
+        """
+        tasks = self._ensure_recon(tasks)
         injectable = _injectable_endpoints(self.surface, limit=3)
         if not injectable or _sqlmap_task_exists(tasks):
             return tasks
@@ -1325,7 +1413,14 @@ class Orchestrator:
             return []
         endpoints = cart + [url for url in confirm if url not in cart]
         listing = "\n".join(f"  - {url}" for url in endpoints[:6])
-        steps = max(8, min(3 * len(endpoints) + 8, 18))
+        # 步数预算要给够：这类任务必须串完一整条链路才有结论——
+        # 拿到会话（靶场上还得先用 SQLi 绕过登录，因为 /cart 需要登录态）→ 加购 →
+        # 价格篡改 → 负数数量 → 跳过步骤 → 重复提交 → 逐条 record_finding/record_coverage。
+        # 实测踩过：按 `3*端点数+8` 给 14 步时，B1 在第 13 步用尽预算，
+        # 只完成"确认端点存在 + 拿到会话"，一条结论都没写出
+        # （覆盖记录里留下的正是 not_tested「步数耗尽前仅完成前置侦察」）。
+        # 与 S1/K1 同类：**测不完**与**测不出**在报告里长得一样，但成因完全不同。
+        steps = max(14, min(4 * len(endpoints) + 10, 24))
         return [
             WorkerTask(
                 id="B1",

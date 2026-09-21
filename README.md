@@ -346,6 +346,161 @@ call 3: [W1-R1] (reused: …)
 requests actually sent: 1 | cache hits: 2
 ```
 
+## Bounded output, spill, and an offline-auditable trace
+
+Three additions that all address the same failure mode: **the agent sees less than
+it produced, and nobody can tell what it actually did.**
+
+**1. Oversized tool output is bounded but never lost.** Anything over 16 KiB is
+summarised for the model *and* stored in a run-scoped spill store. The model gets
+an opaque handle and can read the original back with a dedicated tool:
+
+```bash
+# the tool result contains:  [完整输出已保存] 句柄 SO-3b4bf44073ddfd7c0f2d30c145daaeec
+spill_read(handle="SO-3b4bf4…", offset=0, limit=8000)     # paging
+spill_read(handle="SO-3b4bf4…", search="injectable")      # literal search
+```
+
+Handles are `SO-` + 128 random bits, never a counter and never a hash of the
+content, and carry no path — so there is **no path parameter to abuse** and no way
+to read another run's output (the store is per-run and in-memory by default).
+Quotas are enforced at three levels (256 KiB per entry, 32 MiB per run, 512 MiB
+across runs) and hitting one is reported rather than hidden. Metadata records
+`original_size` / `stored_size` / `truncated` / `sha256`, so a reviewer can verify
+that what they got is what was there. Failures, timeouts and scope refusals are
+spilled too — "why did sqlmap produce nothing" is answerable only from the error.
+
+**2. Every run writes `trace.jsonl`.** Append-only, flushed per event, so an
+interrupted run still tells you what happened up to the interruption. Each line is
+a model step (action, argument summary, observation summary, phase, evidence refs),
+a tool call (name, duration, exit code, output size, spill handle, error), a
+finding, a coverage record, a budget snapshot, or an orchestrator event (plan,
+wave, sweeps, time-budget refusals, replan decisions). Sensitive values are masked
+before writing — by key (`Authorization`, `Cookie`, `token`, `password`…), by
+value shape (`sk-…`, JWT, `AKIA…`, PEM headers), and inline in free text
+(`hh_session=…` inside an observation). Key names and lengths survive, so an
+auditor can still see that a header was present without being able to recover it.
+
+**3. Reports can be re-rendered with no target and no model.** `snapshot.json`
+holds everything the renderer needs:
+
+```bash
+hexhound report --run latest --target http://127.0.0.1:5000 \
+  --output reports/final.md --trace --trace-out reports/trace.json
+```
+
+The test suite asserts this path is genuinely offline by replacing `httpx.request`
+and the LLM client with objects that **raise** — any real access fails the test.
+Snapshots carry their own schema version with a migration path (versionless → v1 →
+v2), and a run directory predating snapshots falls back to `surface.json` +
+`tasks.json` with the report saying plainly that the trace and tool evidence were
+never recorded, rather than letting a reader assume they were empty.
+
+## API contract import (OpenAPI 3 / Swagger 2)
+
+```bash
+hexhound audit --target http://127.0.0.1:5000 --mode blackbox \
+  --api-spec ./openapi.yaml --output reports/api.md
+```
+
+Imported operations are written into the shared attack surface, so the coverage
+gate enforces them: they count as untouched endpoints, their declared parameters
+enter the parameter-level blind-spot list, and **importing marks nothing as
+tested**. The planner receives the contract as its own `<api_contract>` section.
+
+The safety model deliberately inverts Strix's: a spec is untrusted input, so its
+`servers` / `host` / `schemes` / `basePath` are recorded in the report **and then
+ignored** — every operation is anchored to the `--target` you named. External
+`$ref` is refused by default; local refs must stay inside the spec root (checked
+textually for `..` and again with a resolved-path containment check); optional
+remote refs go through the *same* `ALLOWED_HOSTS` validator the target requests
+use. Protocol-relative paths (`//evil.example.com/x`) and absolute URLs in `paths`
+are rejected outright, and paths not starting with `/` are refused rather than
+silently corrected. Every skipped operation or parameter is listed with its
+reason. YAML parsing is a self-contained subset that actively refuses anchors,
+aliases, custom tags and multi-document streams — the entry points for YAML bombs
+and `!!python/object` deserialization — and reports the offending line.
+
+## Browser-verified XSS: reflection is not execution
+
+```bash
+pip install playwright && python -m playwright install chromium   # optional
+```
+
+`browser_verify_xss` opens the page in a real browser and returns a **graded**
+verdict, because "the payload is in the response" and "the payload ran" are
+different findings:
+
+| Level | Evidence | What the report may say |
+| --- | --- | --- |
+| `executed` | DOM marker rewritten, global flag set, or dialog observed | **confirmed XSS** |
+| `dom` | payload in the rendered DOM, nothing executed | entered the DOM, execution unconfirmed |
+| `reflected` | payload in the raw response only | reflection — **not** XSS |
+| `blocked` | present but CSP/browser policy refused it | not exploitable |
+| `absent` | nowhere | not reflected |
+
+Only `executed` sets `confirmed`, and the wording for every level is fixed in code
+and repeated in the tool result, so the model cannot upgrade "reflected" into
+"confirmed XSS". Scope is enforced before the page opens *and* again against the
+final URL after redirects (one redirect is enough to leave scope); only http/https
+is allowed, so `file:` and `data:` are refused. Default payloads are
+non-destructive — they only set a marker attribute on their own DOM, and avoid
+`alert()` (which blocks a headless page until dismissed) and bare `<script>` (which
+only fires when injected into the parse stream). Each verification stores the raw
+body, rendered DOM, console, dialogs, network, cookies and a PNG screenshot as
+`S`-numbered evidence. Playwright stays optional: without it the tool is not
+offered at all, and `fuzz_params`' xss category still runs, so "no browser" never
+quietly becomes "XSS not tested".
+
+The lab ships a control group that makes the distinction checkable: `/reflect`,
+`/reflect-text`, `/reflect-dom` and `/reflect-csp` all echo the payload and are
+indistinguishable at string level, but **only `/reflect` executes**.
+
+## Convergence: bounded closing rounds, replanning, and supervision
+
+When a sub-task spends its step budget without calling `finish_task`, it now gets
+at most **two restricted closing rounds** whose tool whitelist is
+`record_finding` / `record_coverage` / `leave_note` / `finish_task`. Anything else
+is refused *without being executed*, so the extra turns cannot become another
+scanning round — total LLM requests is `max_steps + 2`, arithmetic rather than a
+promise. If the model still does not summarise, the system writes one from facts
+only (step count, action histogram, finding and coverage counts) and the task is
+reported as `closing_no_finish`: the work was banked, but "the model closed it" and
+"the system had to" stay distinguishable. Provider errors, budget stops and
+supervisor aborts are all explicit terminal states that keep the steps, findings
+and coverage already recorded.
+
+Replanning happens **only at wave boundaries** and only via structured patches
+(add / update / remove), with hard caps in code: 3 new tasks per patch, 3 replan
+rounds, 40 tasks total, dependency depth 4. `update` cannot touch id, role or url —
+that would desynchronise the ledger, the evidence attribution or the target from
+what actually ran. **Replanning cannot widen the authorized scope**: an added
+task's host must equal this run's target host, which is stricter than "is in
+ALLOWED_HOSTS" because a run may whitelist several hosts while being authorized for
+one. Task ids are content-derived, so the same input yields the same ids and a run
+is replayable.
+
+The supervisor watches for three stall patterns, each with a warn threshold and an
+abort threshold: identical tool calls, consecutive steps with no new evidence, and
+the same failure repeating. Detection is separated from action, every intervention
+lands in the trace, and aborts are graceful — the sub-agent is told to bank its
+findings and finish, not cut off.
+
+## Verify it yourself
+
+```bash
+python -m pytest                                    # 653 passed, 1 skipped
+python -m ruff check src tests                      # All checks passed
+python examples/tool_selftest.py                    # 31 detection checks, no API key
+SWARM_MOCK=1 python examples/swarm_demo.py          # full orchestration, no model calls
+wsl -d Ubuntu-24.04 -u root -- bash /mnt/c/.../tools/verify_lab_new_vulns.sh      # 5/5
+wsl -d Ubuntu-24.04 -u root -- bash /mnt/c/.../tools/verify_lab_business_logic.sh # 7/7
+```
+
+> The WSL lab is a **separate copy**: editing `vulnlab/app.py` on Windows does not
+> change `/opt/hexhound-lab/app.py`. Copy it across and restart the lab (kill by
+> *port*, not by command line) before expecting new endpoints to exist.
+
 ## Common commands
 
 ```bash
@@ -525,6 +680,8 @@ surface. That is a code-level "who may do what" constraint.
 | `task_create/list/update` | shared | Per-agent task list, so plans are written down and worked through |
 | `save_artifact` | shared | Persist payloads/wordlists/snippets into the run's artifact directory |
 | `capture_screenshot` `dynamic_crawl` | shared | Page screenshots / real headless-browser execution (needs playwright) |
+| `browser_verify_xss` | injection, verify | Real-browser XSS verdict: `executed` / `dom` / `reflected` / `blocked` / `absent` — only `executed` may be reported as confirmed (needs playwright) |
+| `spill_read` | all | Read back the full original of a compressed tool output by opaque handle: paging or literal search (no path argument, run-scoped) |
 | `list_files` `read_file` `search_code` | source | Source-review trio (path escape refused, ≤500 lines per call, regex search) |
 | `finish_task` | shared | Wrap up a sub-task with a structured summary (mandatory closing action) |
 
@@ -701,7 +858,10 @@ completed instead of pretending it was.
 ├── runs/<host>-<timestamp>/
 │   ├── surface.json     # attack-surface snapshot (endpoints/params/fingerprints/tried combos/coverage)
 │   ├── tasks.json       # sub-task ledger (role/steps/tokens/cost/model/conclusion)
-│   ├── run.json         # run summary (budget, coverage, dedup stats)
+│   ├── run.json         # run summary (budget, coverage, dedup stats, trace digest)
+│   ├── trace.jsonl      # append-only audit trace (model steps, tool calls, orchestrator events)
+│   ├── snapshot.json    # the full state the report renders from (offline rebuild)
+│   ├── spill/           # full originals of oversized tool output (opaque names)
 │   └── poc/HH-001.sh    # runnable PoC: curl replay of the evidence requests, in order
 └── memory/<host>.json   # cross-run memory: fingerprints, param hit history, past findings
 ```
@@ -768,14 +928,21 @@ write `.env` next to the executable (or in the current directory), and reports g
 │   ├── prompts.py            # role prompts (orchestrator/recon/injection/auth/verify) + task prompts
 │   ├── knowledge.py          # path wordlists / payload library / fingerprints / error regexes
 │   ├── surface.py            # attack-surface model: endpoints, tried combos, candidates, coverage
+│   ├── sanitize.py           # ANSI/OSC/C0 cleanup, UTF-8-safe decoding, head/tail clipping
+│   ├── spill.py              # bounded run-scoped store for oversized tool output (opaque handles)
+│   ├── trace.py              # audit trace + report-rebuild snapshot + redaction + migration
+│   ├── apispec.py            # OpenAPI 3 / Swagger 2 import (scope-safe $ref, YAML subset)
+│   ├── replan.py             # bounded mid-run plan patches (add/update/remove, hard caps)
+│   ├── supervisor.py         # stall / repeat / failure-loop detection and graceful abort
+│   ├── xssverify.py          # real-browser XSS grading: reflected vs DOM vs executed
 │   ├── dedupe.py             # finding dedup fingerprint
-│   ├── budget.py             # budget ledger: tokens/money/requests/time + warning bands
+│   ├── budget.py             # budget ledger: atomic reservation, monotonic deadlines, per-task usage
 │   ├── memory.py             # run artifacts + task ledger + cross-run host memory
-│   ├── tools.py              # tool registry (role-scoped) + 26 tools + output governor
-│   ├── agent.py              # ReAct loop (budget-aware, layered compression, closing discipline)
-│   ├── orchestrator.py       # plan -> waves -> verify -> dedup
+│   ├── tools.py              # tool registry (role-scoped) + 30 tools + output governor
+│   ├── agent.py              # ReAct loop (budget-aware, layered compression, bounded closing rounds)
+│   ├── orchestrator.py       # plan -> waves -> replan -> verify -> dedup + deterministic dispatch
 │   ├── mockllm.py            # scripted LLM: exercises the whole pipeline without a key
-│   ├── report.py             # report renderer (findings/candidates/coverage/ledger, md+json)
+│   ├── report.py             # report renderer (findings/candidates/coverage/trace, md+json)
 │   ├── console.py            # UTF-8 console handling (GBK-safe markers)
 │   ├── butian.py             # Butian platform submission-field mapping
 │   ├── submission.py         # submission package (ZIP with evidence attachments)
@@ -785,13 +952,13 @@ write `.env` next to the executable (or in the current directory), and reports g
 │   ├── vision.py             # multimodal image-analysis client
 │   ├── gui.py                # Flask console (hexhound gui)
 │   ├── desktop.py            # pywebview desktop shell
-│   └── cli.py                # click CLI (audit / report / providers / setup / gui)
-├── vulnlab/                  # deliberately vulnerable Flask lab (10 classes)
+│   └── cli.py                # click CLI (audit/report/providers/sandbox/memory/setup/gui)
+├── vulnlab/                  # deliberately vulnerable Flask lab (17 classes incl. business logic)
 ├── examples/
 │   ├── tool_selftest.py      # 31 detection checks (no API key needed)
 │   ├── swarm_demo.py         # end-to-end orchestration demo (SWARM_MOCK=1 works offline)
 │   └── mock_demo.py          # minimal single-agent demo
-└── tests/                    # 144 unit tests (fully offline)
+└── tests/                    # 653 unit tests (fully offline)
 ```
 
 ## Safety boundaries and disclaimer
@@ -828,10 +995,16 @@ write `.env` next to the executable (or in the current directory), and reports g
 - [x] **Cross-run diff + regression re-testing**: new / persisting / possibly fixed / unknown, and *never* "not tested = fixed"
 - [x] **Memory maintenance CLI** (`hexhound memory --list/--forget/--before/--reset`)
 - [x] **Script channel + playbooks for race conditions, business logic and crypto/auth implementation**, with deterministic task dispatch and a lab that verifiably contains all three
-- [ ] Dynamically adjust the plan mid-run (incremental subtask patches)
-- [ ] Spill oversized tool output to disk and read it back on demand
+- [x] **Bounded tool output + run-scoped spill store** with a dedicated paging/search read-back tool (no shell needed)
+- [x] **Offline-auditable trace + report rebuild** (`trace.jsonl`, `snapshot.json`, redaction, schema migration)
+- [x] **API contract import** (OpenAPI 3 / Swagger 2) anchored to `--target`, with script-verified scope-safe `$ref` handling
+- [x] **Browser-verified XSS** (optional Playwright): reflection / DOM / *execution* graded separately
+- [x] **Bounded mid-run replanning** (wave boundaries, structured patches, hard caps) + stall/failure-loop supervision
+- [x] **Lab business-logic scenarios** (`/cart`, `/order/confirm`: price tampering, negative quantity, step skipping, repeat submission), hand-verified 7/7
+- [x] **CI** (lint + tests on Windows/Linux × py3.11/3.12 + key-free self-checks)
+- [ ] Spill/snapshot retention policy for long-lived installs
+- [ ] Browser verification over POST bodies (currently GET)
 - [ ] More lab vulnerability classes (deserialization / prototype pollution)
-- [ ] Browser-backed XSS confirmation (currently string-reflection only, no JS execution)
 
 ## License
 

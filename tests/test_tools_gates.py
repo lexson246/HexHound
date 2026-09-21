@@ -353,5 +353,115 @@ class CvssTests(unittest.TestCase):
         self.assertIsNone(_cvss_score("CVSS:3.1/AV:X/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"))
 
 
+class SharedSessionCaptureTests(unittest.TestCase):
+    """会话必须在子代理之间共享。
+
+    实测现场（这是"业务逻辑测不出来"的根因）：一次运行里 `T3(auth)` 用 SQLi
+    绕过了 `/login` 并拿到 `Set-Cookie`，而同一轮 `B1(injection)` 要测 `/cart`
+    却一直 401——它自己试了常见口令 / SQL 绕过 / actuator 泄露的口令 /
+    `/api/jwt_login` 全都不通，最后把业务逻辑四项如实记成 `blocked`。
+    **同一个进程里，一个子代理已经拿到的会话，另一个子代理完全不知道。**
+    """
+
+    def make_registry(self, *, profiles=None, role: str = "injection", worker: str = "W1"):
+        return ToolRegistry(
+            base_dir=Path("."),
+            allowed_hosts=frozenset({"127.0.0.1"}),
+            mode="blackbox",
+            role=role,
+            worker_id=worker,
+            surface=AttackSurface(target="http://127.0.0.1:5000"),
+            auth_profiles=profiles if profiles is not None else {},
+        )
+
+    def _fake_response(self, *, cookies=(), body="{}"):
+        import httpx
+
+        request = httpx.Request("POST", "http://127.0.0.1:5000/login")
+        return httpx.Response(
+            200, headers=[("set-cookie", c) for c in cookies], text=body, request=request
+        )
+
+    def test_set_cookie_is_registered_as_account_c(self) -> None:
+        from hexhound.tools import _capture_session
+
+        registry = self.make_registry()
+        note = _capture_session(
+            registry,
+            "http://127.0.0.1:5000/login",
+            self._fake_response(cookies=["hh_session=alice:tok-alice-demo; Path=/; HttpOnly"]),
+        )
+        self.assertIn("账号 C", note)
+        cookie = registry.auth_profiles["C"]["Cookie"]
+        self.assertIn("hh_session=alice:tok-alice-demo", cookie)
+        # cookie 的 Path/HttpOnly 属性不该进请求头
+        self.assertNotIn("HttpOnly", cookie)
+
+    def test_token_in_body_is_registered(self) -> None:
+        from hexhound.tools import _capture_session
+
+        registry = self.make_registry()
+        _capture_session(
+            registry,
+            "http://127.0.0.1:5000/api/jwt_login",
+            self._fake_response(body='{"code":0,"token":"eyJhbGciOiJIUzI1NiJ9.abc.def"}'),
+        )
+        self.assertIn("Bearer eyJhbGci", registry.auth_profiles["C"]["Authorization"])
+
+    def test_response_without_session_registers_nothing(self) -> None:
+        from hexhound.tools import _capture_session
+
+        registry = self.make_registry()
+        note = _capture_session(
+            registry, "http://127.0.0.1:5000/", self._fake_response(body="<h1>hi</h1>")
+        )
+        self.assertEqual(note, "")
+        self.assertNotIn("C", registry.auth_profiles)
+
+    def test_existing_profiles_are_not_clobbered(self) -> None:
+        """账号 A/B 是模型显式设置的身份，不能被自动登记覆盖。"""
+        from hexhound.tools import _capture_session
+
+        registry = self.make_registry(profiles={"A": {"Cookie": "a=1"}, "B": {"Cookie": "b=2"}})
+        _capture_session(
+            registry,
+            "http://127.0.0.1:5000/login",
+            self._fake_response(cookies=["hh_session=x:tok-x-demo"]),
+        )
+        self.assertEqual(registry.auth_profiles["A"], {"Cookie": "a=1"})
+        self.assertEqual(registry.auth_profiles["B"], {"Cookie": "b=2"})
+        self.assertIn("C", registry.auth_profiles)
+
+    def test_capture_is_recorded_once_per_url(self) -> None:
+        from hexhound.tools import _capture_session
+
+        registry = self.make_registry()
+        for _ in range(3):
+            _capture_session(
+                registry,
+                "http://127.0.0.1:5000/login",
+                self._fake_response(cookies=["hh_session=x:tok-x-demo"]),
+            )
+        self.assertEqual(len(registry.session_notes), 1)
+
+    def test_profiles_are_shared_between_workers(self) -> None:
+        """编排器把同一个 auth_profiles 字典注入每个子代理 → 一处登记处处可见。"""
+        from hexhound.tools import _capture_session
+
+        shared: dict = {}
+        auth_worker = self.make_registry(profiles=shared, role="auth", worker="W1")
+        _capture_session(
+            auth_worker,
+            "http://127.0.0.1:5000/login",
+            self._fake_response(cookies=["hh_session=alice:tok-alice-demo"]),
+        )
+        injection_worker = self.make_registry(profiles=shared, role="injection", worker="W2")
+        self.assertIn(
+            "hh_session=alice:tok-alice-demo",
+            injection_worker.auth_profiles["C"]["Cookie"],
+            "另一子代理必须能看到已登记的会话",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
