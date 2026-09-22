@@ -58,7 +58,18 @@ def test_ordinary_save_keeps_saved_provider_keys(settings_file: Path) -> None:
     assert gui._provider_keys() == {"deepseek": "sk-fake-0001"}
     stored = _read_settings(settings_file)
     assert stored["target"] == "http://127.0.0.1:5000"
-    assert json.loads(stored["provider_keys"]) == {"deepseek": "sk-fake-0001"}
+    assert _decoded_keys(stored["provider_keys"]) == {"deepseek": "sk-fake-0001"}
+
+
+def _decoded_keys(stored_value: str) -> dict:
+    """把落盘的 provider_keys 字段读回明文 dict（兼容加密与旧明文两种形态）。"""
+    from hexhound import secretstore
+
+    if secretstore.is_protected(stored_value):
+        plain, error = secretstore.unprotect(stored_value)
+        assert not error, error
+        return json.loads(plain)
+    return json.loads(stored_value)
 
 
 def test_explicit_none_clears_a_field_to_its_default(settings_file: Path) -> None:
@@ -71,8 +82,68 @@ def test_explicit_none_clears_a_field_to_its_default(settings_file: Path) -> Non
 
     assert gui._provider_keys() == {}
     stored = _read_settings(settings_file)
-    assert stored["provider_keys"] == gui.DEFAULTS["provider_keys"]
+    # 清空后落盘的内容解出来必须是空字典（可能带加密外壳）
+    assert _decoded_keys(stored["provider_keys"]) == {}
     assert stored["target"] == gui.DEFAULTS["target"]
+
+
+def test_keys_are_not_stored_in_plaintext(settings_file: Path) -> None:
+    """密钥落盘后，文件里**不能出现明文**（Windows 用 DPAPI 加密）。
+
+    上一轮补掉了"密钥经 HTTP 回传浏览器"，但文件本身一直是明文——
+    同步盘、备份、误发的截图都可能带上它。
+    """
+    gui._save_settings({"provider_keys": json.dumps({"deepseek": "sk-fake-0001"})})
+    text = settings_file.read_text(encoding="utf-8")
+    assert "sk-fake-0001" not in text
+    from hexhound import secretstore
+
+    available, _reason = secretstore.protection_available()
+    if available:
+        assert secretstore.is_protected(_read_settings(settings_file)["provider_keys"])
+    # 无论哪种形态，读回来都必须是原值（加密不能丢数据）
+    assert gui._provider_keys() == {"deepseek": "sk-fake-0001"}
+
+
+def test_legacy_plaintext_is_migrated_without_losing_keys(settings_file: Path) -> None:
+    """旧文件里的明文密钥要在下一次保存时自动迁移，且**一个都不能丢**。"""
+    _write_settings(
+        settings_file,
+        {"provider_keys": json.dumps({"deepseek": "sk-fake-0001", "qwen": "sk-fake-0002"})},
+    )
+    assert gui._provider_keys() == {"deepseek": "sk-fake-0001", "qwen": "sk-fake-0002"}
+    gui._save_settings({"target": "http://127.0.0.1:5000"})
+    assert gui._provider_keys() == {"deepseek": "sk-fake-0001", "qwen": "sk-fake-0002"}
+    assert "sk-fake-0001" not in settings_file.read_text(encoding="utf-8")
+
+
+def test_double_save_does_not_double_encrypt(settings_file: Path) -> None:
+    """已经是密文就不能再加密一次（否则第二次读就解不开了）。"""
+    gui._save_settings({"provider_keys": json.dumps({"deepseek": "sk-fake-0001"})})
+    first = _read_settings(settings_file)["provider_keys"]
+    gui._save_settings({"target": "http://127.0.0.1:5000"})
+    second = _read_settings(settings_file)["provider_keys"]
+    assert _decoded_keys(second) == {"deepseek": "sk-fake-0001"}
+    from hexhound import secretstore
+
+    if secretstore.protection_available()[0]:
+        assert second.count(secretstore.PREFIX) == 1, "不得出现嵌套加密"
+        assert first == second, "未改动密钥时不应重新加密"
+
+
+def test_undecryptable_keys_report_a_reason(app, client, token, monkeypatch) -> None:
+    """换机器/换用户导致解不开时：必须给出原因，**不能**静默当成"没配过"。"""
+    from hexhound import secretstore
+
+    gui._save_settings({"provider_keys": json.dumps({"deepseek": "sk-fake-0001"})})
+    monkeypatch.setattr(
+        secretstore, "unprotect", lambda value: ("", "模拟：密文与当前用户不匹配")
+    )
+    assert gui._provider_keys() == {}
+    assert "模拟" in gui._KEYSTORE_NOTE
+    payload = client.get("/api/providers", headers=_auth(token)).get_json()
+    assert "模拟" in payload["keystore_error"]
+    assert payload["keys_saved"] == {}
 
 
 def test_role_model_fields_round_trip(settings_file: Path) -> None:

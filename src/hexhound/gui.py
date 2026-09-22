@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, jsonify, render_template_string, request, send_file
 
-from . import history
+from . import history, secretstore
 from .agent import ReActAgent
 from .budget import Budget, limits_from_config
 from .config import (
@@ -367,6 +367,7 @@ HTML = r"""<!doctype html>
         <button type="button" id="envBtn" style="background:var(--line);color:var(--fg);flex:1;">写入 .env</button>
       </div>
       <div id="testResult" class="hint"></div>
+      <div id="keystoreNote" class="hint" hidden></div>
       <details style="margin-top:10px;">
         <summary class="muted" style="cursor:pointer;">按角色指定模型（可选：编排/复核用强模型，批量侦察用便宜模型）</summary>
         <div id="roleModelBox" style="margin-top:8px;"></div>
@@ -817,6 +818,12 @@ async function loadProviders() {
     const j = await r.json();
     PROVIDERS = j.presets || [];
     PROVIDER_STATE = {active: j.active || '', keys_masked: j.keys_masked || {}, keys_saved: j.keys_saved || {}};
+    // 磁盘加密状态与解密失败原因都要能看见："密钥突然没了"必须查得出原因
+    const notes = [];
+    if (j.keystore_error) notes.push('读取已保存密钥失败：' + j.keystore_error);
+    if (j.keys_encrypted_at_rest === false && j.protection_note) notes.push(j.protection_note);
+    $('#keystoreNote').textContent = notes.join(' ');
+    $('#keystoreNote').hidden = !notes.length;
   } catch (error) {
     PROVIDER_STATE = {active: '', keys_masked: {}, keys_saved: {}};
   }
@@ -1087,6 +1094,9 @@ def _save_settings(data: dict) -> None:
             field = f"role_model_{role}"
             if field in data:
                 cleaned[field] = str(data.get(field, "") or "").strip()
+        # 密钥字段落盘前加密（Windows DPAPI）。旧文件里的明文 JSON 在这里被
+        # 自动迁移成密文——读的时候两种格式都认，因此**不会丢密钥**。
+        cleaned["provider_keys"] = _protect_provider_keys(cleaned.get("provider_keys", ""))
         _atomic_write_text(
             SETTINGS_PATH, json.dumps(cleaned, ensure_ascii=False, indent=2)
         )
@@ -1112,8 +1122,20 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 def _provider_keys() -> dict[str, str]:
-    """读取已保存的各提供商密钥（存在 settings.json 的 provider_keys 里）。"""
+    """读取已保存的各提供商密钥（存在 settings.json 的 provider_keys 里）。
+
+    落盘时用 DPAPI 加密（Windows），因此这里要先解密。解不开**不能**静默当成
+    "没配过"——原因记进 `_KEYSTORE_NOTE`，由 `/api/providers` 带给界面。
+    """
     raw = _load_settings().get("provider_keys") or "{}"
+    global _KEYSTORE_NOTE
+    _KEYSTORE_NOTE = ""
+    if secretstore.is_protected(raw):
+        decrypted, error = secretstore.unprotect(raw)
+        if error:
+            _KEYSTORE_NOTE = error
+            return {}
+        raw = decrypted
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
@@ -1121,6 +1143,18 @@ def _provider_keys() -> dict[str, str]:
     if not isinstance(data, dict):
         return {}
     return {str(k): str(v) for k, v in data.items() if str(v).strip()}
+
+
+#: 最近一次读取密钥时的说明（解密失败等），供界面显示。
+_KEYSTORE_NOTE = ""
+
+
+def _protect_provider_keys(raw: str) -> str:
+    """把 provider_keys 字段加密后再落盘；已经是密文就原样保留（不重复加密）。"""
+    text = str(raw or "")
+    if not text or secretstore.is_protected(text):
+        return text
+    return secretstore.protect(text)
 
 
 def _active_provider(settings: dict) -> str:
@@ -1921,12 +1955,18 @@ def create_app() -> Flask:
         saved = _provider_keys()
         masked = {key: mask_key(value) for key, value in saved.items()}
         active = _active_provider(stored)
+        protected_ok, protection_reason = secretstore.protection_available()
         return jsonify(
             {
                 "presets": describe_presets(),
                 "active": active,
                 "keys_masked": masked,
                 "keys_saved": {key: True for key in saved},
+                # 密钥在磁盘上是否加密保存，以及有没有解密失败——
+                # "密钥突然没了"必须能查出原因，而不是让用户以为从没配过。
+                "keys_encrypted_at_rest": protected_ok,
+                "protection_note": protection_reason,
+                "keystore_error": _KEYSTORE_NOTE,
                 "env_keys": {
                     preset["key"]: bool(os.getenv(preset["env_key"], "").strip())
                     for preset in describe_presets()
