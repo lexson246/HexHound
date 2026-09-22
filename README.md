@@ -489,12 +489,13 @@ findings and finish, not cut off.
 ## Verify it yourself
 
 ```bash
-python -m pytest                                    # 756 passed, 1 skipped
+python -m pytest                                    # 786 passed, 1 skipped
 python -m ruff check src tests tools                # All checks passed
+python tools/check_ci_workflow.py                   # CI workflow references are consistent
 python tools/smoke_gui_server.py                    # local console smoke, no window/target/model
 python -m pytest tests/test_gui_frontend.py         # browser smoke (needs Playwright; see below)
 python tools/check_desktop_exe.py hexhound.exe      # double-click must not open a console
-python tools/verify_desktop_exe.py hexhound.exe     # desktop launch acceptance (19 checks)
+python tools/verify_desktop_exe.py hexhound.exe     # desktop launch acceptance (21 checks)
 python examples/tool_selftest.py                    # 31 detection checks, no API key
 SWARM_MOCK=1 python examples/swarm_demo.py          # full orchestration, no model calls
 wsl -d Ubuntu-24.04 -u root -- bash /mnt/c/.../tools/verify_lab_new_vulns.sh      # 5/5
@@ -506,7 +507,8 @@ wsl -d Ubuntu-24.04 -u root -- bash /mnt/c/.../tools/verify_lab_business_logic.s
 > `HEXHOUND_REQUIRE_GUI=1`, which turns "dependency missing" into a **failure**
 > instead of a silent skip — a GUI layer that quietly skips is no test layer at all.
 > `tools/verify_desktop_exe.py` isolates settings and run artifacts through
-> `HEXHOUND_SETTINGS_PATH` / `HEXHOUND_HOME`, so it never touches your real config.
+> `HEXHOUND_SETTINGS_PATH` / `HEXHOUND_HOME`, and **verifies that isolation**
+> (fingerprint of your real settings before/after), so it never touches your config.
 
 > The WSL lab is a **separate copy**: editing `vulnlab/app.py` on Windows does not
 > change `/opt/hexhound-lab/app.py`. Copy it across and restart the lab (kill by
@@ -691,7 +693,7 @@ surface. That is a code-level "who may do what" constraint.
 | `task_create/list/update` | shared | Per-agent task list, so plans are written down and worked through |
 | `save_artifact` | shared | Persist payloads/wordlists/snippets into the run's artifact directory |
 | `capture_screenshot` `dynamic_crawl` | shared | Page screenshots / real headless-browser execution (needs playwright) |
-| `browser_verify_xss` | injection, verify | Real-browser XSS verdict: `executed` / `dom` / `reflected` / `blocked` / `absent` — only `executed` may be reported as confirmed (needs playwright) |
+| `browser_verify_xss` | injection, verify | Real-browser XSS verdict: `executed` / `dom` / `reflected` / `blocked` / `absent` — only `executed` may be reported as confirmed. GET query injection and **POST form injection** (`method="POST"` + `param` + `fields` for the other form fields); needs playwright |
 | `spill_read` | all | Read back the full original of a compressed tool output by opaque handle: paging or literal search (no path argument, run-scoped) |
 | `list_files` `read_file` `search_code` | source | Source-review trio (path escape refused, ≤500 lines per call, regex search) |
 | `finish_task` | shared | Wrap up a sub-task with a structured summary (mandatory closing action) |
@@ -919,6 +921,33 @@ Statuses stay honest: a run counts as `done` only when `snapshot.json` exists; a
 `run.json` is `unfinished (interrupted or failed)`. **An incomplete run is never displayed as a
 complete audit.**
 
+### Report workspace (filters, detail, export, cross-run compare)
+
+The findings area is a small workspace rather than a flat list:
+
+* **filters** — status (all / verified / candidate), severity (generated from the data you actually
+  have) and a keyword box (title / URL / type / parameter / evidence), with a "showing N of M" count
+  and an explicit "no findings match these filters" state instead of a blank area;
+* **detail pane** — click a card for the full record (id, severity, status, type, URL, parameter,
+  verification method, PoC, worker, evidence, counter-evidence). A candidate is labelled
+  *not a confirmed vulnerability*;
+* **export** — the findings list as JSON or Markdown (`/api/export`), following whichever run is
+  selected. The Markdown separates verified findings from candidates and states that candidates are
+  not confirmations and that unlisted locations are not "safe". The full report remains its own
+  entry point;
+* **cross-run compare** — pick a historical run and diff it against the current findings, reusing the
+  same fingerprint logic as the CLI (`diff.diff_findings`). The four buckets are kept distinct:
+  new, still present, *suspected fixed*, and **undetermined** — a location that was not covered this
+  time can never be reported as fixed.
+
+### Where keys live at rest
+
+Provider keys are never sent back to the browser (masked values only) and, on Windows, the
+`provider_keys` field is encrypted at rest with **DPAPI** (user-scoped, no extra dependency).
+Plaintext files from older versions still read fine and are migrated to ciphertext on the next save.
+If the ciphertext cannot be decrypted (different machine or user), the console says so with the
+reason instead of silently behaving as if no key had ever been configured.
+
 ## Local control plane
 
 The console is a local single-user tool, and the endpoints behind it treat that as a security
@@ -1039,7 +1068,7 @@ write `.env` next to the executable (or in the current directory), and reports g
 │   ├── tool_selftest.py      # 31 detection checks (no API key needed)
 │   ├── swarm_demo.py         # end-to-end orchestration demo (SWARM_MOCK=1 works offline)
 │   └── mock_demo.py          # minimal single-agent demo
-└── tests/                    # 756 unit tests (fully offline)
+└── tests/                    # 786 unit tests (fully offline)
 ```
 
 ## Safety boundaries and disclaimer

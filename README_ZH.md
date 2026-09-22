@@ -389,6 +389,17 @@ pip install playwright && python -m playwright install chromium   # 可选
 截图作为 `S` 编号证据。Playwright 保持可选：没装就**不下发**这个工具，
 而 `fuzz_params` 的 xss 类别照常可用，所以"没装浏览器"永远不会悄悄变成"XSS 没测"。
 
+**执行证据必须能归因到本次载荷**（两条都是实测假阳驱动的，早期版本踩过）：
+每次验证用**自己的随机标记值**，DOM 标记属性/全局变量的值必须等于本次 nonce
+（上一次验证残留、页面自己写的同名标记都不算）；对话框只在**内容与本次载荷相关**
+（含载荷原文或本次 nonce）时才算执行证据，基线里本来就有的弹窗另行扣除。
+页面自己弹的 `alert('请输入用户名')` 与注入无关——早期判据却会因此给出
+`executed` + `confirmed=True`，而 payload 明明躺在 `<textarea>` 里没执行。
+
+**表单型（POST）注入**：`method="POST"` + `param`（字段名），表单的其它字段
+（csrf/用户名…）用 `fields` 一起提交，基线用同样字段、只把注入字段置空。
+没有字段名的 POST 会**直接报错**说清缺什么，而不是给一个看着像结论的 `absent`。
+
 靶场里有一组**对照组**让这个区分可复核：`/reflect`、`/reflect-text`、
 `/reflect-dom`、`/reflect-csp` 四个端点都会原样回显，字符串级别完全一样，
 但**只有 `/reflect` 会执行**。
@@ -418,12 +429,13 @@ pip install playwright && python -m playwright install chromium   # 可选
 ## 自己验证一遍
 
 ```bash
-python -m pytest                                    # 756 passed, 1 skipped
+python -m pytest                                    # 786 passed, 1 skipped
 python -m ruff check src tests tools                # All checks passed
 python tools/smoke_gui_server.py                    # 本机控制台冒烟（不起窗口、不打目标、不调模型）
 python -m pytest tests/test_gui_frontend.py         # 浏览器冒烟（需 Playwright，见下）
+python tools/check_ci_workflow.py                   # CI 工作流引用一致性（本机可跑）
 python tools/check_desktop_exe.py hexhound.exe      # 双击不弹控制台（PE 子系统校验）
-python tools/verify_desktop_exe.py hexhound.exe     # 桌面版启动验收（19 项）
+python tools/verify_desktop_exe.py hexhound.exe     # 桌面版启动验收（21 项）
 python examples/tool_selftest.py                    # 31 项检出能力，不需要 key
 SWARM_MOCK=1 python examples/swarm_demo.py          # 完整编排，不调模型
 wsl -d Ubuntu-24.04 -u root -- bash /mnt/c/.../tools/verify_lab_new_vulns.sh      # 5/5
@@ -434,7 +446,10 @@ wsl -d Ubuntu-24.04 -u root -- bash /mnt/c/.../tools/verify_lab_business_logic.s
 > CI 里设 `HEXHOUND_REQUIRE_GUI=1`：依赖缺失会**失败**而不是静默跳过——
 > 一个"缺依赖就跳过"的界面测试层等于没有测试层。
 > `tools/verify_desktop_exe.py` 通过 `HEXHOUND_SETTINGS_PATH` / `HEXHOUND_HOME`
-> 把配置与产物隔离到临时目录，不会碰你的真实配置。
+> 把配置与产物隔离到临时目录，并**验证隔离确实生效**（比对真实配置的前后指纹），
+> 不会碰你的真实配置。
+> `tools/check_ci_workflow.py` 只做静态一致性检查——**它不能替代真跑一次 CI**
+> （runner 环境、权限、平台差异测不到），输出里也这么写着。
 
 > WSL 里的靶场是**独立副本**：在 Windows 侧改 `vulnlab/app.py` 不会影响
 > `/opt/hexhound-lab/app.py`。要先把文件拷过去、再重启靶场（按**端口**杀进程，
@@ -800,6 +815,28 @@ PARALLEL=3            # 并发子代理数
 状态如实区分：有 `snapshot.json` 才算"已完成"，只有 `run.json` 的是
 "未完成（中断或异常）"。**没跑完的运行不会被显示成完整审计。**
 
+### 报表工作区（筛选 / 详情 / 导出 / 跨运行对比）
+
+发现区是一个小工作区，而不是一串平铺卡片：
+
+* **筛选**：状态（全部 / 已复核 / 待复核）、等级（按你实际有的数据生成）、
+  关键词（标题 / URL / 类型 / 参数 / 证据）；显示"显示 N / 共 M 条"，
+  筛不出东西时明说"当前筛选条件下没有发现"，而不是留一片空白；
+* **详情面板**：点卡片看完整字段（编号、等级、状态、类型、URL、参数、复核方式、
+  PoC、来源角色、证据、反证）；候选项标注"**不是已确认漏洞**"；
+* **导出**：把发现清单导成 JSON 或 Markdown（`/api/export`），跟随当前选中的运行。
+  Markdown 把"已复核"与"待复核候选"分开，并写明候选项不是确认漏洞、
+  未列出的位置不代表安全。**完整报告仍是另一个入口**；
+* **跨运行对比**：选一次历史运行与本次对比，复用 CLI 同一套指纹判据
+  （`diff.diff_findings`）。四类严格分开：本次新增 / 仍存在 / **疑似已修复** /
+  **无法判定**——本次没覆盖到的位置永远不会被写成"已修复"。
+
+### 密钥在本机怎么存
+
+提供商的密钥**不经浏览器回传**（接口只回掩码），并且在 Windows 上以 **DPAPI** 加密后
+才落盘（用户级，不引入新依赖）。旧版本留下的明文文件照常能读，下一次保存自动转成密文。
+如果密文解不开（换了机器或用户），界面会**说明原因**，而不是表现得像"从来没配过密钥"。
+
 ## 交互式初始化向导
 
 ```bash
@@ -895,7 +932,7 @@ windowed 模式会把这些全部吞掉。打包后向导与设置面板把 `.en
 │   ├── tool_selftest.py      # 工具检出能力自检（31 项，无需 API key）
 │   ├── swarm_demo.py         # 端到端编排演练（SWARM_MOCK=1 可离线运行）
 │   └── mock_demo.py          # 单代理模式最小演示
-└── tests/                    # 756 个单元测试（纯本地，无网络）
+└── tests/                    # 786 个单元测试（纯本地，无网络）
 ```
 
 ## 安全边界与免责声明
