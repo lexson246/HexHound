@@ -1090,7 +1090,14 @@ def _enumerate_common(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     baseline_len = len(baseline.text) if baseline is not None else 0
     fanout = baseline_status == 200
 
-    hits: list[str] = []
+    #: 命中记录：`(展示文本, 真实路径)` **成对**保存。
+    #:
+    #: 这里曾经只存展示文本，然后在登记端点时用 `text.split("  ")[-1]` 反解 URL——
+    #: 于是"给人看的那段话"变成了数据：`/admin（受保护，值得进一步探测）`
+    #: 这种带自然语言后缀的**假端点**被登记进攻面与覆盖率表（端点覆盖数字虚高）；
+    #: 带内容特征的命中更糟，`[-1]` 取到的是 `特征: <title>…` 整段文字。
+    #: 展示与数据必须分开，别再从展示文本里解析数据。
+    hits: list[tuple[str, str]] = []
     soft_hits: list[str] = []
     for path in words:
         url = origin + path
@@ -1101,7 +1108,7 @@ def _enumerate_common(ctx: ToolRegistry, args: dict[str, Any]) -> str:
         if status in _REDIRECT_STATUS:
             location = response.headers.get("location", "")
             if location.rstrip("/") not in (url.rstrip("/"), origin.rstrip("/")):
-                hits.append(f"{status} -> {location}  {url}")
+                hits.append((f"{status} -> {location}  {url}", url))
             continue
         if status == 404 or status >= 500 and status != 500:
             continue
@@ -1113,19 +1120,19 @@ def _enumerate_common(ctx: ToolRegistry, args: dict[str, Any]) -> str:
             if fanout and not marker:
                 soft_hits.append(f"{status}  {url}（长度 {len(body)}，无内容特征）")
                 continue
-            hits.append(f"{status}  {url}" + (f"  特征: {marker}" if marker else ""))
+            hits.append((f"{status}  {url}" + (f"  特征: {marker}" if marker else ""), url))
         elif status in (401, 403):
-            hits.append(f"{status}  {url}（受保护，值得进一步探测）")
+            hits.append((f"{status}  {url}（受保护，值得进一步探测）", url))
         elif status == 500:
-            hits.append(f"{status}  {url}（服务端报错，可能存在注入/未处理输入）")
+            hits.append((f"{status}  {url}（服务端报错，可能存在注入/未处理输入）", url))
         else:
-            hits.append(f"{status}  {url}")
+            hits.append((f"{status}  {url}", url))
 
-    paths = [item.split("  ")[-1] for item in hits]
+    paths = [url for _text, url in hits]
     ctx.surface.add_extra_paths(paths)
     ctx.surface.add_endpoints(paths, source="enumerate")
-    for item in hits:
-        ctx.surface.mark_attempt(item.split("  ")[-1], "enumerate", outcome="signal", detail=item[:120])
+    for text, url in hits:
+        ctx.surface.mark_attempt(url, "enumerate", outcome="signal", detail=text[:120])
     lines = [
         f"[enumerate_common] 探测 {len(words)} 个路径（档位 {'+'.join(tiers)}，随机路径基线 HTTP {baseline_status}）"
     ]
@@ -1133,7 +1140,7 @@ def _enumerate_common(ctx: ToolRegistry, args: dict[str, Any]) -> str:
         lines.append("注意：本站对任意路径都返回 200（疑似 SPA/自定义错误页），已用随机路径基线过滤。")
     if hits:
         lines.append(f"命中 {len(hits)} 个：")
-        lines += [f"  {item}" for item in hits[:60]]
+        lines += [f"  {text}" for text, _url in hits[:60]]
     else:
         lines.append("未命中任何有效路径。")
     if soft_hits:

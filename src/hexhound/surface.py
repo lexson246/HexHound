@@ -42,6 +42,35 @@ _ASSET_SUFFIX = re.compile(
 
 _DIGIT = re.compile(r"\d+")
 
+#: URI 路径里不允许出现的字符（RFC 3986：空白与控制字符一律不算路径内容）。
+#:
+#: 为什么要在攻面入口挡这一层：实测有工具把自己"给人看的"命中文本当成端点登记，
+#: 于是覆盖率表里出现 `/admin（受保护，值得进一步探测）` 这类**假端点**——
+#: 端点覆盖数字虚高，读者以为测过的东西其实不存在。根因已在调用方修掉，
+#: 这里是边界防线：任何调用方都不该能把一句话塞进端点表。
+_INVALID_IN_URL = re.compile(r"[\s\x00-\x1f\x7f]")
+
+
+def looks_like_url(value: str) -> bool:
+    """这个值能不能当作 URL/路径登记（挡住"一句话被当成端点"）。
+
+    判据刻意保守：只拒绝**不可能是 URL** 的东西——含空白或控制字符、
+    或者（去掉 query/fragment 后）路径里出现成对的中文括号。
+    合法的百分号编码路径（`/%E4%B8%AD%E6%96%87`）不受影响。
+
+    注意：这里**不**因为非 ASCII 就拒绝——IRI 里中文路径是合法的，
+    真正的问题是"人话"混进来了，而人话一定有空白或全角标点。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if _INVALID_IN_URL.search(text):
+        return False
+    parsed = urlparse(text if "://" in text else "//" + text)
+    path = parsed.path or ""
+    # 全角括号只会出现在中文说明里（URL 里要用也会被百分号编码）
+    return not any(char in path for char in "（）")
+
 
 def normalize_path(url: str) -> str:
     """把 URL 归一成「同一条路径」：去掉 host、数字段折叠为 {n}、去掉末尾斜杠。"""
@@ -58,9 +87,12 @@ def normalize_endpoint(url: str, keep_host: bool = True) -> str:
 
     相对路径（无 host）在攻面里没有意义：与绝对 URL 端点无法比对、无法直接请求，
     因此统一返回空串让调用方丢弃（表单 action 会先用 base_url 补全）。
+
+    含空白/全角标点的"人话"同样返回空串（见 `looks_like_url`）：这类值一定不是
+    端点，而它一旦进入 `attempt_key` 就会变成一条"探过某个不存在的端点"的记录。
     """
     value = str(url or "").strip()
-    if not value or "://" not in value:
+    if not value or "://" not in value or not looks_like_url(value):
         return ""
     parsed = urlparse(value)
     if not parsed.netloc:
@@ -309,8 +341,8 @@ class AttackSurface:
         status: int = 0,
         note: str = "",
     ) -> str | None:
-        """登记一个端点，返回归一化后的 key（静态资源返回 None）。"""
-        if not url or is_asset(url):
+        """登记一个端点，返回归一化后的 key（静态资源或非法值返回 None）。"""
+        if not url or is_asset(url) or not looks_like_url(url):
             return None
         key = normalize_endpoint(url)
         if not key:
@@ -470,12 +502,16 @@ class AttackSurface:
             del self.notes[:-60]
 
     def add_extra_paths(self, paths: Iterable[str]) -> int:
-        """记录非 404 的探测路径（enumerate 命中）。"""
+        """记录非 404 的探测路径（enumerate 命中）。
+
+        只收"像 URL/路径"的值：这一层曾被展示文本污染
+        （`/admin（受保护，值得进一步探测）` 被当成一条探测到的路径）。
+        """
         added = 0
         with self._lock:
             for path in paths:
                 path = str(path or "").strip()
-                if path and path not in self.extra_paths:
+                if path and looks_like_url(path) and path not in self.extra_paths:
                     self.extra_paths.append(path)
                     added += 1
         return added
