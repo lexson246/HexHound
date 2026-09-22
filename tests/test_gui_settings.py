@@ -190,9 +190,14 @@ def test_validate_run_settings_wraps_the_error_for_the_ui() -> None:
 
 
 @pytest.fixture()
-def app(monkeypatch, settings_file: Path):
-    """一份隔离的 GUI 应用（临时设置文件、干净状态）。"""
+def app(monkeypatch, settings_file: Path, tmp_path):
+    """一份隔离的 GUI 应用（临时设置文件、临时运行产物目录、干净状态）。
+
+    运行产物目录也要隔离：首页会列出历史运行，若不隔离就会去读用户真实的
+    `~/.hexhound/runs/`（只读，但测试应当完全不碰用户数据）。
+    """
     monkeypatch.setattr(gui, "STATE", gui.RunState())
+    monkeypatch.setattr(gui.history, "data_home", lambda home=None: tmp_path / "hh-home")
     application = gui.create_app()
     application.config.update(TESTING=True)
     return application
@@ -313,3 +318,95 @@ def test_duplicate_run_is_refused_while_one_is_active(app, client, token) -> Non
         assert "已有审计任务" in response.get_json()["error"]
     finally:
         gui.STATE.abort_begin()
+
+
+# --------------------------------------------- P1 预算护栏 / 参数校验（桌面端）
+
+
+def test_bad_budget_value_blocks_the_run_with_label_and_unit(app, client, token) -> None:
+    """护栏填错必须在启动前拦住，并说清是哪个字段、单位是什么。"""
+    response = client.post(
+        "/api/run",
+        json={"target": "http://127.0.0.1:5000", "max_cost": "-1", "max_tokens": "abc"},
+        headers=_auth(token),
+    )
+    assert response.status_code == 400
+    error = response.get_json()["error"]
+    assert "费用上限" in error and "元" in error
+    assert "Token 上限" in error
+    assert gui.STATE.snapshot()["running"] is False
+
+
+def test_all_five_budget_limits_reach_the_budget_object(app) -> None:
+    """桌面端必须和 CLI 一样支持全部五个预算维度（曾经只生效两个）。"""
+    from hexhound import runparams
+
+    limits = runparams.limits_from_settings(
+        {
+            "max_cost": "3",
+            "max_tokens": "200000",
+            "max_llm_calls": "50",
+            "max_tool_calls": "80",
+            "max_seconds": "900",
+        }
+    )
+    assert (limits.max_cost, limits.max_tokens, limits.max_llm_calls) == (3.0, 200000, 50)
+    assert (limits.max_tool_calls, limits.max_seconds) == (80, 900.0)
+
+
+def test_limit_fields_are_rendered_from_the_shared_spec(app, client, token) -> None:
+    """界面上的参数输入框由字段定义渲染（标签/单位不会再和 CLI 漂移）。"""
+    html = client.get("/").get_data(as_text=True)
+    for key in ("max_cost", "max_tokens", "max_llm_calls", "max_tool_calls", "max_seconds"):
+        assert f'name="{key}"' in html, key
+    assert "费用上限" in html and "Token 上限" in html
+    assert "不限制" in html
+
+
+def test_new_settings_fields_survive_a_save(tmp_path, monkeypatch) -> None:
+    """新增的预算字段同样遵循"未提交就不动"的保存语义。"""
+    path = tmp_path / "settings.json"
+    monkeypatch.setattr(gui, "SETTINGS_PATH", path)
+    gui._save_settings({"max_tokens": "1000", "max_seconds": "300"})
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["max_tokens"] == "1000"
+    assert stored["max_seconds"] == "300"
+    gui._save_settings({"target": "http://127.0.0.1:5000"})
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["max_tokens"] == "1000"
+
+
+# ------------------------------------------------------ P1 历史运行（只读产物）
+
+
+def test_history_endpoint_lists_runs_from_disk(app, client, token, tmp_path, monkeypatch) -> None:
+    home = tmp_path / "hh-home"  # 与 `app` fixture 里隔离的产物目录一致
+    run_dir = home / "runs" / "127.0.0.1-20260101-000000"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {"target": "http://127.0.0.1:5000", "mode": "blackbox",
+             "usage": {"total_tokens": 10, "estimated_cost": 0.01},
+             "stats": {"findings": 1, "endpoints": 2}},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "report.md").write_text("## 历史报告\n\n证据。\n", encoding="utf-8")
+    (run_dir / "snapshot.json").write_text("{}", encoding="utf-8")
+
+    payload = client.get("/api/history").get_json()
+    assert [run["id"] for run in payload["runs"]] == ["127.0.0.1-20260101-000000"]
+    assert payload["runs"][0]["findings"] == 1
+    assert payload["status_labels"]
+
+    detail = client.get("/api/history/127.0.0.1-20260101-000000").get_json()
+    assert detail["markdown_source"] == "report"
+    assert "历史报告" in detail["markdown"]
+    # 首页要带上历史面板（清单由前端拉 /api/history 渲染，见浏览器冒烟测试）
+    html = client.get("/").get_data(as_text=True)
+    assert 'id="historyList"' in html and "历史运行" in html
+
+
+def test_history_detail_of_unknown_run_is_404(app, client, token) -> None:
+    assert client.get("/api/history/does-not-exist").status_code == 404

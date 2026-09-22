@@ -17,11 +17,11 @@ from urllib.parse import urlparse
 
 from flask import Flask, jsonify, render_template_string, request, send_file
 
+from . import history
 from .agent import ReActAgent
-from .budget import Budget, BudgetLimits
+from .budget import Budget, limits_from_config
 from .config import (
     ROLES,
-    Config,
     _normalize_host,
     normalize_base_url,
     resolve_provider,
@@ -44,6 +44,13 @@ from .providers import (
     pricing_known,
 )
 from .report import write_report
+from .runparams import (
+    BY_KEY,
+    config_from_settings,
+    field_specs,
+    numeric_defaults,
+    parse_fields,
+)
 from .screenshot import capture_url
 from .submission import write_butian_package
 from .surface import AttackSurface
@@ -95,7 +102,9 @@ DEFAULTS = {
     "zoom": "1.0",
     "auth_a": "",
     "auth_b": "",
-    # 多代理编排与预算
+    # 多代理编排与预算。
+    # 数值字段（含预算上限）的默认值由 `runparams.FIELDS` 统一提供，
+    # 避免"界面一处默认值、CLI 另一处默认值"的漂移。
     "max_tasks": "6",
     "task_steps": "10",
     "parallel": "3",
@@ -103,6 +112,8 @@ DEFAULTS = {
     "rate_limit": "0",
     "swarm": "1",
 }
+#: 合并 `runparams` 的数值字段默认值（键冲突时以 runparams 为准）。
+DEFAULTS.update(numeric_defaults())
 
 HTML = r"""<!doctype html>
 <html lang="zh-CN">
@@ -262,20 +273,19 @@ HTML = r"""<!doctype html>
       <label>目标 URL</label>
       <input name="target" value="{{ settings.target }}" placeholder="https://授权目标">
 <div id="sourceFields"><label>源码目录</label><input name="path" value="{{ settings.path }}"></div>
-      <details><summary>执行参数与预算</summary>
+      <details><summary>执行参数与预算上限</summary>
+      <p class="muted">标签、单位与取值范围来自同一份字段定义（与 CLI 一致）。预算类字段填 <b>0</b> 或留空 = 不限制；界面与后端都会校验。</p>
+      {% for group in field_groups %}
       <div class="row">
-        <div><label>单代理步数</label><input name="max_steps" value="{{ settings.max_steps }}"></div>
-        <div><label>请求超时 / 秒</label><input name="request_timeout" value="{{ settings.request_timeout }}"></div>
+        {% for field in group %}
+        <div>
+          <label for="f-{{ field.key }}">{{ field.label }}{% if field.unit %} / {{ field.unit }}{% endif %}</label>
+          <input id="f-{{ field.key }}" name="{{ field.key }}" value="{{ settings[field.key] }}" inputmode="decimal">
+          <small class="muted" id="hint-{{ field.key }}">范围：{{ field.range }}</small>
+        </div>
+        {% endfor %}
       </div>
-      <div class="row">
-        <div><label>任务上限</label><input name="max_tasks" value="{{ settings.max_tasks }}"></div>
-        <div><label>每任务步数</label><input name="task_steps" value="{{ settings.task_steps }}"></div>
-        <div><label>并发数</label><input name="parallel" value="{{ settings.parallel }}"></div>
-      </div>
-      <div class="row">
-        <div><label>预算 / ¥（0 不限）</label><input name="max_cost" value="{{ settings.max_cost }}"></div>
-        <div><label>请求间隔 / 秒</label><input name="rate_limit" value="{{ settings.rate_limit }}"></div>
-      </div>
+      {% endfor %}
       </details>
       <label>授权主机 · 逗号分隔</label>
       <input name="allowed_hosts" value="{{ settings.allowed_hosts }}">
@@ -292,7 +302,13 @@ HTML = r"""<!doctype html>
       </section><div class="workflow" aria-label="审计流程"><span><i>01</i> 范围配置</span><b>→</b><span><i>02</i> 协同评估</span><b>→</b><span><i>03</i> 证据复核</span><b>→</b><span><i>04</i> 报告归档</span></div></div>
     </div>
   </section>
-  <section id="reportsPane" class="panel" hidden><div class="panel-head"><h2>发现与报告</h2><button type="button" id="reportBtn">查看完整报告</button></div><div class="panel-body"><div id="results"><div class="empty-state"><div class="empty-symbol" aria-hidden="true">▤</div><h3>尚无审计结果</h3><p>完成一次审计后，在这里查看发现、复核状态和完整报告。</p></div></div><div id="reportSection"><pre class="raw" id="reportView" style="display:none;"></pre></div></div></section>
+  <section id="reportsPane" class="panel" hidden><div class="panel-head"><h2>发现与报告</h2><button type="button" id="reportBtn">查看完整报告</button></div><div class="panel-body"><div id="results"><div class="empty-state"><div class="empty-symbol" aria-hidden="true">▤</div><h3>尚无审计结果</h3><p>完成一次审计后，在这里查看发现、复核状态和完整报告。</p></div></div><div id="reportSection"><pre class="raw" id="reportView" style="display:none;"></pre></div>
+    <details id="historySection" open><summary>历史运行（重启后仍可查看，只读本机产物）</summary>
+      <div class="row"><div><button type="button" id="historyRefresh">刷新历史</button></div><div id="historyNote" class="muted">只读取本机运行产物：不调用模型，也不会访问目标。</div></div>
+      <div id="historyList" class="muted">正在加载…</div>
+      <div id="historyDetail"></div>
+    </details>
+  </div></section>
   <section id="visionPane" class="panel" hidden><div class="panel-head"><h2>页面与图像分析</h2><span class="eyebrow">VISION</span></div><div class="panel-body vision-grid"><div>    <input type="file" id="imgInput" accept="image/*">
     <label>直接截图目标 URL</label>
     <div class="row">
@@ -456,6 +472,61 @@ let timer = null;
 let lastLog = '';
 let lastResult = '';
 const idleLog = $('#log').innerHTML;
+
+/* ---------- 历史运行（只读本机产物） ---------- */
+function formatHistoryRun(run) {
+  const label = run.status_label || run.status || '';
+  const cost = Number(run.cost || 0).toFixed(4);
+  const when = (run.finished_at || '').replace('T', ' ').slice(0, 19);
+  return `<div class="finding" style="border-left-color:${run.status === 'done' ? 'var(--ok)' : 'var(--warn)'}">
+    <b>${escapeHtml(run.target || run.id)}</b>
+    <span class="tag">${escapeHtml(label)}</span>
+    ${run.mode ? `<span class="tag">${escapeHtml(run.mode)}</span>` : ''}
+    <div class="muted">${escapeHtml(when)} · 发现 ${run.findings || 0} · 端点 ${run.endpoints || 0} · ${Number(run.tokens || 0).toLocaleString()} token · ¥${cost}</div>
+    <div class="muted">${escapeHtml(run.id)}</div>
+    <button type="button" data-run="${escapeHtml(run.id)}">查看这次报告</button>
+  </div>`;
+}
+async function loadHistory() {
+  const list = $('#historyList');
+  try {
+    const r = await apiFetch('/api/history?limit=30');
+    const j = await r.json();
+    if (!r.ok || j.error) throw new Error(j.error || '历史加载失败');
+    const runs = j.runs || [];
+    const labels = j.status_labels || {};
+    if (!runs.length) {
+      list.innerHTML = '<div class="muted">本机还没有运行产物（跑一次审计后这里会出现记录）。</div>';
+      return;
+    }
+    list.innerHTML = runs.map(run => formatHistoryRun({...run, status_label: labels[run.status] || run.status})).join('');
+    list.querySelectorAll('button[data-run]').forEach(button => {
+      button.onclick = () => loadHistoryDetail(button.dataset.run);
+    });
+  } catch (error) {
+    list.textContent = '历史加载失败：' + error.message;
+  }
+}
+async function loadHistoryDetail(runId) {
+  const detail = $('#historyDetail');
+  detail.textContent = '正在读取 ' + runId + ' …';
+  try {
+    const r = await apiFetch('/api/history/' + encodeURIComponent(runId));
+    const j = await r.json();
+    if (!r.ok || j.error) throw new Error(j.error || '读取失败');
+    const source = j.markdown_source === 'report' ? '当时写下的报告原文'
+      : j.markdown_source === 'snapshot' ? '由运行快照离线重渲染（原文已不存在）' : '产物里没有报告';
+    detail.innerHTML = `<h3>${escapeHtml(j.id)}</h3><div class="muted">来源：${escapeHtml(source)}</div>`;
+    const pre = document.createElement('pre');
+    pre.className = 'raw';
+    pre.style.display = 'block';
+    pre.textContent = j.markdown || '（这次运行没有留下报告文本）';
+    detail.appendChild(pre);
+  } catch (error) {
+    detail.textContent = '读取失败：' + error.message;
+  }
+}
+$('#historyRefresh').onclick = () => loadHistory();
 async function poll() {
   try {
     const response = await apiFetch('/api/status');
@@ -812,6 +883,7 @@ for (const id of ['saveBtn', 'settingsSave', 'testBtn', 'envBtn', 'shotBtn']) {
 }
 document.documentElement.style.zoom = Math.min(2, Math.max(.5, zoomLevel));
 loadProviders();
+loadHistory();
 poll();
 
 </script>
@@ -1055,12 +1127,17 @@ def _request_hostname() -> str:
 
 
 def _settings_payload() -> dict:
-    """给模板的完整设置（含 provider 相关字段与角色模型）。"""
+    """给模板的完整设置（含 provider 相关字段、角色模型与数值字段定义）。"""
     stored = _load_settings()
     merged = {**DEFAULTS, **stored}
+    specs = field_specs()
+    # 每行两个字段：与既有版式一致，且不依赖模板里的循环算术。
+    groups = [specs[index : index + 2] for index in range(0, len(specs), 2)]
     return {
         "settings": {**merged, "role_models": _role_models(stored)},
         "role_labels": ROLE_LABEL,
+        "field_groups": groups,
+        "run_history": history.list_runs(limit=10),
     }
 
 
@@ -1371,13 +1448,40 @@ def _parse_auth_profiles(settings: dict) -> dict[str, dict[str, str]]:
 def _validate_run_settings(settings: dict) -> dict[str, dict[str, str]]:
     """启动审计**之前**的校验（把配置错误挡在跑之前，而不是让它在报告里变形）。
 
-    目前只做认证身份解析——它是唯一"错了以后会静默改变结论含义"的配置。
+    两类都校验，**一次报出全部问题**：
+
+    1. 认证身份解析——唯一"错了以后会静默改变结论含义"的配置；
+    2. 数值字段（步数/并发/预算上限…）——与 CLI 同一份定义。
+       预算护栏填错（例如把 0 不限制写成 -1）必须在启动前拦住。
+
     返回解析好的身份字典，供 `_run_audit` 复用（避免解析两次）。
     """
+    problems: list[str] = []
     try:
-        return _parse_auth_profiles(settings)
+        parse_fields(settings)
     except ValueError as exc:
-        raise ValueError(f"认证身份配置有误，已阻止启动：{exc}") from exc
+        problems.append(str(exc))
+    profiles: dict[str, dict[str, str]] = {}
+    try:
+        profiles = _parse_auth_profiles(settings)
+    except ValueError as exc:
+        problems.append(str(exc))
+    if problems:
+        raise ValueError("配置有误，已阻止启动：" + "；".join(problems))
+    return profiles
+
+
+def _archive_report(artifacts: RunArtifacts, report_path: Path) -> None:
+    """把最终报告复制进本次运行的产物目录（历史复盘用）。
+
+    失败**不影响**审计收尾：报告已经写在输出路径上了，副本只是"历史里也有一份"。
+    但失败要留痕——否则用户会以为历史里那份就是当时的原文。
+    """
+    try:
+        text = Path(report_path).read_text(encoding="utf-8")
+    except OSError:
+        return
+    artifacts.write_artifact("report.md", text)
 
 
 def _mark_partial(result, settings: dict):
@@ -1434,21 +1538,17 @@ def _run_audit(settings: dict, token: int) -> None:
             raise ValueError("请填写模型名（设置 → 模型提供商）。")
         provider = resolved["provider"]
         preset = get_preset(provider)
-        config = Config(
+        # 参数解析、范围校验与 Config/Budget 构造都走 `runparams`——
+        # 与 CLI 同一份字段定义。早先这里手抄了一遍 Config，于是 CLI 支持的
+        # token / 模型调用数 / 总时长三个上限在桌面上被静默丢弃（用户以为设了护栏）。
+        config = config_from_settings(
+            settings,
             api_key=resolved["api_key"],
             base_url=resolved["base_url"] or (preset.base_url if preset else ""),
             model=resolved["model"],
             provider=provider,
             role_models=_role_models(settings),
-            max_steps=int(settings.get("max_steps") or DEFAULTS["max_steps"]),
-            request_timeout=int(settings.get("request_timeout") or DEFAULTS["request_timeout"]),
             allowed_hosts=allowed,
-            max_tasks=int(settings.get("max_tasks") or DEFAULTS["max_tasks"]),
-            task_steps=int(settings.get("task_steps") or DEFAULTS["task_steps"]),
-            parallel=int(settings.get("parallel") or DEFAULTS["parallel"]),
-            rate_limit=float(settings.get("rate_limit") or DEFAULTS["rate_limit"]),
-            max_cost=float(settings.get("max_cost") or DEFAULTS["max_cost"]),
-            temperature=float(settings.get("temperature") or DEFAULTS["temperature"]),
         )
         config.validate()
         target = settings.get("target", "")
@@ -1470,13 +1570,31 @@ def _run_audit(settings: dict, token: int) -> None:
         # 身份解析已在 `/api/run` 里预先校验过（错误会以 400 返回给界面）；
         # 这里再解析一次拿到结果——线程里不做"静默降级成匿名"。
         auth_profiles = _parse_auth_profiles(settings)
-        budget = Budget(
-            BudgetLimits(
-                max_cost=config.max_cost,
-                max_tool_calls=int(settings.get("max_tool_calls") or 0),
-            )
-        )
+        # 预算上限与 CLI 同源（`budget.limits_from_config`），五个上限全部生效。
+        budget = Budget(limits_from_config(config))
         budget.on_change(lambda snapshot: STATE.update_tokens(snapshot, token))
+        # 把生效中的护栏写进运行记录：用户要能一眼确认"我设的上限真的生效了"，
+        # 而不是只能等跑完看用量。0 = 不限制的项不列（列出来反而像设了限制）。
+        active_limits = [
+            text
+            for field, text in (
+                (BY_KEY["max_cost"], f"费用 ≤ ¥{config.max_cost:.2f}"),
+                (BY_KEY["max_tokens"], f"Token ≤ {config.max_tokens}"),
+                (BY_KEY["max_llm_calls"], f"模型调用 ≤ {config.max_llm_calls} 次"),
+                (BY_KEY["max_tool_calls"], f"工具调用 ≤ {config.max_tool_calls} 次"),
+                (BY_KEY["max_seconds"], f"总时长 ≤ {config.max_seconds:.0f} 秒"),
+            )
+            if getattr(config, field.key)
+        ]
+        STATE.add_event(
+            {
+                "kind": "notice",
+                "task": "护栏",
+                "level": "info",
+                "message": "；".join(active_limits) if active_limits else "未设置预算上限（0 = 不限制）",
+            },
+            token,
+        )
         artifacts = RunArtifacts(target)
         surface = AttackSurface(target=target, mode=mode, path=artifacts.surface_path)
         goal = _goal_for(mode, settings.get("path", ""), target)
@@ -1554,6 +1672,10 @@ def _run_audit(settings: dict, token: int) -> None:
             result = _mark_partial(result, settings)
         output = write_report(result, goal, output_path)
         package = write_butian_package(result, output)
+        # 把这一份报告存进**本次运行的产物目录**：默认输出路径是固定的
+        # `reports/report.md`，下一次运行就覆盖了——所以"历史里还能看到当时的报告"
+        # 必须有一份随运行目录走的副本。
+        _archive_report(artifacts, output)
         STATE.finish(
             result,
             str(output),
@@ -1777,6 +1899,32 @@ def create_app() -> Flask:
     @app.route("/api/status")
     def status() -> str:
         return jsonify(STATE.snapshot())
+
+    @app.route("/api/history")
+    def history_api() -> str:
+        """历史运行清单（只读磁盘：不调模型、不访问目标）。
+
+        这就是"关掉程序再打开还能看到上次跑了什么"的入口。
+        """
+        limit = request.args.get("limit", "30")
+        try:
+            count = max(1, min(int(limit), 200))
+        except (TypeError, ValueError):
+            count = 30
+        return jsonify(
+            {
+                "runs": history.list_runs(limit=count, target=request.args.get("target", "")),
+                "status_labels": history.STATUS_LABEL,
+            }
+        )
+
+    @app.route("/api/history/<run_id>")
+    def history_detail_api(run_id: str) -> str:
+        """某次历史运行的报告（原文优先，缺失时离线重渲染）。"""
+        detail = history.run_detail(run_id)
+        if detail is None:
+            return jsonify({"error": "找不到这次运行的产物目录。"}), 404
+        return jsonify(detail)
 
     @app.route("/api/report")
     def report() -> str:

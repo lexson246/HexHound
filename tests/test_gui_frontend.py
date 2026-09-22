@@ -17,6 +17,8 @@ def test_console_interactions(monkeypatch, tmp_path):
     playwright = pytest.importorskip("playwright.sync_api")
     monkeypatch.setattr(gui, "SETTINGS_PATH", tmp_path / "settings.json")
     monkeypatch.setattr(gui, "STATE", gui.RunState())
+    # 历史面板读的是运行产物目录：隔离到临时目录，别去读用户真实的历史
+    monkeypatch.setattr(gui.history, "data_home", lambda home=None: tmp_path / "hh-home")
     app = gui.create_app()
     client = app.test_client()
     token = app.config["HEXHOUND_LOCAL_TOKEN"]
@@ -52,7 +54,7 @@ def test_console_interactions(monkeypatch, tmp_path):
             elif path in {"/api/vision", "/api/screenshot"}:
                 route.fulfill(json={"answer": "模拟视觉分析结果"})
             else:
-                assert path in {"/", "/favicon.ico", "/api/providers", "/api/status", "/api/save", "/api/stop", "/api/report"}, path
+                assert path in {"/", "/favicon.ico", "/api/providers", "/api/status", "/api/save", "/api/stop", "/api/report", "/api/history"}, path
                 # 原样转给 Flask 测试客户端（带令牌），跑的是真实视图函数。
                 headers = {gui.TOKEN_HEADER: token}
                 response = client.open(path, method=req.method, data=req.post_data, content_type="application/json", headers=headers)
@@ -132,6 +134,9 @@ def test_console_interactions(monkeypatch, tmp_path):
         expect(page.locator("#reportsPane")).to_be_visible()
         expect(page.locator("#results")).to_contain_text("测试发现")
         expect(page.locator("#results")).to_contain_text("<b>literal evidence</b>")
+        # 历史面板要真的接上后端：隔离的产物目录里没有运行记录，
+        # 于是必须显示"还没有运行产物"——而不是一直停在"正在加载…"。
+        expect(page.locator("#historyList")).to_contain_text("还没有运行产物", timeout=10000)
         page.locator("#reportBtn").click()
         expect(page.locator("#reportView")).to_have_text("暂无报告")
 
