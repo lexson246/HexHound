@@ -135,6 +135,59 @@ def run_detail(run_id: str, *, home: Path | None = None) -> dict[str, Any] | Non
     return detail
 
 
+def run_findings(run_id: str, *, home: Path | None = None) -> list[dict[str, Any]]:
+    """读回某次运行的发现列表（离线，不调模型、不访问目标）。
+
+    来源优先级：`snapshot.json`（字段最全，含去重指纹）→ `surface.json`
+    （旧格式：findings 在 surface 里）。两者都没有时返回空列表——
+    "这次运行没留下发现"与"产物读不出来"在界面上是两件事，
+    因此调用方还会拿到 `source` 字段（见 `run_findings_with_source`）。
+    """
+    return run_findings_with_source(run_id, home=home)[0]
+
+
+def run_findings_with_source(
+    run_id: str, *, home: Path | None = None
+) -> tuple[list[dict[str, Any]], str]:
+    """读回某次运行的发现列表，并说明是从哪读到的。
+
+    返回值 `(findings, source)`，`source` ∈ {snapshot, surface, none}。
+    """
+    run_dir = find_run(run_id, home=home)
+    if run_dir is None:
+        return [], "none"
+    snapshot_file = run_dir / "snapshot.json"
+    if snapshot_file.exists():
+        payload = _load_json(snapshot_file)
+        result = payload.get("result") or {}
+        findings = result.get("findings")
+        if isinstance(findings, list):
+            return [item for item in findings if isinstance(item, dict)], "snapshot"
+    surface_file = run_dir / "surface.json"
+    if surface_file.exists():
+        payload = _load_json(surface_file)
+        findings = payload.get("findings")
+        if isinstance(findings, list):
+            return [item for item in findings if isinstance(item, dict)], "surface"
+        # 旧格式把发现放在 candidates/verified 两个列表里
+        merged: list[dict[str, Any]] = []
+        for key in ("verified", "candidates"):
+            items = payload.get(key)
+            if isinstance(items, list):
+                merged.extend(item for item in items if isinstance(item, dict))
+        if merged:
+            return merged, "surface"
+    return [], "none"
+
+
+def run_summary(run_id: str, *, home: Path | None = None) -> dict[str, Any]:
+    """一次运行的汇总字段（目标/模式/用量/统计），找不到返回空字典。"""
+    run_dir = find_run(run_id, home=home)
+    if run_dir is None:
+        return {}
+    return _load_json(run_dir / "run.json")
+
+
 def render_run_report(run_dir: Path) -> tuple[str, str]:
     """取回这次运行的报告文本，返回 `(markdown, 来源)`。
 

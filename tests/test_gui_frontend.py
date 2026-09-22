@@ -181,6 +181,29 @@ def test_console_interactions(monkeypatch, tmp_path):
         # 历史面板要真的接上后端：隔离的产物目录里没有运行记录，
         # 于是必须显示"还没有运行产物"——而不是一直停在"正在加载…"。
         expect(page.locator("#historyList")).to_contain_text("还没有运行产物", timeout=10000)
+
+        # ---- 报表工作区：筛选 / 详情 / 导出 / 对比（前端逻辑，只有真实浏览器能验） ----
+        expect(page.locator("#findingCount")).to_have_text("显示 1 / 共 1 条")
+        page.locator("#filterText").fill("不存在的关键词")
+        expect(page.locator("#results")).to_contain_text("当前筛选条件下没有发现")
+        page.locator("#filterText").fill("")
+        expect(page.locator("#results")).to_contain_text("测试发现")
+        page.locator("#filterStatus").select_option("verified")
+        expect(page.locator("#results")).to_contain_text("当前筛选条件下没有发现")  # 唯一一条是候选
+        page.locator("#filterStatus").select_option("")
+        expect(page.locator("#results")).to_contain_text("测试发现")
+        # 点卡片出详情（证据原文要完整带出来）
+        page.locator('#results [data-finding="F1"]').click()
+        expect(page.locator("#detailPane")).to_be_visible()
+        expect(page.locator("#detailPane")).to_contain_text("<b>literal evidence</b>")
+        page.locator("#detailClose").click()
+        expect(page.locator("#detailPane")).not_to_be_visible()
+        # 导出链接指向本次运行
+        assert "/api/export?format=json&run=current" in page.locator("#exportJson").get_attribute("href")
+        # 没有选历史运行时点对比 → 提示而不是报错
+        page.locator("#compareBtn").click()
+        expect(page.locator("#notice")).to_have_text("先选择一次历史运行")
+
         page.locator("#reportBtn").click()
         expect(page.locator("#reportView")).to_have_text("暂无报告")
 

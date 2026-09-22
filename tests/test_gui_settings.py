@@ -410,3 +410,121 @@ def test_history_endpoint_lists_runs_from_disk(app, client, token, tmp_path, mon
 
 def test_history_detail_of_unknown_run_is_404(app, client, token) -> None:
     assert client.get("/api/history/does-not-exist").status_code == 404
+
+
+# ------------------------------------------------- P1 报表工作区（筛选/详情/导出/对比）
+
+
+def _seed_run(home: Path, name: str = "127.0.0.1-20260101-000000", findings=None) -> Path:
+    """造一次历史运行的产物（含 snapshot 里的 findings）。"""
+    run_dir = home / "runs" / name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    items = findings if findings is not None else [
+        {"id": "HH-001", "title": "SQL 注入", "severity": "high", "status": "verified",
+         "vuln_type": "sql_injection", "url": "http://127.0.0.1:5000/api/user?id=1",
+         "evidence": "布尔差异", "param": "id"},
+        {"id": "HH-002", "title": "反射型 XSS", "severity": "medium", "status": "candidate",
+         "url": "http://127.0.0.1:5000/search", "evidence": "payload 回显"},
+    ]
+    (run_dir / "run.json").write_text(
+        json.dumps({"target": "http://127.0.0.1:5000", "mode": "blackbox",
+                    "usage": {"total_tokens": 10, "estimated_cost": 0.01},
+                    "stats": {"findings": len(items), "endpoints": 2}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (run_dir / "report.md").write_text("## 历史报告\n\n正文\n", encoding="utf-8")
+    (run_dir / "snapshot.json").write_text(
+        json.dumps({"schema_version": 2, "target": "http://127.0.0.1:5000", "goal": "g",
+                    "result": {"findings": items}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return run_dir
+
+
+def test_findings_endpoint_returns_current_state(app, client, token) -> None:
+    gui.STATE.findings = [{"id": "HH-009", "title": "当前发现", "status": "verified"}]
+    payload = client.get("/api/findings").get_json()
+    assert payload["run"] == "current"
+    assert payload["source"] == "current"
+    assert [item["id"] for item in payload["findings"]] == ["HH-009"]
+
+
+def test_findings_endpoint_reads_a_history_run(app, client, token, tmp_path) -> None:
+    _seed_run(tmp_path / "hh-home")
+    payload = client.get("/api/findings?run=127.0.0.1-20260101-000000").get_json()
+    assert payload["source"] == "snapshot"
+    assert {item["id"] for item in payload["findings"]} == {"HH-001", "HH-002"}
+    assert payload["findings"][0]["param"] == "id", "详情面板要用的字段必须带出来"
+
+
+def test_findings_endpoint_unknown_run_is_404(app, client, token) -> None:
+    assert client.get("/api/findings?run=nope").status_code == 404
+
+
+def test_export_json_download(app, client, token, tmp_path) -> None:
+    _seed_run(tmp_path / "hh-home")
+    response = client.get("/api/export?format=json&run=127.0.0.1-20260101-000000")
+    assert response.status_code == 200
+    assert "attachment" in response.headers["Content-Disposition"]
+    payload = json.loads(response.get_data(as_text=True))
+    assert len(payload["findings"]) == 2
+    assert payload["source"] == "snapshot"
+
+
+def test_export_markdown_separates_candidates_from_verified(app, client, token, tmp_path) -> None:
+    """导出文案必须把候选项与已复核分开，并写明候选项不是确认漏洞。"""
+    _seed_run(tmp_path / "hh-home")
+    response = client.get("/api/export?format=markdown&run=127.0.0.1-20260101-000000")
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert "已复核：1 条" in body
+    assert "待复核候选：1 条" in body
+    assert "候选项**不是**已确认漏洞" in body
+
+
+def test_export_rejects_unknown_format(app, client, token) -> None:
+    assert client.get("/api/export?format=xml").status_code == 400
+
+
+def test_compare_reports_new_persisting_fixed_and_unknown(app, client, token, tmp_path) -> None:
+    """跨运行对比：新增 / 仍存在 / 疑似已修复 / 无法判定 四类都要分得清。"""
+    _seed_run(
+        tmp_path / "hh-home",
+        findings=[
+            {"id": "HH-001", "title": "SQL 注入", "severity": "high", "status": "verified",
+             "url": "http://127.0.0.1:5000/api/user?id=1"},
+            {"id": "HH-002", "title": "已修的问题", "severity": "low", "status": "verified",
+             "url": "http://127.0.0.1:5000/fixed"},
+            {"id": "HH-003", "title": "没测到的位置", "severity": "medium", "status": "verified",
+             "url": "http://127.0.0.1:5000/untouched"},
+        ],
+    )
+    # 本次：HH-001 仍在（同一指纹），另有一条新的；/fixed 本次被覆盖且无问题 → 疑似已修复
+    gui.STATE.findings = [
+        {"id": "HH-101", "title": "SQL 注入", "severity": "high", "status": "verified",
+         "url": "http://127.0.0.1:5000/api/user?id=1"},
+        {"id": "HH-102", "title": "新发现", "severity": "critical", "status": "verified",
+         "url": "http://127.0.0.1:5000/new"},
+    ]
+    payload = client.get("/api/compare?with=127.0.0.1-20260101-000000").get_json()
+    assert payload["against"] == "127.0.0.1-20260101-000000"
+    assert payload["current_count"] == 2 and payload["previous_count"] == 3
+    assert payload["counts"]["persisting"] >= 1
+    assert payload["counts"]["new"] >= 1
+    # "没测到的位置" 绝不能算成已修复
+    unknown_titles = {item["title"] for item in payload["unknown"]}
+    assert "没测到的位置" in unknown_titles
+
+
+def test_compare_requires_with(app, client, token) -> None:
+    assert client.get("/api/compare").status_code == 400
+    assert client.get("/api/compare?with=nope").status_code == 404
+
+
+def test_workspace_controls_are_rendered(app, client, token) -> None:
+    """筛选/详情/导出/对比四组控件都要在页面上（否则功能等于没做）。"""
+    html = client.get("/").get_data(as_text=True)
+    for marker in ('id="filterStatus"', 'id="filterSeverity"', 'id="filterText"',
+                   'id="detailPane"', 'id="exportJson"', 'id="exportMarkdown"',
+                   'id="compareSelect"', 'id="compareBtn"'):
+        assert marker in html, marker

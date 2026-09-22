@@ -12,6 +12,7 @@ import re
 import secrets
 import sys
 import threading
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -27,6 +28,7 @@ from .config import (
     resolve_provider,
     write_env_file,
 )
+from .diff import diff_findings
 from .llm import LLMClient
 from .login import capture_login_state
 from .memory import HostMemory, RunArtifacts
@@ -308,7 +310,22 @@ HTML = r"""<!doctype html>
       </section><div class="workflow" aria-label="审计流程"><span><i>01</i> 范围配置</span><b>→</b><span><i>02</i> 协同评估</span><b>→</b><span><i>03</i> 证据复核</span><b>→</b><span><i>04</i> 报告归档</span></div></div>
     </div>
   </section>
-  <section id="reportsPane" class="panel" hidden><div class="panel-head"><h2>发现与报告</h2><button type="button" id="reportBtn">查看完整报告</button></div><div class="panel-body"><div id="results"><div class="empty-state"><div class="empty-symbol" aria-hidden="true">▤</div><h3>尚无审计结果</h3><p>完成一次审计后，在这里查看发现、复核状态和完整报告。</p></div></div><div id="reportSection"><pre class="raw" id="reportView" style="display:none;"></pre></div>
+  <section id="reportsPane" class="panel" hidden><div class="panel-head"><h2>发现与报告</h2><button type="button" id="reportBtn">查看完整报告</button></div><div class="panel-body">
+    <div id="findingToolbar" class="row">
+      <div><label for="filterStatus">状态</label><select id="filterStatus">
+        <option value="">全部</option><option value="verified">仅已复核</option><option value="candidate">仅待复核候选</option>
+      </select></div>
+      <div><label for="filterSeverity">等级</label><select id="filterSeverity"><option value="">全部</option></select></div>
+      <div><label for="filterText">关键词</label><input id="filterText" placeholder="标题 / URL / 类型"></div>
+      <div><label for="compareSelect">与历史运行对比</label><select id="compareSelect"><option value="">— 选择一次历史运行 —</option></select></div>
+      <div><button type="button" id="compareBtn">对比</button></div>
+    </div>
+    <div class="row"><div id="findingCount" class="muted">共 0 条</div>
+      <div><a id="exportJson" href="#" download>导出 JSON</a> · <a id="exportMarkdown" href="#" download>导出 Markdown</a></div>
+    </div>
+    <div id="compareResult" hidden></div>
+    <div id="detailPane" hidden></div>
+    <div id="results"><div class="empty-state"><div class="empty-symbol" aria-hidden="true">▤</div><h3>尚无审计结果</h3><p>完成一次审计后，在这里查看发现、复核状态和完整报告。</p></div></div><div id="reportSection"><pre class="raw" id="reportView" style="display:none;"></pre></div>
     <details id="historySection" open><summary>历史运行（重启后仍可查看，只读本机产物）</summary>
       <div class="row"><div><button type="button" id="historyRefresh">刷新历史</button></div><div id="historyNote" class="muted">只读取本机运行产物：不调用模型，也不会访问目标。</div></div>
       <div id="historyList" class="muted">正在加载…</div>
@@ -448,12 +465,67 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 function renderFindings(list) {
+  ALL_FINDINGS = list || [];
+  renderSeverityOptions();
+  renderFilteredFindings();
+}
+/* ---------- 报表工作区：筛选 / 详情 / 导出 / 跨运行对比 ---------- */
+function currentFilter() {
+  return {
+    status: $('#filterStatus').value,
+    severity: $('#filterSeverity').value,
+    text: $('#filterText').value.trim().toLowerCase()
+  };
+}
+function visibleFindings() {
+  const f = currentFilter();
+  return ALL_FINDINGS.filter(item => {
+    const status = item.status === 'candidate' ? 'candidate' : 'verified';
+    if (f.status && status !== f.status) return false;
+    if (f.severity && String(item.severity || '') !== f.severity) return false;
+    if (f.text) {
+      const haystack = [item.id, item.title, item.url, item.vuln_type, item.param, item.evidence]
+        .map(v => String(v || '').toLowerCase()).join(' ');
+      if (!haystack.includes(f.text)) return false;
+    }
+    return true;
+  });
+}
+function renderSeverityOptions() {
+  const select = $('#filterSeverity');
+  const levels = [...new Set(ALL_FINDINGS.map(item => String(item.severity || '')).filter(Boolean))].sort();
+  const keep = select.value;
+  select.innerHTML = '<option value="">全部</option>' + levels.map(v => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`).join('');
+  select.value = levels.includes(keep) ? keep : '';
+}
+function findingDetail(item) {
+  const rows = [['编号', item.id], ['标题', item.title], ['等级', item.severity],
+    ['状态', item.status === 'candidate' ? '待复核候选（不是已确认漏洞）' : '已复核'],
+    ['类型', item.vuln_type], ['URL', item.url], ['参数', item.param],
+    ['复核方式', item.verification], ['PoC', item.poc_path], ['来源角色', item.worker || item.role],
+    ['证据', item.evidence || item.description], ['反证', item.counterevidence]]
+    .filter(([, value]) => value !== undefined && value !== null && String(value) !== '');
+  return '<div class="finding"><b>' + escapeHtml(item.id || '') + ' ' + escapeHtml(item.title || '') + '</b>'
+    + '<button type="button" id="detailClose" style="float:right">关闭</button>'
+    + rows.map(([label, value]) => `<div class="muted"><b>${escapeHtml(label)}</b>：<span>${escapeHtml(String(value).slice(0, 1200))}</span></div>`).join('')
+    + '</div>';
+}
+function renderFilteredFindings() {
   const box = $('#results');
-  if (!list.length) { box.innerHTML = '<div class="empty-state"><div class="empty-symbol" aria-hidden="true">▤</div><h3>暂无已记录的发现</h3><p>运行完成后的发现与复核状态会列在这里。<br>未发现问题不代表目标安全。</p></div>'; return; }
+  const list = visibleFindings();
+  $('#findingCount').textContent = `显示 ${list.length} / 共 ${ALL_FINDINGS.length} 条`;
+  if (!ALL_FINDINGS.length) {
+    box.innerHTML = '<div class="empty-state"><div class="empty-symbol" aria-hidden="true">▤</div><h3>暂无已记录的发现</h3><p>运行完成后的发现与复核状态会列在这里。<br>未发现问题不代表目标安全。</p></div>';
+    return;
+  }
+  if (!list.length) {
+    box.innerHTML = '<div class="muted">当前筛选条件下没有发现（清空条件可看全部）。</div>';
+    return;
+  }
   const verified = list.filter(f => f.status !== 'candidate');
   const candidates = list.filter(f => f.status === 'candidate');
   const card = (f) => `
-    <div class="finding" style="${f.status === 'candidate' ? 'border-left-color:var(--warn);opacity:.9' : ''}">
+    <div class="finding" data-finding="${escapeHtml(f.id || '')}" style="${f.status === 'candidate' ? 'border-left-color:var(--warn);opacity:.9' : ''}">
       <b>${escapeHtml(f.id || '')} ${escapeHtml(f.title || '')}</b>
       <span class="tag">${escapeHtml(f.severity || '')}</span>
       ${f.status === 'candidate' ? '<span class="tag" style="background:var(--warn);color:#000">待复核</span>' : '<span class="tag" style="background:var(--ok);color:#000">已复核</span>'}
@@ -465,7 +537,58 @@ function renderFindings(list) {
     </div>`;
   box.innerHTML = `<h2>已复核漏洞（${verified.length}）</h2>` + (verified.map(card).join('') || '<div class="muted">无</div>')
     + (candidates.length ? `<h2>待复核候选（${candidates.length}）</h2>` + candidates.map(card).join('') : '');
+  box.querySelectorAll('[data-finding]').forEach(node => {
+    node.style.cursor = 'pointer';
+    node.onclick = () => {
+      const item = ALL_FINDINGS.find(f => String(f.id || '') === node.dataset.finding);
+      if (!item) return;
+      const pane = $('#detailPane');
+      pane.innerHTML = findingDetail(item);
+      pane.hidden = false;
+      const close = pane.querySelector('#detailClose');
+      if (close) close.onclick = () => { pane.hidden = true; pane.innerHTML = ''; };
+    };
+  });
 }
+['#filterStatus', '#filterSeverity'].forEach(selector => {
+  $(selector).onchange = () => renderFilteredFindings();
+});
+let filterTimer;
+$('#filterText').oninput = () => {
+  clearTimeout(filterTimer);
+  filterTimer = setTimeout(() => renderFilteredFindings(), 150);
+};
+function updateExportLinks() {
+  const run = $('#compareSelect').value || 'current';
+  $('#exportJson').href = '/api/export?format=json&run=' + encodeURIComponent(run);
+  $('#exportMarkdown').href = '/api/export?format=markdown&run=' + encodeURIComponent(run);
+}
+$('#compareBtn').onclick = async () => {
+  const against = $('#compareSelect').value;
+  const box = $('#compareResult');
+  if (!against) { notify('先选择一次历史运行'); return; }
+  box.hidden = false;
+  box.textContent = '正在对比…';
+  try {
+    const r = await apiFetch('/api/compare?with=' + encodeURIComponent(against));
+    const j = await r.json();
+    if (!r.ok || j.error) throw new Error(j.error || '对比失败');
+    const block = (title, items, hint) => `<h3>${escapeHtml(title)}（${items.length}）</h3>`
+      + (hint ? `<div class="muted">${escapeHtml(hint)}</div>` : '')
+      + (items.length
+        ? items.map(i => `<div class="muted">· ${escapeHtml(i.id || '')} ${escapeHtml(i.title || '')} <span class="tag">${escapeHtml(i.severity || '')}</span> ${escapeHtml(i.url || '')}</div>`).join('')
+        : '<div class="muted">无</div>');
+    box.innerHTML = `<div class="finding"><b>与 ${escapeHtml(against)} 对比</b>`
+      + `<div class="muted">本次 ${j.current_count} 条 / 历史 ${j.previous_count} 条（历史来源：${escapeHtml(j.against_source || '')}）</div>`
+      + block('本次新增', j.new || [])
+      + block('历史已有、本次仍存在', j.persisting || [])
+      + block('疑似已修复', j.fixed || [], '只有在本次确实覆盖过该端点且无问题时才算"疑似已修复"；没测到的一律进"无法判定"。')
+      + block('无法判定', j.unknown || [], '历史上报过、但本次没有覆盖到该位置——**不能说成已修复**。')
+      + '</div>';
+  } catch (error) {
+    box.textContent = '对比失败：' + error.message;
+  }
+};
 async function loadReport() {
   const view = $('#reportView');
   const r = await apiFetch('/api/report');
@@ -477,6 +600,9 @@ async function loadReport() {
 let timer = null;
 let lastLog = '';
 let lastResult = '';
+/* 报表工作区状态：当前展示的发现（本次运行或选中的历史运行）与筛选条件。 */
+let ALL_FINDINGS = [];
+let CURRENT_RUN = 'current';
 const idleLog = $('#log').innerHTML;
 
 /* ---------- 历史运行（只读本机产物） ---------- */
@@ -501,6 +627,13 @@ async function loadHistory() {
     if (!r.ok || j.error) throw new Error(j.error || '历史加载失败');
     const runs = j.runs || [];
     const labels = j.status_labels || {};
+    // 对比下拉与导出目标都跟着历史清单走
+    const select = $('#compareSelect');
+    const keep = select.value;
+    select.innerHTML = '<option value="">— 选择一次历史运行 —</option>' + runs.map(run =>
+      `<option value="${escapeHtml(run.id)}">${escapeHtml(run.id)}（${escapeHtml(labels[run.status] || run.status)}）</option>`).join('');
+    select.value = runs.some(run => run.id === keep) ? keep : '';
+    updateExportLinks();
     if (!runs.length) {
       list.innerHTML = '<div class="muted">本机还没有运行产物（跑一次审计后这里会出现记录）。</div>';
       return;
@@ -523,6 +656,17 @@ async function loadHistoryDetail(runId) {
     const source = j.markdown_source === 'report' ? '当时写下的报告原文'
       : j.markdown_source === 'snapshot' ? '由运行快照离线重渲染（原文已不存在）' : '产物里没有报告';
     detail.innerHTML = `<h3>${escapeHtml(j.id)}</h3><div class="muted">来源：${escapeHtml(source)}</div>`;
+    // 把这次历史运行的发现读进工作区（与本次运行同一套筛选/详情/导出）
+    const findingsResponse = await apiFetch('/api/findings?run=' + encodeURIComponent(runId));
+    const findingsPayload = await findingsResponse.json();
+    if (findingsResponse.ok && !findingsPayload.error) {
+      CURRENT_RUN = runId;
+      ALL_FINDINGS = findingsPayload.findings || [];
+      renderSeverityOptions();
+      renderFilteredFindings();
+      detail.insertAdjacentHTML('beforeend',
+        `<div class="muted">已载入该次运行的 ${ALL_FINDINGS.length} 条发现（来源：${escapeHtml(findingsPayload.source)}）；筛选与导出都跟着它走。</div>`);
+    }
     const pre = document.createElement('pre');
     pre.className = 'raw';
     pre.style.display = 'block';
@@ -888,6 +1032,7 @@ for (const id of ['saveBtn', 'settingsSave', 'testBtn', 'envBtn', 'shotBtn']) {
   };
 }
 document.documentElement.style.zoom = Math.min(2, Math.max(.5, zoomLevel));
+updateExportLinks();
 loadProviders();
 loadHistory();
 poll();
@@ -1477,6 +1622,47 @@ def _validate_run_settings(settings: dict) -> dict[str, dict[str, str]]:
     return profiles
 
 
+def _findings_markdown(findings: list[dict], *, title: str) -> str:
+    """把发现渲染成可交付的 Markdown（导出用，字段与报告口径一致）。"""
+    lines = [f"# {title}", ""]
+    verified = [item for item in findings if str(item.get("status")) != "candidate"]
+    candidates = [item for item in findings if str(item.get("status")) == "candidate"]
+    lines.append(f"- 已复核：{len(verified)} 条")
+    lines.append(f"- 待复核候选：{len(candidates)} 条")
+    lines.append("")
+    lines.append("> 候选项**不是**已确认漏洞；未列出的位置也不代表安全（可能没测到）。")
+    lines.append("")
+    for label, group in (("已复核发现", verified), ("待复核候选", candidates)):
+        if not group:
+            continue
+        lines.append(f"## {label}")
+        lines.append("")
+        for item in group:
+            lines.append(
+                f"### {item.get('id', '')} {item.get('title', '')}"
+                f"（{item.get('severity', '')} · {item.get('vuln_type', '')}）"
+            )
+            lines.append("")
+            if item.get("url"):
+                lines.append(f"- URL：{item['url']}")
+            if item.get("param"):
+                lines.append(f"- 参数：{item['param']}")
+            if item.get("verification"):
+                lines.append(f"- 复核方式：{item['verification']}")
+            if item.get("poc_path"):
+                lines.append(f"- PoC：{item['poc_path']}")
+            evidence = str(item.get("evidence") or item.get("description") or "")
+            if evidence:
+                lines.append("")
+                lines.append("```")
+                lines.append(evidence)
+                lines.append("```")
+            if item.get("counterevidence"):
+                lines.append(f"- 反证：{item['counterevidence']}")
+            lines.append("")
+    return "\n".join(lines)
+
+
 def _archive_report(artifacts: RunArtifacts, report_path: Path) -> None:
     """把最终报告复制进本次运行的产物目录（历史复盘用）。
 
@@ -1931,6 +2117,100 @@ def create_app() -> Flask:
         if detail is None:
             return jsonify({"error": "找不到这次运行的产物目录。"}), 404
         return jsonify(detail)
+
+    def _findings_for(run: str) -> tuple[list[dict], str, str]:
+        """取某次运行的发现：`current`（内存）或历史运行目录。
+
+        返回 `(findings, 来源说明, 错误)`；错误非空时应回 404。
+        历史来源**只读磁盘**——复盘不该产生新的流量或费用。
+        """
+        if run in ("", "current"):
+            return list(STATE.findings or []), "current", ""
+        findings, source = history.run_findings_with_source(run)
+        if source == "none":
+            detail = history.run_detail(run)
+            if detail is None:
+                return [], "", "找不到这次运行的产物目录。"
+        return findings, source, ""
+
+    @app.route("/api/findings")
+    def findings_api() -> str:
+        """某次运行的发现清单（`?run=current|<历史目录名>`）。
+
+        界面据此做筛选与详情展示；历史运行走同一条路径，
+        因此"看上次的发现"与"看本次的发现"用同一套字段。
+        """
+        run = request.args.get("run", "current").strip()
+        findings, source, error = _findings_for(run)
+        if error:
+            return jsonify({"error": error}), 404
+        return jsonify({"run": run or "current", "source": source, "findings": findings})
+
+    @app.route("/api/compare")
+    def compare_api() -> str:
+        """把**本次**发现与某次历史运行对比（新增 / 仍存在 / 疑似已修复 / 无法判定）。
+
+        复用 `diff.diff_findings`：判定顺序（指纹 → 类别+路径 → 端点是否仍报问题）
+        本身就是要守住的东西，界面上另写一套判断只会漂移。
+        """
+        against = request.args.get("with", "").strip()
+        if not against:
+            return jsonify({"error": "缺少 with 参数（要对比的历史运行目录名）。"}), 400
+        previous, previous_source = history.run_findings_with_source(against)
+        if previous_source == "none" and history.run_detail(against) is None:
+            return jsonify({"error": "找不到这次运行的产物目录。"}), 404
+        current = list(STATE.findings or [])
+        summary = history.run_summary(against)
+        result = diff_findings(
+            previous,
+            current,
+            target=str(summary.get("target") or ""),
+        )
+        payload = result.to_dict()
+        payload["against"] = against
+        payload["against_source"] = previous_source
+        payload["current_count"] = len(current)
+        payload["previous_count"] = len(previous)
+        return jsonify(payload)
+
+    @app.route("/api/export")
+    def export_api() -> str:
+        """导出某次运行的**发现清单**（`format=json|markdown`）。只读，不触网。
+
+        刻意只导出发现清单，不管目标是本次还是历史运行——格式与字段可预测，
+        界面上的筛选/详情看的就是同一份数据。
+        **完整报告**是另一个入口（`查看完整报告` / `/api/history/<run>`），
+        它可能包含报告正文与附录，与本接口的用途不同。
+        """
+        run = request.args.get("run", "current").strip() or "current"
+        fmt = request.args.get("format", "json").strip().lower()
+        findings, source, error = _findings_for(run)
+        if error:
+            return jsonify({"error": error}), 404
+        if fmt not in ("json", "markdown", "md"):
+            return jsonify({"error": "format 只能是 json 或 markdown。"}), 400
+        if fmt == "json":
+            body = json.dumps(
+                {
+                    "run": run,
+                    "source": source,
+                    "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "findings": findings,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            mimetype, suffix = "application/json", "json"
+        else:
+            where = "本次运行" if run == "current" else f"历史运行 {run}"
+            body = _findings_markdown(findings, title=f"{where}的发现（来源：{source}）")
+            mimetype, suffix = "text/markdown", "md"
+        safe_name = re.sub(r"[^A-Za-z0-9_.\-]", "_", run) or "current"
+        response = app.response_class(body, mimetype=mimetype)
+        response.headers["Content-Disposition"] = (
+            f"attachment; filename=hexhound_findings_{safe_name}.{suffix}"
+        )
+        return response
 
     @app.route("/api/report")
     def report() -> str:
