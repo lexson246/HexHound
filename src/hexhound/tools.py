@@ -2728,6 +2728,18 @@ def _browser_verify_xss(ctx: ToolRegistry, args: dict[str, Any]) -> str:
         )
     payload = str(args.get("payload") or "").strip()
     param = str(args.get("param") or "").strip()
+    method = str(args.get("method") or "GET").strip().upper()
+    raw_fields = args.get("fields")
+    fields = (
+        {str(key): str(value) for key, value in raw_fields.items()}
+        if isinstance(raw_fields, dict)
+        else None
+    )
+    if method == "POST" and not param:
+        return (
+            "错误：method=POST 需要同时给 param（要注入的表单字段名）。"
+            "真实表单通常还需要其它字段，用 fields 传（例如 {\"csrf\":\"...\",\"user\":\"a\"}）。"
+        )
     verifier = BrowserVerifier(
         allowed_hosts=ctx.allowed_hosts,
         timeout_ms=int(args.get("timeout_ms") or 20000),
@@ -2735,7 +2747,9 @@ def _browser_verify_xss(ctx: ToolRegistry, args: dict[str, Any]) -> str:
         channel=str(args.get("channel") or "").strip(),
     )
     try:
-        verdict = verifier.verify_xss(url, payload=payload, param=param)
+        verdict = verifier.verify_xss(
+            url, payload=payload, param=param, method=method, fields=fields
+        )
     except ScopeRefused as exc:
         return f"拒绝：{exc}"
     except BrowserUnavailable as exc:
@@ -3006,14 +3020,19 @@ _DESC_DYNAMIC_CRAWL = (
 )
 _DESC_BROWSER_VERIFY_XSS = (
     "用真实浏览器验证一个 XSS 到底成不成立，返回**分级结论**（需 playwright）。"
-    "参数：{\"url\": 页面URL（白名单内）, \"param\": 要注入的参数名(可选，给了就自动拼查询串), "
+    "参数：{\"url\": 页面URL（白名单内）, \"param\": 要注入的参数名/表单字段名"
+    "(可选；GET 时自动拼查询串，POST 时替换该表单字段), "
+    "\"method\": \"GET\"/\"POST\"(默认GET；表单型 XSS 用 POST), "
+    "\"fields\": 表单的其它字段对象(可选，POST 常用，例如 "
+    "{\"csrf_token\":\"...\",\"username\":\"alice\"}), "
     "\"payload\": 自定义载荷(可选，默认用无破坏性的执行标记载荷), "
     "\"wait_ms\": 等待毫秒(默认1500), \"channel\": \"msedge\"/\"chrome\"(可选，用系统浏览器)}。"
     "级别含义：executed=真的执行了（**只有这一级能报确认的 XSS**）；"
     "dom=进了渲染后的 DOM 但没执行；reflected=只在原始响应里出现（**只是反射，不能报 XSS**）；"
     "blocked=被 CSP 拦下；absent=没反射。"
     "会一并保存截图与 console 作为证据。"
-    "注意：反射型 XSS 的结论强度取决于这一级判定，**不要**把 reflected 写成确认漏洞。"
+    "注意：反射型 XSS 的结论强度取决于这一级判定，**不要**把 reflected 写成确认漏洞；"
+    "POST 必须给 param——没有字段名就测不到注入点，工具会直接报错而不是给出结论。"
 )
 
 
@@ -3418,6 +3437,9 @@ class ToolRegistry:
                 "**只是反射，不能报 XSS**）、`blocked`（被 CSP 拦下）、`absent`（没反射）。"
                 "内置 `fuzz_params` 的 xss 类别只判到「字符串反射」；"
                 "要把 XSS 写成已复核结论，必须先用这个工具拿到 `executed`，并引用它保存的截图证据。"
+                "**表单型（POST）注入点用 `method=\"POST\"` + `param`（字段名），"
+                "表单的其它字段（csrf/用户名等）用 `fields` 一起提交**——"
+                "只测 GET 查询串会漏掉一整类真实 XSS。"
                 "载荷默认无破坏性（只给 DOM 打个标记属性），不会改动目标数据。"
             )
         if not lines:

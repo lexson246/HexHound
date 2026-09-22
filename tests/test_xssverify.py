@@ -395,6 +395,50 @@ class ToolIntegrationTests(unittest.TestCase):
             text = self.invoke_handler(registry, {})
         self.assertIn("需要 url", text)
 
+    def test_tool_requires_param_for_post(self) -> None:
+        """表单型验证必须给字段名：工具要直接说清缺什么，而不是给个空结论。"""
+        from unittest.mock import patch
+
+        registry = self.make_registry()
+        with patch("hexhound.xssverify.playwright_available", return_value=(True, "")):
+            text = self.invoke_handler(registry, {"url": f"{LAB}/form", "method": "POST"})
+        self.assertIn("param", text)
+        self.assertIn("fields", text)
+
+    def test_tool_passes_method_and_fields_through(self) -> None:
+        """工具层要把 method/fields 原样传给验证器（否则表单型永远只有 GET）。"""
+        from unittest.mock import patch
+
+        captured: dict = {}
+
+        class FakeVerifier:
+            def __init__(self, **kwargs) -> None:
+                pass
+
+            def verify_xss(self, url, *, payload="", param="", method="GET", fields=None):
+                captured.update(
+                    {"url": url, "param": param, "method": method, "fields": fields}
+                )
+                return XssVerdict(level="absent", payload=payload or "p", url=url)
+
+        registry = self.make_registry()
+        with (
+            patch("hexhound.xssverify.playwright_available", return_value=(True, "")),
+            patch("hexhound.xssverify.BrowserVerifier", FakeVerifier),
+        ):
+            self.invoke_handler(
+                registry,
+                {
+                    "url": f"{LAB}/form",
+                    "param": "name",
+                    "method": "post",
+                    "fields": {"csrf": "t0ken"},
+                },
+            )
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(captured["param"], "name")
+        self.assertEqual(captured["fields"], {"csrf": "t0ken"})
+
 
 def _lab_available() -> bool:
     ready, _ = playwright_available()
@@ -558,7 +602,9 @@ class DialogAttributionTests(unittest.TestCase):
     def verifier_with(self, builder) -> BrowserVerifier:
         """把 `observe` 换成给定页面的构造器（不起浏览器，判据逻辑照跑）。"""
         verifier = BrowserVerifier(allowed_hosts=ALLOWED)
-        verifier.observe = lambda url, wait_ms=None: builder(url)  # type: ignore[method-assign]
+        verifier.observe = (  # type: ignore[method-assign]
+            lambda url, wait_ms=None, method="GET", post_data="": builder(url)
+        )
         return verifier
 
     @staticmethod
@@ -716,6 +762,30 @@ class _LocalPageLab:
                 f"<div>{name}</div></body></html>"
             )
 
+        @app.route("/form-echo", methods=["POST"])
+        def form_echo():
+            """表单型注入点：把 POST 字段回显进 HTML 正文（可执行上下文）。"""
+            name = request.form.get("name", "")
+            extra = request.form.get("extra", "")
+            return (
+                "<html><body><form method=post><input name=name></form>"
+                f"<div>你好 {name}</div><span>{extra}</span></body></html>"
+            )
+
+        @app.route("/form-textarea", methods=["POST"])
+        def form_textarea():
+            """表单回显进 textarea（进了 DOM 但不执行）→ 只能判 dom。"""
+            name = request.form.get("name", "")
+            return (
+                "<html><body>"
+                f"<textarea>{name}</textarea></body></html>"
+            )
+
+        @app.route("/form-get-only", methods=["GET"])
+        def form_get_only():
+            """只接受 GET：POST 到它会得到 405，用来证明"POST 确实发出去了"。"""
+            return "<html><body>GET only</body></html>", 200
+
         server = make_server("127.0.0.1", 0, app)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -787,6 +857,110 @@ class DialogFalsePositiveBrowserTests(unittest.TestCase):
         self.assertEqual(verdict.level, "executed", verdict.statement())
         self.assertTrue(verdict.confirmed)
         self.assertTrue(verdict.execution_signals)
+
+
+class PostFormXssBrowserTests(unittest.TestCase):
+    """表单型（POST）注入的真实浏览器回归。
+
+    此前浏览器验证只覆盖 GET 查询串——表单型 XSS 完全没测过，
+    而真实漏洞里 POST 表单是常见形态。
+    """
+
+    server: Any = None
+    base = ""
+    channel: str | None = None
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        ready, reason = playwright_available()
+        if not ready:
+            _skip_or_fail(reason)
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            for candidate in ("", "msedge", "chrome"):
+                try:
+                    kwargs: dict[str, Any] = {"headless": True}
+                    if candidate:
+                        kwargs["channel"] = candidate
+                    playwright.chromium.launch(**kwargs).close()
+                    cls.channel = candidate
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
+        if cls.channel is None:
+            _skip_or_fail("没有可用的浏览器（chromium / msedge / chrome）")
+        cls.server, cls.base = _LocalPageLab.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls.server is not None:
+            cls.server.shutdown()
+
+    def verifier(self) -> BrowserVerifier:
+        return BrowserVerifier(
+            allowed_hosts=frozenset({"127.0.0.1", "localhost"}),
+            channel=self.channel,
+            timeout_ms=15000,
+        )
+
+    def test_post_form_reflection_executes(self) -> None:
+        """表单字段回显进 HTML 正文 → executed（POST 注入真的送到了服务端）。"""
+        verdict = self.verifier().verify_xss(
+            f"{self.base}/form-echo", param="name", method="POST", baseline=False
+        )
+        self.assertEqual(verdict.level, "executed", verdict.statement())
+        self.assertTrue(verdict.confirmed)
+
+    def test_post_from_get_only_endpoint_is_not_executed(self) -> None:
+        """只接受 GET 的端点收到 POST 会 405 → 不能判成 executed（证明是真 POST）。"""
+        verdict = self.verifier().verify_xss(
+            f"{self.base}/form-get-only", param="name", method="POST", baseline=False
+        )
+        self.assertNotEqual(verdict.level, "executed", verdict.statement())
+        self.assertEqual(verdict.observation.get("status"), 405)
+
+    def test_post_into_textarea_is_dom_not_executed(self) -> None:
+        verdict = self.verifier().verify_xss(
+            f"{self.base}/form-textarea", param="name", method="POST", baseline=False
+        )
+        self.assertNotEqual(verdict.level, "executed", verdict.statement())
+        self.assertTrue(verdict.in_dom, "payload 应当进了 DOM")
+
+    def test_extra_form_fields_are_submitted(self) -> None:
+        """其它表单字段要一起提交（真实表单几乎都需要 csrf/用户名等字段）。
+
+        直接在 `observe()` 层断言：`verify_xss` 返回的观测是**摘要**（不含响应体），
+        而这里要看的就是服务端到底收到了哪些字段。
+        """
+        observation = self.verifier().observe(
+            f"{self.base}/form-echo",
+            method="POST",
+            post_data="name=hello&extra=EXTRA-FIELD-VALUE",
+        )
+        self.assertIn("EXTRA-FIELD-VALUE", observation.rendered_html)
+        self.assertIn("hello", observation.rendered_html)
+
+    def test_verify_xss_accepts_fields_and_reports_executed(self) -> None:
+        verdict = self.verifier().verify_xss(
+            f"{self.base}/form-echo",
+            param="name",
+            method="POST",
+            fields={"extra": "EXTRA-FIELD-VALUE"},
+            baseline=False,
+        )
+        self.assertEqual(verdict.level, "executed", verdict.statement())
+
+    def test_baseline_post_works_without_payload(self) -> None:
+        """带基线（默认）也要能跑通 POST 路径。"""
+        verdict = self.verifier().verify_xss(f"{self.base}/form-echo", param="name", method="POST")
+        self.assertEqual(verdict.level, "executed", verdict.statement())
+
+    def test_post_requires_param(self) -> None:
+        """没有字段名的 POST 测不到注入点 → 明确报错，而不是给个假的 absent。"""
+        with self.assertRaises(ValueError) as ctx:
+            self.verifier().verify_xss(f"{self.base}/form-echo", method="POST")
+        self.assertIn("param", str(ctx.exception))
 
 
 if __name__ == "__main__":

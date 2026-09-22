@@ -425,11 +425,24 @@ class BrowserVerifier:
 
     # ---------- 观测 ----------
 
-    def observe(self, url: str, *, wait_ms: int | None = None) -> PageObservation:
+    def observe(
+        self,
+        url: str,
+        *,
+        wait_ms: int | None = None,
+        method: str = "GET",
+        post_data: str = "",
+    ) -> PageObservation:
         """打开页面并收集**证据**：DOM、console、网络、截图、执行标记。
 
         作用域校验在**打开之前**做，并且对 `final_url`（可能被重定向改写）
         再校验一次——一次重定向就能把浏览器带到别处。
+
+        `method="POST"` 时会在**首次导航**上做一次请求改写：把
+        `page.goto()` 发出的 GET 改成带 `post_data`（表单编码）的 POST。
+        这是浏览器里唯一能"让服务端处理一次 POST 并把响应渲染出来"的做法
+        （`goto` 本身只发 GET；塞一个本地表单再提交会引入额外的源与跳转）。
+        改写只对**这一个** URL 生效，其他请求（静态资源、后续 XHR）原样放行。
         """
         error = _validate_browser_url(url, self.allowed_hosts)
         if error:
@@ -439,6 +452,11 @@ class BrowserVerifier:
             raise BrowserUnavailable(reason)
 
         from playwright.sync_api import sync_playwright
+
+        method_value = str(method or "GET").upper()
+        if method_value not in ("GET", "POST"):
+            raise ValueError(f"浏览器验证只支持 GET/POST，收到 {method!r}。")
+        body = str(post_data or "")
 
         console: list[dict[str, Any]] = []
         dialogs: list[str] = []
@@ -478,6 +496,27 @@ class BrowserVerifier:
                 if frame == page.main_frame
                 else None,
             )
+            if method_value == "POST":
+                # 只改写**首次导航**那一个请求：把它从 GET 换成带表单体的 POST。
+                # 用正则精确匹配本次 URL，避免影响页面后续的资源/XHR 请求。
+                import re as _re_module
+
+                pattern = _re_module.compile("^" + _re_module.escape(url) + "$")
+
+                def _as_post(route) -> None:
+                    try:
+                        route.continue_(
+                            method="POST",
+                            post_data=body,
+                            headers={
+                                **route.request.headers,
+                                "content-type": "application/x-www-form-urlencoded",
+                            },
+                        )
+                    except Exception:  # noqa: BLE001 改写失败就退回原始请求
+                        route.continue_()
+
+                page.route(pattern, _as_post)
             try:
                 response = page.goto(
                     url, wait_until="domcontentloaded", timeout=self.timeout_ms
@@ -555,16 +594,26 @@ class BrowserVerifier:
         payload: str = "",
         param: str = "",
         method: str = "GET",
+        fields: dict[str, str] | None = None,
         baseline: bool = True,
         wait_ms: int | None = None,
     ) -> XssVerdict:
         """验证一个 URL 上的 XSS：反射 / DOM / 执行 **分级**判定。
 
-        `param` 给了就走查询串注入（`?param=payload`），否则直接用给定的 url
-        （调用方应把 payload 已经编码进 url）。
+        `param` 给了就做注入，两种方式：
+
+        * `method="GET"`（默认）：拼查询串 `?param=payload`；
+        * `method="POST"`：以 `application/x-www-form-urlencoded` 发一次表单 POST。
+          真实表单几乎都需要**其它字段**（csrf token、用户名…），用 `fields`
+          一起提交；`param` 指定的那个字段被替换成 payload。
+
+        没有 `param` 时直接用给定的 url（调用方应把 payload 已经编码进 url）。
+        POST **必须**给 `param`：没有字段名就测不到注入点，与其给出一个看着像
+        结论的 `absent`，不如直接报错说清缺什么。
 
         `baseline=True` 时先取一次**不带 payload** 的页面：payload 在基线里
         就出现（页面自己就含这段文本）时判据失效，此时明确标注而不是给结论。
+        POST 的基线用同样的字段、只把注入字段置空。
 
         **执行证据必须能归因到本次载荷**（两条独立要求，都是实测假阳驱动的）：
 
@@ -575,15 +624,30 @@ class BrowserVerifier:
            `executed`（**确认级误报**：payload 明明躺在 `<textarea>` 里没执行）。
            基线里已有的弹窗同样被扣除。
         """
-        method_value = method.upper()
+        method_value = str(method or "GET").upper()
         if method_value not in ("GET", "POST"):
             raise ValueError(f"浏览器 XSS 验证只支持 GET/POST，收到 {method!r}。")
 
         # 自定义载荷无法带我们的标记值，此时只能靠"载荷原文"归因。
         marker = "" if payload else new_marker()
         chosen = payload or build_payloads(marker)[0]
+        extra_fields = {
+            str(name): str(value) for name, value in (fields or {}).items() if str(name)
+        }
         target_url = url
-        if param:
+        post_data = ""
+        baseline_post_data = ""
+        if method_value == "POST":
+            if not param:
+                raise ValueError(
+                    "POST 表单验证需要 param（要注入的表单字段名）——"
+                    "没有字段名的 POST 测不到注入点。"
+                )
+            from urllib.parse import urlencode
+
+            post_data = urlencode({**extra_fields, param: chosen})
+            baseline_post_data = urlencode({**extra_fields, param: ""})
+        elif param:
             from urllib.parse import quote
 
             separator = "&" if "?" in url else "?"
@@ -592,7 +656,9 @@ class BrowserVerifier:
         notes: list[str] = []
         baseline_dialogs: list[str] = []
         if baseline:
-            baseline_observation = self.observe(url, wait_ms=wait_ms)
+            baseline_observation = self.observe(
+                url, wait_ms=wait_ms, method=method_value, post_data=baseline_post_data
+            )
             baseline_dialogs = list(baseline_observation.dialogs)
             if chosen in baseline_observation.raw_body or chosen in baseline_observation.rendered_html:
                 notes.append(
@@ -600,7 +666,9 @@ class BrowserVerifier:
                     "请换一个不会与页面内容重合的 payload 再验证。"
                 )
 
-        observation = self.observe(target_url, wait_ms=wait_ms)
+        observation = self.observe(
+            target_url, wait_ms=wait_ms, method=method_value, post_data=post_data
+        )
         signals: list[str] = []
         if _flag_matches(observation.executed_flags.get(MARKER_ATTRIBUTE), marker):
             signals.append(
