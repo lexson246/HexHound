@@ -198,12 +198,27 @@ def _graceful_close(window_pid: int) -> bool:
     return gone
 
 
+def _real_settings_fingerprint() -> tuple[bool, int, int]:
+    """用户真实设置文件的指纹（存在、大小、mtime）。
+
+    验收必须**证明**自己没碰用户配置，而不是假设隔离生效了——这条检查在
+    验收结束时再取一次指纹做对比。（实测踩过：旧的 exe 还没有
+    `HEXHOUND_SETTINGS_PATH` 支持，于是隔离没生效、真实配置被写进去了。）
+    """
+    path = Path.home() / ".hexhound" / "settings.json"
+    if not path.exists():
+        return (False, 0, 0)
+    stat = path.stat()
+    return (True, stat.st_size, int(stat.st_mtime))
+
+
 def main() -> int:
     checks: list[tuple[str, bool, str]] = []
     exe = Path(sys.argv[1]) if len(sys.argv) > 1 else EXE
     if not exe.is_file():
         print(f"[FAIL] 找不到 {exe}")
         return 1
+    real_settings_before = _real_settings_fingerprint()
 
     before_webview = _processes(("msedgewebview2.exe",))
     before_browsers = _processes(("msedge.exe", "chrome.exe", "firefox.exe"))
@@ -321,6 +336,20 @@ def main() -> int:
                 subprocess.run(["taskkill", "/F", "/PID", str(leftover)], capture_output=True, check=False)
         checks.append(("第二次关闭也干净退出", closed2,
                        "已优雅退出" if closed2 else "需要强制结束"))
+
+    # 隔离自证：设置写在隔离目录里，用户真实配置一字未动。
+    isolated_settings = ISOLATED / "settings.json"
+    checks.append((
+        "隔离生效（配置写在隔离目录）",
+        isolated_settings.exists() and marker in isolated_settings.read_text(encoding="utf-8"),
+        str(isolated_settings),
+    ))
+    real_after = _real_settings_fingerprint()
+    checks.append((
+        "用户真实配置未被改动",
+        real_after == real_settings_before,
+        f"before={real_settings_before} after={real_after}",
+    ))
 
     failed = [name for name, ok, _ in checks if not ok]
     print()
