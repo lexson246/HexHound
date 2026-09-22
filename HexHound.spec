@@ -3,7 +3,7 @@
 
 产物是**控制台版 CLI**（`hexhound.exe`）——审计过程会打印任务计划、子任务起止、
 漏洞清单与预算，这些输出在 windowed 模式里看不到，所以这里必须是 console 版。
-桌面窗口版见 `HexHound-desktop.spec`。
+桌面窗口版见 `HexHound-desktop.spec`，项目根目录的 hexhound.exe 使用桌面版构建。
 
 构建：`python -m PyInstaller --noconfirm --clean HexHound.spec`
 """

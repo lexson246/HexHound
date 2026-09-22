@@ -10,10 +10,13 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
+import threading
 import unittest
 from pathlib import Path
-from urllib.parse import quote
+from typing import Any
+from urllib.parse import parse_qs, quote, urlsplit
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
@@ -24,10 +27,13 @@ from hexhound.xssverify import (  # noqa: E402
     MARKER_ATTRIBUTE,
     BrowserUnavailable,
     BrowserVerifier,
+    PageObservation,
     ScopeRefused,
     XssVerdict,
     _validate_browser_url,
+    build_payloads,
     classify,
+    new_marker,
     playwright_available,
     summarize_verdict,
     verification_payloads,
@@ -495,6 +501,281 @@ class RealBrowserTests(unittest.TestCase):
         """白名单内不该被前置校验挡住（对照上一条）。"""
         observation = self.make_verifier().observe(f"{LAB}/")
         self.assertEqual(observation.status, 200)
+
+
+class MarkerCorrelationTests(unittest.TestCase):
+    """执行标记必须归因到**本次**验证（P0-3 的判据层，不需要浏览器）。
+
+    旧判据是"DON 上有没有这个属性/有没有弹窗"，与本 payload 无关的信号
+    也能把结论推成 `executed`——那是确认级误报。
+    """
+
+    def test_marker_from_another_run_is_not_evidence(self) -> None:
+        level = classify(
+            payload=build_payloads("hhthisrun")[0],
+            raw_body="",
+            rendered_html="",
+            executed_flags={MARKER_ATTRIBUTE: "hhpreviousrun"},
+            marker_value="hhthisrun",
+        )
+        self.assertNotEqual(level, "executed", "上一次验证残留的标记不算本次执行")
+
+    def test_matching_marker_is_evidence(self) -> None:
+        level = classify(
+            payload=build_payloads("hhthisrun")[0],
+            raw_body="",
+            rendered_html="",
+            executed_flags={MARKER_ATTRIBUTE: "hhthisrun"},
+            marker_value="hhthisrun",
+        )
+        self.assertEqual(level, "executed")
+
+    def test_without_marker_the_legacy_truthy_flag_still_works(self) -> None:
+        """纯判据调用（没给 nonce）保持原语义：真值即执行。"""
+        level = classify(
+            payload=PAYLOAD, raw_body="", rendered_html="",
+            executed_flags={MARKER_ATTRIBUTE: True},
+        )
+        self.assertEqual(level, "executed")
+
+    def test_payloads_carry_a_unique_marker_per_run(self) -> None:
+        first, second = new_marker(), new_marker()
+        self.assertNotEqual(first, second)
+        self.assertIn(first, build_payloads(first)[0])
+        # 对外稳定的默认载荷不受影响
+        self.assertEqual(verification_payloads(), list(DEFAULT_PAYLOADS))
+
+
+class DialogAttributionTests(unittest.TestCase):
+    """普通弹窗不得被当成本次载荷的执行证据（P0-3 回归，打桩观测层）。
+
+    实测场景：页面自己 `alert('请输入用户名')`，同时把参数回显进 `<textarea>`
+    （根本不会执行）。旧判据看到"有 dialog"就给出 `executed` + `confirmed=True`，
+    而且还会附上"对话框内容包含 payload"——因为那行代码查的是函数参数
+    `payload`（默认空串），`"" in 任何文本` 恒真。
+    """
+
+    def verifier_with(self, builder) -> BrowserVerifier:
+        """把 `observe` 换成给定页面的构造器（不起浏览器，判据逻辑照跑）。"""
+        verifier = BrowserVerifier(allowed_hosts=ALLOWED)
+        verifier.observe = lambda url, wait_ms=None: builder(url)  # type: ignore[method-assign]
+        return verifier
+
+    @staticmethod
+    def injected(url: str) -> str:
+        """取出被注入的载荷（`verify_xss` 会把它放进查询串）。"""
+        return parse_qs(urlsplit(url).query).get("name", [""])[0]
+
+    def test_unrelated_dialog_does_not_confirm_execution(self) -> None:
+        def page(url: str) -> PageObservation:
+            injected = self.injected(url)
+            return PageObservation(
+                url=url,
+                status=200,
+                raw_body=f"<textarea>{injected}</textarea>",
+                rendered_html=f"<textarea>{injected}</textarea>",
+                dialogs=["请输入用户名"],  # 页面自己的提示，与载荷无关
+                executed_flags={},
+            )
+
+        verdict = self.verifier_with(page).verify_xss(
+            "http://127.0.0.1:5000/reflect-dom", param="name", baseline=False
+        )
+        self.assertNotEqual(verdict.level, "executed", verdict.statement())
+        self.assertFalse(verdict.confirmed)
+        self.assertEqual(verdict.level, "dom")
+        self.assertTrue(
+            any("无关" in note for note in verdict.notes),
+            f"应当说明该弹窗与载荷无关：{verdict.notes}",
+        )
+
+    def test_dialog_carrying_the_payload_is_evidence(self) -> None:
+        """页面把注入的参数送进了 dialog（`alert(参数)`）→ 可归因，算执行证据。"""
+
+        def page(url: str) -> PageObservation:
+            injected = self.injected(url)
+            return PageObservation(
+                url=url,
+                status=200,
+                raw_body=f"<textarea>{injected}</textarea>",
+                rendered_html=f"<textarea>{injected}</textarea>",
+                dialogs=[injected],
+                executed_flags={},
+            )
+
+        verdict = self.verifier_with(page).verify_xss(
+            "http://127.0.0.1:5000/dialog", param="name", baseline=False
+        )
+        self.assertEqual(verdict.level, "executed", verdict.statement())
+        self.assertTrue(verdict.confirmed)
+
+    def test_baseline_dialog_is_subtracted(self) -> None:
+        """基线页面本来就弹的对话框不能算在本次载荷头上。"""
+        dialogs = ["欢迎回来"]
+
+        def page(url: str) -> PageObservation:
+            injected = self.injected(url)
+            return PageObservation(
+                url=url,
+                status=200,
+                raw_body=f"<textarea>{injected}</textarea>",
+                rendered_html=f"<textarea>{injected}</textarea>",
+                dialogs=list(dialogs),
+                executed_flags={},
+            )
+
+        verdict = self.verifier_with(page).verify_xss(
+            "http://127.0.0.1:5000/welcome", param="name", baseline=True
+        )
+        self.assertNotEqual(verdict.level, "executed", verdict.statement())
+
+    def test_stale_marker_attribute_is_not_evidence(self) -> None:
+        """DOM 上留着上一轮的标记属性 → 不构成本次执行证据。"""
+
+        def page(url: str) -> PageObservation:
+            injected = self.injected(url)
+            return PageObservation(
+                url=url,
+                status=200,
+                raw_body=f"<textarea>{injected}</textarea>",
+                rendered_html=f"<textarea>{injected}</textarea>",
+                executed_flags={MARKER_ATTRIBUTE: "hhfrompreviousrun"},
+            )
+
+        verdict = self.verifier_with(page).verify_xss(
+            "http://127.0.0.1:5000/reflect-dom", param="name", baseline=False
+        )
+        self.assertNotEqual(verdict.level, "executed", verdict.statement())
+
+    def test_marker_attribute_of_this_run_is_evidence(self) -> None:
+        """本次 nonce 打在 DOM 上 → 执行证据（阳性对照，防止判据被修废）。
+
+        模拟真实执行：注入的载荷确实跑了，于是 DOM 上出现了**本次** nonce。
+        nonce 从注入的载荷里取出来（真实浏览器里就是载荷执行的结果）。
+        """
+
+        def page(url: str) -> PageObservation:
+            injected = self.injected(url)
+            found = re.search(r"data-hexhound-xss','(hh[0-9a-f]+)'", injected)
+            value = found.group(1) if found else "missing"
+            return PageObservation(
+                url=url,
+                status=200,
+                raw_body=f"<div>{injected}</div>",
+                rendered_html="<div>x</div>",  # 执行后原样载荷已不在 DOM 里
+                executed_flags={MARKER_ATTRIBUTE: value},
+            )
+
+        verdict = self.verifier_with(page).verify_xss(
+            "http://127.0.0.1:5000/reflect", param="name", baseline=False
+        )
+        self.assertEqual(verdict.level, "executed", verdict.statement())
+        self.assertTrue(verdict.confirmed)
+        self.assertTrue(
+            any("data-hexhound-xss" in signal for signal in verdict.execution_signals),
+            verdict.execution_signals,
+        )
+
+
+class _LocalPageLab:
+    """临时本地测试页（随机端口，只跑在本机），用于真实浏览器回归。"""
+
+    @classmethod
+    def start(cls) -> tuple[Any, str]:
+        from flask import Flask, request
+        from werkzeug.serving import make_server
+
+        app = Flask("hexhound-xss-regression")
+
+        @app.route("/dialog-textarea")
+        def dialog_textarea():
+            """页面自己弹一个无关对话框 + payload 落在 textarea（不执行）。"""
+            name = request.args.get("name", "")
+            return (
+                "<html><body><script>alert('请输入用户名');</script>"
+                f"<textarea>{name}</textarea></body></html>"
+            )
+
+        @app.route("/dialog-exec")
+        def dialog_exec():
+            """同样弹无关对话框，但 payload 落在可执行上下文（阳性对照）。"""
+            name = request.args.get("name", "")
+            return (
+                "<html><body><script>alert('请输入用户名');</script>"
+                f"<div>{name}</div></body></html>"
+            )
+
+        server = make_server("127.0.0.1", 0, app)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, f"http://127.0.0.1:{server.server_port}"
+
+
+class DialogFalsePositiveBrowserTests(unittest.TestCase):
+    """真实浏览器层：普通弹窗不得导致确认级 XSS 误报（P0-3 端到端回归）。
+
+    只访问本机临时测试页——不碰靶场、不碰任何真实目标。
+    """
+
+    server: Any = None
+    base = ""
+    #: None = 还没探测；"" = 用打包的 chromium；"msedge"/"chrome" = 系统浏览器
+    channel: str | None = None
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        ready, reason = playwright_available()
+        if not ready:
+            raise unittest.SkipTest(reason)
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            for candidate in ("", "msedge", "chrome"):
+                try:
+                    kwargs: dict[str, Any] = {"headless": True}
+                    if candidate:
+                        kwargs["channel"] = candidate
+                    playwright.chromium.launch(**kwargs).close()
+                    cls.channel = candidate
+                    break
+                except Exception:  # noqa: BLE001 这个候选不可用，换下一个
+                    continue
+        if cls.channel is None:
+            raise unittest.SkipTest("没有可用的浏览器（chromium / msedge / chrome）")
+        cls.server, cls.base = _LocalPageLab.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls.server is not None:
+            cls.server.shutdown()
+
+    def verifier(self) -> BrowserVerifier:
+        return BrowserVerifier(
+            allowed_hosts=frozenset({"127.0.0.1", "localhost"}),
+            channel=self.channel,
+            timeout_ms=15000,
+        )
+
+    def test_unrelated_dialog_plus_textarea_is_not_confirmed_xss(self) -> None:
+        verdict = self.verifier().verify_xss(
+            f"{self.base}/dialog-textarea", param="name", baseline=False
+        )
+        self.assertNotEqual(
+            verdict.level,
+            "executed",
+            f"普通弹窗不得当成本次载荷执行：{verdict.statement()}",
+        )
+        self.assertFalse(verdict.confirmed)
+        self.assertTrue(verdict.in_dom, "payload 应当在渲染后的 DOM 里")
+
+    def test_real_execution_is_still_detected(self) -> None:
+        """修好假阳之后，真执行必须仍然判得出来（否则就是把判据修废了）。"""
+        verdict = self.verifier().verify_xss(
+            f"{self.base}/dialog-exec", param="name", baseline=False
+        )
+        self.assertEqual(verdict.level, "executed", verdict.statement())
+        self.assertTrue(verdict.confirmed)
+        self.assertTrue(verdict.execution_signals)
 
 
 if __name__ == "__main__":

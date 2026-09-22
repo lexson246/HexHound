@@ -8,6 +8,8 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
+import secrets
 import sys
 import threading
 from pathlib import Path
@@ -58,6 +60,21 @@ def _project_root() -> Path:
 PROJECT_ROOT = _project_root()
 SETTINGS_PATH = Path.home() / ".hexhound" / "settings.json"
 
+#: 本机控制面只接受这些主机名（见 `create_app` 的请求守卫）。
+#:
+#: 为什么必须校验 Host：攻击者可以把自己的域名解析到 127.0.0.1（DNS rebinding），
+#: 让受害者浏览器"带着攻击者的域名"访问本机端口。此时浏览器认为这是
+#: 同源（攻击者域），页面里的脚本就能读走 `/api/providers` 之类的响应。
+#: 校验 Host 之后，`Host: evil.com:5001` 的请求会被直接拒绝。
+_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+#: 有副作用的本机接口必须携带的会话令牌头（见 `create_app`）。
+#:
+#: 跨站请求**无法**携带自定义头：浏览器会先发 OPTIONS 预检，而本服务不返回任何
+#: CORS 响应头，预检必然失败。所以它同时挡掉 CSRF——否则一个恶意网页就能让本机
+#: 去跑一次审计（消耗真实模型额度）、改白名单、写 .env、甚至弹出登录窗口。
+TOKEN_HEADER = "X-HexHound-Token"
+
 DEFAULTS = {
     # 刻意留空：不预设提供商/模型/密钥，避免"没注意就按某家付费模型跑起来"。
     # 首次打开时面板会引导选择（或从 .env 读取）。
@@ -87,111 +104,196 @@ DEFAULTS = {
     "swarm": "1",
 }
 
-HTML = """<!doctype html>
+HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>HexHound 控制台</title>
 <style>
-  :root { --bg:#0f1420; --panel:#1a2130; --line:#2b3547; --fg:#e6ebf2; --muted:#8b98ad;
-          --accent:#4f8cff; --ok:#3fb950; --err:#f85149; --warn:#d29922; }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.6 "Segoe UI",system-ui,sans-serif; }
-  header { padding:18px 24px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:12px; }
-  header h1 { margin:0; font-size:20px; }
-  header span { color:var(--muted); }
-  main { display:grid; grid-template-columns:360px 1fr; gap:20px; padding:20px 24px; }
-  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:18px; }
-  .panel h2 { margin:0 0 14px; font-size:15px; color:var(--fg); }
-  label { display:block; margin:10px 0 4px; color:var(--muted); font-size:12px; }
-  input, select { width:100%; padding:8px 10px; background:#0c111b; color:var(--fg);
-    border:1px solid var(--line); border-radius:6px; font-size:13px; }
-  input:focus, select:focus { outline:none; border-color:var(--accent); }
-  .row { display:flex; gap:10px; }
-  .row > div { flex:1; }
-  button { cursor:pointer; border:0; border-radius:6px; padding:10px 16px; font-size:14px; font-weight:600; }
-  #runBtn { background:var(--accent); color:#fff; width:100%; margin-top:16px; }
-  #saveBtn { background:var(--line); color:var(--fg); width:100%; margin-top:8px; }
-  button:disabled { opacity:.55; cursor:not-allowed; }
-  #status { margin:12px 0; font-size:13px; }
-  #status.running { color:var(--accent); }
-  #status.done { color:var(--ok); }
+
+  :root { color-scheme:dark; --bg:#0d1014; --panel:#14181e; --line:#292e36; --fg:#ecedf0;
+    --muted:#949ca9; --accent:#b9ed80; --ok:#b9ed80; --err:#ff8989; --warn:#e9bd77; }
+  * { box-sizing:border-box; }
+  [hidden] { display:none !important; }
+  body { margin:0; color:var(--fg); background:var(--bg); font:14px/1.6 "Segoe UI","Microsoft YaHei",sans-serif; }
+  button,input,select { font:inherit; }
+  button,a,input,select,summary { -webkit-tap-highlight-color:transparent; }
+  button { cursor:pointer; border:1px solid var(--line); border-radius:8px; padding:10px 15px; background:#20252d; color:var(--fg); font-weight:600; transition:background .15s,border-color .15s; }
+  button:hover:not(:disabled) { background:#2c333d; border-color:#596373; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  :focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+  a { color:var(--accent); text-underline-offset:4px; }
+  .sidebar { position:fixed; inset:0 auto 0 0; width:218px; padding:30px 18px 20px; border-right:1px solid var(--line); background:#111419; display:flex; flex-direction:column; z-index:5; }
+  .brand { display:flex; align-items:center; gap:11px; padding:0 10px; font-size:22px; font-weight:700; letter-spacing:-.8px; }
+  .brand-mark { display:grid; place-items:center; width:33px; height:37px; background:var(--accent); color:#172213; clip-path:polygon(50% 0,96% 24%,96% 76%,50% 100%,4% 76%,4% 24%); font-size:23px; font-weight:800; }
+  .eyebrow { color:var(--muted); font:10px/1.5 Consolas,monospace; letter-spacing:2px; text-transform:uppercase; }
+  .brand-sub { margin:10px 10px 46px; }
+  .nav-label { padding:0 13px; margin-bottom:10px; }
+  nav { display:grid; gap:7px; }
+  .nav-item { width:100%; display:flex; align-items:center; gap:12px; text-align:left; background:transparent; border-color:transparent; color:var(--muted); padding:12px 14px; font-size:13px; }
+  .nav-item[aria-current="page"] { background:#232d20; border-color:#36462c; color:var(--accent); }
+  .nav-icon { font:18px/1 monospace; width:20px; text-align:center; }
+  .side-footer { margin-top:auto; padding:20px 12px 0; border-top:1px solid var(--line); color:var(--muted); font-size:11px; }
+  .side-footer strong { display:block; color:#cdd3da; font-size:12px; margin-bottom:5px; font-weight:500; }
+  .dot { display:inline-block; width:6px; height:6px; border-radius:50%; background:var(--accent); margin-right:7px; }
+  .app { margin-left:218px; }
+  .topbar { height:70px; padding:0 36px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--line); color:var(--muted); font-size:12px; }
+  .breadcrumb { display:flex; gap:13px; align-items:center; }
+  .breadcrumb strong { color:var(--fg); font-weight:500; }
+  .local-badge { border:1px solid var(--line); padding:4px 10px; border-radius:6px; font:10px Consolas,monospace; letter-spacing:1px; }
+  main { max-width:1600px; margin:auto; padding:32px 36px 42px; }
+  .page-heading { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:27px; }
+  h1 { font-size:29px; letter-spacing:-1px; line-height:1.4; margin:5px 0 8px; font-weight:600; }
+  .page-heading p { color:var(--muted); margin:0; font-size:13px; }
+  .heading-index { color:#48523f; font:52px/1 Consolas,monospace; letter-spacing:-4px; white-space:nowrap; flex-shrink:0; }
+  .metrics { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); border:1px solid var(--line); border-radius:12px; background:var(--panel); margin-bottom:24px; overflow:hidden; }
+  .metric { padding:18px 22px; border-right:1px solid var(--line); }
+  .metric:last-child { border:0; }
+  .metric-label { display:flex; justify-content:space-between; color:var(--muted); font-size:12px; }
+  .metric-label span { color:#717c6a; font:12px Consolas,monospace; }
+  .metric-value { display:block; font:30px/1.5 Consolas,monospace; letter-spacing:-1px; margin-top:6px; }
+  .metric small { color:var(--muted); font-size:11px; }
+  #metricFindings { color:var(--accent); }
+  .workspace { display:grid; grid-template-columns:330px minmax(0,1fr); gap:22px; align-items:start; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; min-width:0; overflow:hidden; }
+  .panel-head { display:flex; align-items:center; justify-content:space-between; padding:17px 20px; border-bottom:1px solid var(--line); gap:10px; }
+  h2 { font-size:14px; font-weight:600; margin:0; }
+  .section-number { color:#606d59; font:11px Consolas,monospace; margin-right:9px; }
+  .panel-body { padding:18px 20px; }
+  label { display:block; margin:14px 0 6px; font-size:12px; color:#b6bdc8; }
+  label:first-child { margin-top:0; }
+  input,select { width:100%; min-width:0; padding:10px 11px; background:#101318; color:var(--fg); border:1px solid #333943; border-radius:7px; font-size:12px; }
+  input::placeholder { color:#707986; }
+  input:focus,select:focus { border-color:var(--accent); }
+  input[type="file"] { padding:24px; border:1px dashed #47533e; background:#171e16; }
+  input::file-selector-button { padding:8px 12px; border:1px solid #47533e; border-radius:6px; background:#293623; color:var(--accent); margin-right:12px; cursor:pointer; }
+  .row { display:flex; gap:10px; align-items:end; }
+  .row > div { flex:1; min-width:0; }
+  details { border-top:1px solid var(--line); padding-top:14px; margin-top:18px; }
+  summary { cursor:pointer; font-size:12px; color:#c9cfda; }
+  .form-actions { border-top:1px solid var(--line); margin-top:20px; padding-top:17px; display:grid; gap:8px; }
+  #runBtn { background:var(--accent); border-color:var(--accent); color:#1c2815; }
+  #runBtn:hover:not(:disabled) { background:#cef5a5; }
+  #stopBtn { color:var(--err); background:transparent; }
+  #saveBtn { font-size:12px; }
+  .hint,.muted { color:var(--muted); }
+  .hint { font-size:11px; margin-top:10px; }
+  #status { display:inline-flex; align-items:center; gap:7px; font-size:11px; color:var(--muted); border:1px solid var(--line); padding:3px 9px; border-radius:5px; max-width:70%; overflow-wrap:anywhere; }
+  #status::before { content:""; width:5px; height:5px; border-radius:50%; background:currentColor; flex-shrink:0; }
+  #status.running,#status.done { color:var(--ok); }
   #status.error { color:var(--err); }
-  #log { background:#0c111b; border:1px solid var(--line); border-radius:8px; padding:12px;
-    height:320px; overflow:auto; font:12px/1.5 Consolas,monospace; white-space:pre-wrap; word-break:break-all; }
-  .step { margin:0 0 12px; padding:10px; border-left:3px solid var(--accent); background:#121826; border-radius:6px; }
-  .step .a { color:var(--accent); font-weight:600; }
-  .step .t { color:var(--muted); }
-  .finding { border-left:3px solid var(--err); padding:12px; margin:10px 0; background:#1a1215; border-radius:6px; }
-  .finding b { color:var(--warn); }
-  .tag { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; background:var(--line); color:var(--fg); }
-  .muted { color:var(--muted); }
-  pre.raw { background:#0c111b; padding:12px; border-radius:8px; overflow:auto; max-height:400px; font:12px/1.5 Consolas,monospace; }
-  .shot-preview { margin-top:10px; }
-  .shot-preview img { display:block; max-width:100%; border:1px solid var(--line); border-radius:8px; background:#0c111b; }
-  .hint { color:var(--muted); font-size:12px; margin-top:8px; }
-  .modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,.55); display:none; align-items:center; justify-content:center; z-index:20; }
-  .modal { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:20px; width:min(480px,92vw); max-height:90vh; overflow:auto; }
-  .modal h2 { margin:0 0 14px; font-size:16px; }
-  .modal .actions { display:flex; gap:10px; justify-content:flex-end; margin-top:16px; }
-  @media (max-width: 900px) { main { grid-template-columns:1fr; } }
+  .log-toolbar { padding:11px 20px; display:flex; align-items:center; justify-content:space-between; background:#11151a; border-bottom:1px solid var(--line); color:var(--muted); font:10px Consolas,monospace; letter-spacing:1px; }
+  .log-toolbar label { display:flex; align-items:center; gap:6px; margin:0; font:11px "Segoe UI",sans-serif; }
+  .log-toolbar input { width:auto; accent-color:var(--accent); }
+  #log { height:440px; overflow:auto; padding:18px 20px; font:12px/1.7 Consolas,"Microsoft YaHei",monospace; overflow-wrap:anywhere; scrollbar-color:#3a424d transparent; }
+  .empty-state { min-height:330px; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; padding:28px; }
+  .empty-symbol { display:grid; place-items:center; width:72px; height:72px; border:1px solid #35432c; border-radius:20px; background:radial-gradient(circle,#23301c,#151b13); color:var(--accent); font:30px Consolas,monospace; margin-bottom:20px; }
+  .empty-state h3 { font:500 16px "Segoe UI","Microsoft YaHei",sans-serif; margin:0 0 9px; color:#dce1e8; }
+  .empty-state p { color:var(--muted); font:12px/1.9 "Segoe UI","Microsoft YaHei",sans-serif; margin:0; max-width:330px; }
+  .step { padding:12px 13px; border-left:2px solid #576c45; margin-bottom:12px; background:#1a2027; border-radius:0 6px 6px 0; }
+  .step .a { color:var(--accent); margin-bottom:4px; }
+  .step .t { color:var(--muted); white-space:pre-wrap; }
+  .token-footer { padding:13px 20px; border-top:1px solid var(--line); font:10px/1.7 Consolas,"Microsoft YaHei",monospace; color:var(--muted); overflow-wrap:anywhere; }
+  .workflow { display:flex; align-items:center; justify-content:space-between; padding:18px 5px; gap:10px; color:var(--muted); font-size:11px; }
+  .workflow span { display:flex; gap:7px; align-items:center; }
+  .workflow i { color:#718362; font:10px Consolas,monospace; font-style:normal; }
+  .workflow b { color:#46503e; font-weight:400; }
+  .finding { border:1px solid var(--line); border-left:3px solid var(--warn); padding:16px; margin:12px 0; background:#191d24; border-radius:8px; overflow-wrap:anywhere; }
+  .finding b { color:var(--fg); }
+  .tag { display:inline-block; padding:2px 7px; margin:2px; border-radius:4px; font-size:10px; background:#2c333d; color:var(--fg); }
+  #results h2 { margin:20px 0 10px; }
+  pre.raw { background:#0e1216; border:1px solid var(--line); padding:20px; border-radius:8px; overflow:auto; max-height:600px; font:12px/1.8 Consolas,monospace; }
+  .shot-preview img { display:block; max-width:100%; border:1px solid var(--line); border-radius:8px; margin-top:18px; }
+  .vision-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:24px; }
+  .vision-output { min-height:300px; padding:24px; background:#101419; border:1px solid var(--line); border-radius:8px; }
+  #visionResult { white-space:pre-wrap; overflow-wrap:anywhere; }
+  .modal-overlay { padding:0; background:var(--panel); color:var(--fg); border:1px solid #434b57; border-radius:14px; width:min(620px,92vw); max-height:88vh; }
+  .modal-overlay::backdrop { background:#000a; backdrop-filter:blur(5px); }
+  .modal { padding:26px; }
+  .modal h2 { font-size:21px; margin-bottom:20px; }
+  .modal .actions { display:flex; justify-content:flex-end; gap:10px; margin-top:24px; }
+  #settingsSave { background:var(--accent) !important; color:#172213 !important; }
+  #notice { position:fixed; bottom:24px; right:28px; max-width:min(460px,90vw); padding:13px 20px; border:1px solid #566b43; border-radius:9px; background:#212c1d; color:#e6f3da; box-shadow:0 12px 40px #0005; z-index:30; }
+  @media(min-width:1450px) { .workspace { grid-template-columns:360px minmax(0,1fr); } #log { height:470px; } }
+  @media(max-width:1100px) { .sidebar { width:180px; padding-inline:12px; } .app { margin-left:180px; } main { padding:24px; } .topbar { padding:0 24px; } .workspace { grid-template-columns:290px minmax(0,1fr); gap:16px; } .metric { padding:15px; } }
+  @media(max-width:850px) { .sidebar { position:static; width:auto; padding:16px 20px; border-right:0; border-bottom:1px solid var(--line); } .brand { padding:0; } .brand-sub,.nav-label,.side-footer { display:none; } nav { display:flex; margin-top:16px; gap:6px; } .nav-item { width:auto; padding:8px 12px; } .app { margin:0; } .topbar { height:48px; } .workspace { grid-template-columns:1fr; } .metrics { grid-template-columns:repeat(2,minmax(0,1fr)); } .metric:nth-child(2) { border-right:0; } .metric:nth-child(-n+2) { border-bottom:1px solid var(--line); } .vision-grid { grid-template-columns:1fr; } }
+  @media(max-width:480px) { main { padding:22px 16px; } .topbar { padding:0 16px; } .nav-item { padding:8px 10px; font-size:12px; gap:7px; } .nav-icon { display:none; } h1 { font-size:25px; } .heading-index { font-size:38px; } .row { flex-wrap:wrap; } .row > div { flex-basis:40%; } .modal { padding:20px; } .workflow { flex-wrap:wrap; } }
+  @media(prefers-reduced-motion:reduce) { * { transition:none !important; } }
 </style>
 </head>
 <body>
-<header><h1>🐕‍🦺 HexHound</h1><span>AI 驱动的漏洞挖掘 · 图形控制台</span><span id="tokenStats" class="muted" style="margin-left:16px;font-size:12px;">Token：输入 0 / 输出 0 / 缓存命中 0 / 未命中 0 · 预估 ¥0.000000</span></header>
+
+<aside class="sidebar">
+  <div class="brand"><span class="brand-mark" aria-hidden="true">H</span>HexHound</div>
+  <div class="brand-sub eyebrow">Security workspace</div>
+  <div class="nav-label eyebrow">Workspace / 工作空间</div>
+  <nav aria-label="主导航">
+    <button class="nav-item" data-view="workspace" aria-current="page"><span class="nav-icon" aria-hidden="true">⊞</span>审计工作台</button>
+    <button class="nav-item" data-view="reports"><span class="nav-icon" aria-hidden="true">▤</span>审计报告</button>
+    <button class="nav-item" data-view="vision"><span class="nav-icon" aria-hidden="true">◎</span>视觉分析</button>
+    <button class="nav-item" id="settingsBtn"><span class="nav-icon" aria-hidden="true">⚙</span>模型与设置</button>
+  </nav>
+  <div class="side-footer"><strong><span class="dot"></span>本地工作空间</strong>配置 · 执行 · 验证 · 留存<br>HexHound / v0.1</div>
+</aside>
+<div class="app">
+<header class="topbar"><div class="breadcrumb">工作空间 <span>/</span> <strong id="currentPage">审计工作台</strong></div><span class="local-badge">LOCAL CONSOLE</span></header>
 <main>
-  <div class="panel">
-    <h2>配置</h2>
-    <form id="cfg">
+  <div class="page-heading"><div><div class="eyebrow">HEXHOUND / SECURITY OPERATIONS</div><h1 id="pageTitle">让每一次发现，都有据可循。</h1><p id="pageDescription">配置评估范围，跟踪代理执行，留存可复核的安全证据。</p></div><div class="heading-index" aria-hidden="true">/ 01</div></div>
+  <section id="workspacePane">
+    <div class="metrics" aria-label="本次审计指标">
+      <div class="metric"><div class="metric-label">执行步骤 <span>01</span></div><strong class="metric-value" id="metricSteps">0</strong><small>本次运行累计步骤</small></div>
+      <div class="metric"><div class="metric-label">已复核发现 <span>02</span></div><strong class="metric-value" id="metricFindings">0</strong><small>候选项单独列于报告</small></div>
+      <div class="metric"><div class="metric-label">Token 用量 <span>03</span></div><strong class="metric-value" id="metricTokens">0</strong><small>输入与输出合计</small></div>
+      <div class="metric"><div class="metric-label">预估费用 <span>04</span></div><strong class="metric-value" id="metricCost">¥0.0000</strong><small>按当前模型计价</small></div>
+    </div>
+    <div class="workspace">
+      <section class="panel"><div class="panel-head"><h2><span class="section-number">01</span>任务配置</h2><span class="eyebrow">CONFIGURE</span></div><div class="panel-body">    <form id="cfg">
       <label>模式</label>
       <select name="mode">
-        <option value="blackbox" {% if settings.mode == 'blackbox' %}selected{% endif %}>blackbox（纯 URL 黑盒）</option>
-        <option value="source" {% if settings.mode == 'source' %}selected{% endif %}>source（源码审计）</option>
+        <option value="blackbox" {% if settings.mode == 'blackbox' %}selected{% endif %}>黑盒评估 · URL</option>
+        <option value="source" {% if settings.mode == 'source' %}selected{% endif %}>源码审计 · Source</option>
       </select>
       <label>编排方式</label>
       <select name="swarm">
-        <option value="1" {% if settings.swarm != '0' %}selected{% endif %}>多代理编排（规划 + 并发子代理 + 复核）</option>
-        <option value="0" {% if settings.swarm == '0' %}selected{% endif %}>单代理 ReAct（v0.1 行为）</option>
+        <option value="1" {% if settings.swarm != '0' %}selected{% endif %}>多代理协作</option>
+        <option value="0" {% if settings.swarm == '0' %}selected{% endif %}>单代理 ReAct</option>
       </select>
       <label>目标 URL</label>
       <input name="target" value="{{ settings.target }}" placeholder="https://授权目标">
-      <label>源码目录（source 模式用）</label>
-      <input name="path" value="{{ settings.path }}">
+<div id="sourceFields"><label>源码目录</label><input name="path" value="{{ settings.path }}"></div>
+      <details><summary>执行参数与预算</summary>
       <div class="row">
-        <div><label>MAX_STEPS（单代理）</label><input name="max_steps" value="{{ settings.max_steps }}"></div>
-        <div><label>REQUEST_TIMEOUT</label><input name="request_timeout" value="{{ settings.request_timeout }}"></div>
+        <div><label>单代理步数</label><input name="max_steps" value="{{ settings.max_steps }}"></div>
+        <div><label>请求超时 / 秒</label><input name="request_timeout" value="{{ settings.request_timeout }}"></div>
       </div>
       <div class="row">
-        <div><label>MAX_TASKS</label><input name="max_tasks" value="{{ settings.max_tasks }}"></div>
-        <div><label>TASK_STEPS</label><input name="task_steps" value="{{ settings.task_steps }}"></div>
-        <div><label>PARALLEL</label><input name="parallel" value="{{ settings.parallel }}"></div>
+        <div><label>任务上限</label><input name="max_tasks" value="{{ settings.max_tasks }}"></div>
+        <div><label>每任务步数</label><input name="task_steps" value="{{ settings.task_steps }}"></div>
+        <div><label>并发数</label><input name="parallel" value="{{ settings.parallel }}"></div>
       </div>
       <div class="row">
-        <div><label>MAX_COST（¥，0=不限）</label><input name="max_cost" value="{{ settings.max_cost }}"></div>
-        <div><label>RATE_LIMIT（秒）</label><input name="rate_limit" value="{{ settings.rate_limit }}"></div>
+        <div><label>预算 / ¥（0 不限）</label><input name="max_cost" value="{{ settings.max_cost }}"></div>
+        <div><label>请求间隔 / 秒</label><input name="rate_limit" value="{{ settings.rate_limit }}"></div>
       </div>
-      <label>ALLOWED_HOSTS（逗号分隔，只填主机名）</label>
+      </details>
+      <label>授权主机 · 逗号分隔</label>
       <input name="allowed_hosts" value="{{ settings.allowed_hosts }}">
-      <button type="button" id="runBtn">开始审计</button>
-      <button type="button" id="stopBtn" disabled style="background:var(--err);color:#fff;width:100%;margin-top:8px;">中断当前任务</button>
-      <button type="button" id="saveBtn">仅保存设置</button>
-      <button type="button" id="settingsBtn" style="background:var(--line);color:var(--fg);width:100%;margin-top:8px;">设置</button>
-      <div class="hint">设置保存在 ~/.hexhound/settings.json，下次打开自动回填。密钥以明文存储，请勿在公用机器上使用。</div>
-    </form>
-  </div>
-  <div class="panel">
-    <h2>运行</h2>
-    <div id="status">空闲</div>
-    <div id="log"></div>
-    <div id="results"></div>
-    <div id="reportSection" style="margin-top:14px;">
-      <button type="button" id="reportBtn" style="background:var(--line);color:var(--fg);">查看完整报告</button>
-      <pre class="raw" id="reportView" style="display:none;margin-top:10px;"></pre>
+      <div class="form-actions"><button type="button" id="runBtn">开始审计 <span aria-hidden="true">↗</span></button>
+      <button type="button" id="stopBtn" disabled>中断当前任务</button>
+      <button type="button" id="saveBtn">保存此配置</button>
+</div>
+<div class="hint">仅在已授权的目标范围内执行审计。配置会保存在本机，供下次使用。</div>
+    </form></div></section>
+      <div><section class="panel"><div class="panel-head"><h2><span class="section-number">02</span>执行记录</h2><div id="status" role="status">等待开始</div></div>
+        <div class="log-toolbar"><span>AGENT ACTIVITY</span><label><input id="followLog" type="checkbox" checked>自动跟随</label></div>
+        <div id="log" role="region" aria-label="代理执行日志" tabindex="0"><div class="empty-state"><div class="empty-symbol" aria-hidden="true">⌘</div><h3>准备好，开始下一次审计</h3><p>在左侧配置目标与授权范围。<br>代理的执行步骤、工具观察和编排进度将在这里实时呈现。</p></div></div>
+        <div id="tokenStats" class="token-footer">Token：输入 0 / 输出 0 / 缓存命中 0 / 未命中 0</div>
+      </section><div class="workflow" aria-label="审计流程"><span><i>01</i> 范围配置</span><b>→</b><span><i>02</i> 协同评估</span><b>→</b><span><i>03</i> 证据复核</span><b>→</b><span><i>04</i> 报告归档</span></div></div>
     </div>
-    <hr style="border:0;border-top:1px solid var(--line);margin:18px 0;">
-    <h2>识图（多模态分析）</h2>
-    <input type="file" id="imgInput" accept="image/*">
+  </section>
+  <section id="reportsPane" class="panel" hidden><div class="panel-head"><h2>发现与报告</h2><button type="button" id="reportBtn">查看完整报告</button></div><div class="panel-body"><div id="results"><div class="empty-state"><div class="empty-symbol" aria-hidden="true">▤</div><h3>尚无审计结果</h3><p>完成一次审计后，在这里查看发现、复核状态和完整报告。</p></div></div><div id="reportSection"><pre class="raw" id="reportView" style="display:none;"></pre></div></div></section>
+  <section id="visionPane" class="panel" hidden><div class="panel-head"><h2>页面与图像分析</h2><span class="eyebrow">VISION</span></div><div class="panel-body vision-grid"><div>    <input type="file" id="imgInput" accept="image/*">
     <label>直接截图目标 URL</label>
     <div class="row">
       <input id="shotUrl" value="{{ settings.target }}" placeholder="http://127.0.0.1:5000">
@@ -200,13 +302,14 @@ HTML = """<!doctype html>
     <label>提问（可选）</label>
     <input id="imgQuestion" placeholder="例如：这张页面有什么可疑点 / 有没有报错信息？">
     <button type="button" id="visionBtn" style="background:var(--line);color:var(--fg);margin-top:8px;">分析图片</button>
-    <div id="shotPreview" class="shot-preview"></div>
-    <div id="visionResult" class="muted" style="margin-top:10px;white-space:pre-wrap;"></div>
-  </div>
-</main>
-<div class="modal-overlay" id="settingsModal">
+</div><div class="vision-output"><div class="eyebrow">ANALYSIS OUTPUT</div><div id="shotPreview" class="shot-preview"></div>
+    <div id="visionResult" class="muted" style="margin-top:16px;">上传图片或输入目标 URL，分析结果将显示在这里。</div></div>
+</div></section>
+</main></div>
+<div id="notice" role="status" hidden></div>
+<dialog class="modal-overlay" id="settingsModal" aria-labelledby="settingsTitle">
   <div class="modal">
-    <h2>设置</h2>
+    <h2 id="settingsTitle">模型与设置</h2><p class="hint">密钥以明文保存在本机，请勿在共用设备上保存。</p>
     <form id="settingsForm">
       <h3 style="margin:14px 0 6px;font-size:14px;">模型提供商</h3>
       <label>提供商预设</label>
@@ -257,18 +360,10 @@ HTML = """<!doctype html>
       <button type="button" id="settingsSave" style="background:var(--accent);color:#fff;">保存设置</button>
     </div>
   </div>
-</div>
+</dialog>
 <script>
-window.addEventListener("load", () => {
-  fetch("/api/stop", {method: "POST", keepalive: true}).catch(() => {});
-});
-window.addEventListener("beforeunload", () => {
-  if (navigator.sendBeacon) {
-    navigator.sendBeacon("/api/stop", new Blob(["{}"], {type: "application/json"}));
-  }
-});
 const $ = (s) => document.querySelector(s);
-let zoomLevel = parseFloat("{{ settings.zoom }}") || 1;
+let zoomLevel = parseFloat({{ settings.zoom|tojson }}) || 1;
 let zoomSaveTimer = null;
 function applyZoom(value) {
   zoomLevel = Math.min(2.0, Math.max(0.5, parseFloat(value) || 1));
@@ -302,9 +397,19 @@ function collect() {
   }
   return o;
 }
+/* 本机控制面的会话令牌：由服务端渲染进本页面，有副作用的请求都带上它。
+   跨站页面拿不到这个令牌（读不到本页面的 HTML），因此无法借本机发起审计或改配置。 */
+const LOCAL_TOKEN = {{ local_token|tojson }};
+function apiFetch(url, options) {
+  const opts = Object.assign({}, options || {});
+  opts.headers = Object.assign({}, opts.headers || {}, {'X-HexHound-Token': LOCAL_TOKEN});
+  return fetch(url, opts);
+}
 async function post(url, data) {
-  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data)});
-  return r.json();
+  const r = await apiFetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data)});
+  const result = await r.json();
+  if (!r.ok || result.error) throw new Error(result.error || '请求失败，请稍后重试');
+  return result;
 }
 function renderStep(s) {
   const d = document.createElement('div');
@@ -314,7 +419,7 @@ function renderStep(s) {
   const role = s.role ? `<span class="tag">${escapeHtml(s.role)}</span> ` : '';
   const thought = s.thought ? `<div class="t">思考：${escapeHtml(s.thought)}</div>` : '';
   const obs = s.observation ? `<div>观察：${escapeHtml(String(s.observation).slice(0, 600))}</div>` : '';
-  d.innerHTML = `<div class="a">${who}${role}Step ${s.step} · ${escapeHtml(act)}</div>${thought}${obs}`;
+  d.innerHTML = `<div class="a">${who}${role}Step ${escapeHtml(s.step)} · ${escapeHtml(act)}</div>${thought}${obs}`;
   return d;
 }
 function escapeHtml(s) {
@@ -322,7 +427,7 @@ function escapeHtml(s) {
 }
 function renderFindings(list) {
   const box = $('#results');
-  if (!list.length) { box.innerHTML = ''; return; }
+  if (!list.length) { box.innerHTML = '<div class="empty-state"><div class="empty-symbol" aria-hidden="true">▤</div><h3>暂无已记录的发现</h3><p>运行完成后的发现与复核状态会列在这里。<br>未发现问题不代表目标安全。</p></div>'; return; }
   const verified = list.filter(f => f.status !== 'candidate');
   const candidates = list.filter(f => f.status === 'candidate');
   const card = (f) => `
@@ -341,61 +446,100 @@ function renderFindings(list) {
 }
 async function loadReport() {
   const view = $('#reportView');
-  const r = await fetch('/api/report');
+  const r = await apiFetch('/api/report');
   const j = await r.json();
+  if (!r.ok || j.error) throw new Error(j.error || '报告加载失败');
   view.textContent = j.markdown || '暂无报告';
   view.style.display = 'block';
 }
 let timer = null;
-function poll() {
-  fetch('/api/status').then(r => r.json()).then(s => {
+let lastLog = '';
+let lastResult = '';
+const idleLog = $('#log').innerHTML;
+async function poll() {
+  try {
+    const response = await apiFetch('/api/status');
+    if (!response.ok) throw new Error('无法读取运行状态');
+    const s = await response.json();
     const st = $('#status');
-    if (s.status === 'running') { st.className = 'running'; st.textContent = '运行中…'; }
-    else if (s.status === 'done') { st.className = 'done'; st.textContent = '完成 [OK]'; }
-    else if (s.status === 'error') { st.className = 'error'; st.textContent = '出错：' + s.error; }
-    else { st.className = ''; st.textContent = '空闲'; }
+    st.className = s.status;
+    // 状态文案以后端为准（单一来源），避免前后端各写一份映射而漂移。
+    st.textContent = s.status_label || '等待开始';
+    if (s.error) st.textContent = '执行失败：' + s.error;
+    // running 包含"正在停止"的收尾期：那期间服务端仍占用运行名额（会拒绝新任务），
+    // 界面必须一致地禁用"开始审计"，否则用户点了只会收到一句 409 错误。
+    const busy = Boolean(s.running) || s.status === 'running';
     $('#stopBtn').disabled = s.status !== 'running';
+    $('#runBtn').disabled = busy;
+    $('#runBtn').textContent = busy ? '审计进行中…' : '开始审计 ↗';
     const tok = s.tokens || {};
-    const cost = Number(tok.estimated_cost || 0).toFixed(6);
-    $('#tokenStats').textContent = `Token：输入 ${tok.prompt_tokens ?? 0} / 输出 ${tok.completion_tokens ?? 0} / 缓存命中 ${tok.cache_hit_tokens ?? 0} / 未命中 ${tok.cache_miss_tokens ?? 0} · 预估 ¥${cost}`;
+    $('#metricSteps').textContent = (s.steps || []).length;
+    $('#metricFindings').textContent = (s.findings || []).filter(f => f.status !== 'candidate').length;
+    $('#metricTokens').textContent = Number(tok.total_tokens || (tok.prompt_tokens || 0) + (tok.completion_tokens || 0)).toLocaleString();
+    $('#metricCost').textContent = '¥' + Number(tok.estimated_cost || 0).toFixed(4);
+    $('#tokenStats').textContent = `Token：输入 ${tok.prompt_tokens ?? 0} / 输出 ${tok.completion_tokens ?? 0} / 缓存命中 ${tok.cache_hit_tokens ?? 0} / 未命中 ${tok.cache_miss_tokens ?? 0}`;
     const log = $('#log');
-    log.innerHTML = '';
-    const phases = s.phases || [];
-    if (phases.length) {
-      const box = document.createElement('div');
-      box.className = 'step';
-      box.innerHTML = `<div class="a">编排进度</div><div class="t" style="white-space:pre-wrap">${escapeHtml(phases.join('\n'))}</div>`;
-      log.appendChild(box);
-    }
-    for (const step of s.steps) log.appendChild(renderStep(step));
-    log.scrollTop = log.scrollHeight;
-    if (s.status === 'done') {
-      renderFindings(s.findings);
-      $('#results').innerHTML += `<h2>总结</h2><div class="muted">${escapeHtml(s.summary || '')}</div>`;
-      $('#results').innerHTML += `<div class="hint">完整报告已写入 ${escapeHtml(s.output_path || '')}</div>`;
-      if (s.submission_path) {
-        $('#results').innerHTML += `<div class="hint"><a href="/api/submission">下载补天提交包</a></div>`;
+    const signature = JSON.stringify([s.phases, s.steps, s.status]);
+    if (signature !== lastLog) {
+      const top = log.scrollTop;
+      log.replaceChildren();
+      const phases = s.phases || [];
+      if (phases.length) {
+        const box = document.createElement('div');
+        box.className = 'step';
+        box.innerHTML = `<div class="a">编排进度</div><div class="t">${escapeHtml(phases.join('\n'))}</div>`;
+        log.appendChild(box);
       }
-      loadReport();
-      if (timer) { clearInterval(timer); timer = null; }
-    } else if (s.status === 'running') {
-      if (!timer) timer = setInterval(poll, 800);
+      for (const step of s.steps || []) log.appendChild(renderStep(step));
+      if (!log.children.length) {
+        log.innerHTML = s.status === 'running'
+          ? '<div class="empty-state"><div class="empty-symbol">…</div><h3>正在准备评估</h3><p>等待代理返回首个执行步骤。</p></div>' : idleLog;
+      }
+      log.scrollTop = $('#followLog').checked ? log.scrollHeight : top;
+      lastLog = signature;
     }
-  });
+    const resultKey = JSON.stringify([s.status, s.findings, s.summary, s.output_path]);
+    if (resultKey !== lastResult) {
+      renderFindings(s.findings || []);
+      if (s.status === 'done' || s.status === 'cancelled') {
+        // 中断也要展示成果：**部分结果不是没有结果**，但必须写明不完整。
+        const banner = s.status === 'cancelled'
+          ? '<div class="muted" style="border-left:3px solid var(--warn);padding-left:10px">'
+            + '<b>本次运行被中断，报告不完整。</b>已完成的步骤与发现如实列出；'
+            + '尚未测试的端点与参数没有被测过——它们既不表示安全，也不表示已修复。</div>'
+          : '';
+        $('#results').innerHTML += banner + `<h2>审计总结</h2><div class="muted">${escapeHtml(s.summary || '暂无总结')}</div>`;
+        if (s.output_path) $('#results').innerHTML += `<div class="hint">报告已保存：${escapeHtml(s.output_path)}</div>`;
+        if (s.submission_path) $('#results').innerHTML += '<p><a href="/api/submission">下载补天提交包</a></p>';
+      }
+      if (s.status === 'running') {
+        $('#reportView').textContent = '';
+        $('#reportView').style.display = 'none';
+      }
+      lastResult = resultKey;
+    }
+  } catch (error) {
+    $('#status').className = 'error';
+    $('#status').textContent = '连接中断，正在重试';
+  } finally {
+    clearTimeout(timer);
+    timer = setTimeout(poll, 1200);
+  }
 }
 $('#saveBtn').onclick = async () => {
   await post('/api/save', collect());
-  $('#status').textContent = '设置已保存';
+  notify('配置已保存');
   await loadProviders();
 };
 $('#settingsBtn').onclick = async () => {
-  $('#settingsModal').style.display = 'flex';
+  $('#settingsModal').showModal();
   await loadProviders();
 };
 
 /* ---------- 模型提供商面板 ---------- */
 let PROVIDERS = [];
-let PROVIDER_STATE = {active: '', keys: {}};
+/* 只保存掩码与"是否已保存"：明文密钥不再经过浏览器（服务端按 provider 取用）。 */
+let PROVIDER_STATE = {active: '', keys_masked: {}, keys_saved: {}};
 
 function currentProvider() {
   return $('#providerSelect').value || 'custom';
@@ -403,7 +547,7 @@ function currentProvider() {
 function presetOf(key) {
   return PROVIDERS.find(p => p.key === key) || null;
 }
-def renderProviderOptions() {
+function renderProviderOptions() {
   const select = $('#providerSelect');
   const placeholder = '<option value="">— 请选择提供商 —</option>';
   select.innerHTML = placeholder + PROVIDERS.map(p =>
@@ -416,6 +560,7 @@ def renderProviderOptions() {
   }
 }
 function applyPreset({fillModel = true, fillUrl = true} = {}) {
+  if (!$('#providerSelect').value) return;
   const preset = presetOf(currentProvider());
   if (!preset) return;
   if (fillUrl && preset.base_url) $('#baseUrlInput').value = preset.base_url;
@@ -425,16 +570,20 @@ function applyPreset({fillModel = true, fillUrl = true} = {}) {
     ? `需要 key（${escapeHtml(preset.key_style)}…）${preset.api_key_url ? ` · <a href="${preset.api_key_url}" target="_blank" rel="noreferrer">获取密钥</a>` : ''}`
     : '该提供商无需密钥';
   $('#providerNote').innerHTML = keyHint + (preset.note ? `<br>${escapeHtml(preset.note)}` : '');
-  const saved = PROVIDER_STATE.keys[preset.key];
-  $('#keyState').textContent = saved ? `（已保存 ${escapeHtml(saved)}）` : '';
-  if (saved && !$('#apiKeyInput').value) $('#apiKeyInput').value = saved;
+  const masked = PROVIDER_STATE.keys_masked[preset.key];
+  const saved = PROVIDER_STATE.keys_saved[preset.key];
+  $('#keyState').textContent = saved ? `（已保存 ${masked || ''}）` : '';
+  // 刻意**不**把已保存的密钥回填进输入框：接口只回传掩码，回填等于把掩码
+  // 当成真密钥再用一次。留空时服务端会自动使用已保存的密钥。
+  if (saved) $('#apiKeyInput').placeholder = '留空 = 使用已保存的密钥（要更换请粘贴新密钥）';
+  else $('#apiKeyInput').placeholder = preset.key_style || '粘贴密钥';
 }
 function renderRoleModels() {
   const spec = {{ role_labels|tojson }};
   const box = $('#roleModelBox');
   box.innerHTML = Object.entries(spec).map(([role, label]) => `
-    <label style="margin-top:8px;">${escapeHtml(label)}</label>
-    <input name="role_model_${role}" data-role="${role}" placeholder="留空 = 跟随上面的默认模型">`).join('');
+    <label for="role-${role}" style="margin-top:8px;">${escapeHtml(label)}</label>
+    <input id="role-${role}" name="role_model_${role}" data-role="${role}" placeholder="留空 = 跟随上面的默认模型">`).join('');
   const saved = {{ settings.role_models|tojson }};
   for (const [role, model] of Object.entries(saved || {})) {
     const input = box.querySelector(`input[data-role="${role}"]`);
@@ -443,12 +592,12 @@ function renderRoleModels() {
 }
 async function loadProviders() {
   try {
-    const r = await fetch('/api/providers');
+    const r = await apiFetch('/api/providers');
     const j = await r.json();
     PROVIDERS = j.presets || [];
-    PROVIDER_STATE = {active: j.active || '', keys: j.keys || {}};
+    PROVIDER_STATE = {active: j.active || '', keys_masked: j.keys_masked || {}, keys_saved: j.keys_saved || {}};
   } catch (error) {
-    PROVIDER_STATE = {active: '', keys: {}};
+    PROVIDER_STATE = {active: '', keys_masked: {}, keys_saved: {}};
   }
   renderProviderOptions();
   applyPreset({fillModel: false, fillUrl: false});
@@ -456,16 +605,18 @@ async function loadProviders() {
 }
 $('#providerSelect').onchange = () => { applyPreset(); };
 $('#fillKeyBtn').onclick = () => {
-  const saved = PROVIDER_STATE.keys[currentProvider()];
+  // 明文密钥不再回传到页面，所以这里不能"填入"——只能告诉用户留空即用已保存的密钥。
+  const saved = PROVIDER_STATE.keys_saved[currentProvider()];
   if (!saved) { $('#testResult').textContent = '该提供商还没有保存过密钥，请直接粘贴。'; return; }
-  $('#apiKeyInput').value = saved;
-  $('#testResult').textContent = '已填入保存的密钥。';
+  $('#apiKeyInput').value = '';
+  $('#apiKeyInput').placeholder = '留空 = 使用已保存的密钥（要更换请粘贴新密钥）';
+  $('#testResult').textContent = '将使用已保存的密钥（' + (PROVIDER_STATE.keys_masked[currentProvider()] || '') + '）；密钥只在服务端使用，不会回显到页面。';
 };
 $('#testBtn').onclick = async () => {
   const out = $('#testResult');
   out.textContent = '正在测试连接…';
   $('#testBtn').disabled = true;
-  const r = await fetch('/api/provider_test', {
+  const r = await apiFetch('/api/provider_test', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
       provider: currentProvider(),
@@ -480,10 +631,14 @@ $('#testBtn').onclick = async () => {
   out.innerHTML = (j.ok ? '✅ ' : '❌ ') + escapeHtml(j.message || '').replace(/\n/g, '<br>')
     + (j.usage ? `<br><span class="muted">用量 ${j.usage.total_tokens} token · 延迟 ${j.latency_ms} ms</span>` : '');
   if (j.ok) {
-    // 测通即记住该提供商的密钥，省得下次重填
-    await post('/api/provider_key', {provider: currentProvider(), api_key: $('#apiKeyInput').value.trim()});
-    PROVIDER_STATE.keys[currentProvider()] = '(已保存)';
+    // 测通即记住该提供商的密钥，省得下次重填（页面只记"已保存"，不记明文）
+    const typed = $('#apiKeyInput').value.trim();
+    if (typed) await post('/api/provider_key', {provider: currentProvider(), api_key: typed});
+    PROVIDER_STATE.keys_saved[currentProvider()] = true;
+    PROVIDER_STATE.keys_masked[currentProvider()] = j.masked || PROVIDER_STATE.keys_masked[currentProvider()] || '';
     $('#keyState').textContent = '（已保存）';
+    $('#apiKeyInput').value = '';
+    $('#apiKeyInput').placeholder = '留空 = 使用已保存的密钥（要更换请粘贴新密钥）';
   }
 };
 $('#envBtn').onclick = async () => {
@@ -492,16 +647,16 @@ $('#envBtn').onclick = async () => {
   const j = await post('/api/write_env', collect());
   out.textContent = j.error ? ('写入失败：' + j.error) : (j.message || '已写入 .env');
 };
-$('#settingsCancel').onclick = () => { $('#settingsModal').style.display = 'none'; };
+$('#settingsCancel').onclick = () => { $('#settingsModal').close(); };
 $('#settingsModal').onclick = (e) => {
-  if (e.target === $('#settingsModal')) $('#settingsModal').style.display = 'none';
+  if (e.target === $('#settingsModal')) $('#settingsModal').close();
 };
 $('#settingsForm [name="zoom"]').onchange = (e) => { applyZoom(e.target.value); };
 $('#settingsSave').onclick = async () => {
   applyZoom($('#settingsForm [name="zoom"]').value);
   await post('/api/save', collect());
-  $('#settingsModal').style.display = 'none';
-  $('#status').textContent = '设置已保存';
+  $('#settingsModal').close();
+  notify('配置已保存');
 };
 async function captureLogin(account) {
   const url = $('#cfg [name="target"]').value.trim();
@@ -512,7 +667,7 @@ async function captureLogin(account) {
   btn.disabled = true;
   statusBox.textContent = '正在打开登录窗口，登录完成后点击页面右上角按钮';
   try {
-    const r = await fetch('/api/capture_login', {
+    const r = await apiFetch('/api/capture_login', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({url: url, allowed_hosts: cfg.allowed_hosts, timeout: 300})
     });
@@ -531,17 +686,20 @@ async function captureLogin(account) {
 $('#captureLoginA').onclick = () => captureLogin('A');
 $('#captureLoginB').onclick = () => captureLogin('B');
 $('#runBtn').onclick = async () => {
-  $('#results').innerHTML = '';
+  if (!$('#cfg').reportValidity()) return;
   $('#runBtn').disabled = true;
-  await post('/api/run', collect());
-  $('#runBtn').disabled = false;
-  $('#stopBtn').disabled = false;
-  poll();
+  try {
+    await post('/api/run', collect());
+    await poll();
+  } catch (error) {
+    notify(error.message);
+    $('#runBtn').disabled = false;
+  }
 };
 $('#stopBtn').onclick = async () => {
   $('#stopBtn').disabled = true;
-  await post('/api/stop', {});
-  poll();
+  try { await post('/api/stop', {}); await poll(); }
+  catch (error) { notify(error.message); $('#stopBtn').disabled = false; }
 };
 $('#visionBtn').onclick = () => {
   const f = $('#imgInput').files[0];
@@ -553,7 +711,7 @@ $('#visionBtn').onclick = () => {
     const dataUrl = String(reader.result);
     const [meta, b64] = dataUrl.split(',');
     const mime = (meta.match(/data:(.*?);/) || ['', 'image/png'])[1];
-    const r = await fetch('/api/vision', {
+    const r = await apiFetch('/api/vision', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({image_base64: b64, mime_type: mime, question: $('#imgQuestion').value})
     });
@@ -578,7 +736,7 @@ $('#shotBtn').onclick = async () => {
   out.textContent = '正在截图并分析…';
   preview.innerHTML = '';
   const cfg = collect();
-  const r = await fetch('/api/screenshot', {
+  const r = await apiFetch('/api/screenshot', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
       url: url,
@@ -593,6 +751,69 @@ $('#shotBtn').onclick = async () => {
   }
   out.textContent = j.answer || j.error || '（无结果）';
 };
+
+const pages = {
+  workspace: ['审计工作台', '让每一次发现，都有据可循。', '配置评估范围，跟踪代理执行，留存可复核的安全证据。', '01'],
+  reports: ['审计报告', '从发现，到可复核的证据。', '查看本次运行的发现、候选项与完整审计报告。', '02'],
+  vision: ['视觉分析', '换个视角，理解目标页面。', '上传页面截图，或对授权目标截图并进行多模态分析。', '03']
+};
+document.querySelectorAll('[data-view]').forEach(button => {
+  button.onclick = () => {
+    const key = button.dataset.view;
+    for (const name of Object.keys(pages)) $('#' + name + 'Pane').hidden = name !== key;
+    document.querySelectorAll('[data-view]').forEach(item => {
+      if (item === button) item.setAttribute('aria-current', 'page');
+      else item.removeAttribute('aria-current');
+    });
+    const [label, title, description, number] = pages[key];
+    $('#currentPage').textContent = label;
+    $('#pageTitle').textContent = title;
+    $('#pageDescription').textContent = description;
+    $('.heading-index').textContent = '/ ' + number;
+  };
+});
+let noticeTimer;
+function notify(message) {
+  $('#notice').textContent = message;
+  $('#notice').hidden = false;
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => { $('#notice').hidden = true; }, 4500);
+}
+window.addEventListener('unhandledrejection', event => {
+  notify(event.reason?.message || '操作失败，请重试');
+});
+document.querySelectorAll('label').forEach((label, index) => {
+  const field = label.nextElementSibling;
+  if (field?.matches('input,select')) {
+    field.id ||= 'field-' + index;
+    label.htmlFor = field.id;
+  }
+});
+$('#imgInput').setAttribute('aria-label', '上传待分析图片');
+$('#cfg [name="target"]').type = 'url';
+$('#cfg [name="allowed_hosts"]').required = true;
+const mode = $('#cfg [name="mode"]');
+mode.onchange = () => {
+  $('#sourceFields').hidden = mode.value !== 'source';
+  $('#cfg [name="target"]').required = mode.value === 'blackbox';
+  $('#cfg [name="path"]').required = mode.value === 'source';
+};
+mode.onchange();
+// Restore action buttons after a failed request, so the user can retry.
+for (const id of ['saveBtn', 'settingsSave', 'testBtn', 'envBtn', 'shotBtn']) {
+  const button = $('#' + id);
+  const action = button.onclick;
+  button.onclick = async event => {
+    button.disabled = true;
+    try { await action(event); }
+    catch (error) { notify(error.message); }
+    finally { button.disabled = false; }
+  };
+}
+document.documentElement.style.zoom = Math.min(2, Math.max(.5, zoomLevel));
+loadProviders();
+poll();
+
 </script>
 </body>
 </html>
@@ -607,17 +828,64 @@ def _load_settings() -> dict:
     return {k: v for k, v in data.items() if isinstance(v, str)}
 
 
+#: 并发保存的互斥锁：多个请求（/api/save 与 /api/provider_key）同时写
+#: settings.json 时，没有它就会出现"后写覆盖先写"。
+_SETTINGS_LOCK = threading.RLock()
+
+
 def _save_settings(data: dict) -> None:
-    """保存设置：白名单字段 + 按角色模型字段（`role_model_<角色>`）一起落盘。"""
-    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    cleaned = {k: str(data.get(k, DEFAULTS.get(k, ""))).strip() for k in DEFAULTS}
-    for role in ROLES:
-        field = f"role_model_{role}"
-        if field in data:
-            cleaned[field] = str(data.get(field, "")).strip()
-    SETTINGS_PATH.write_text(
-        json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    """保存设置：白名单字段 + 按角色模型字段（`role_model_<角色>`）。
+
+    三条硬化（都是实测问题驱动的）：
+
+    1. **未提交的字段不被清空**：先读磁盘现值作为基底，只覆盖 payload 里
+       真的出现的键（`None` 表示显式清空）。早先直接用 `DEFAULTS` 重建整个
+       字典，于是**任何一次普通保存都会把已保存的密钥清空**——设置面板的普通
+       表单里根本没有 `provider_keys` 输入框，而密钥正是存在这个键里的。
+    2. **原子写**：同目录临时文件 + `os.replace`。进程被杀/断电不会留下半份
+       JSON；配置文件写坏等于密钥与白名单一起丢。
+    3. **加锁**：并发保存（多个标签页、`/api/save` 与 `/api/provider_key` 同时
+       到达）串行化，避免后写覆盖先写。
+    """
+    with _SETTINGS_LOCK:
+        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # 基底 = 磁盘现值；首次保存时磁盘为空，退化为"全部默认值"
+        cleaned: dict[str, str] = dict(DEFAULTS)
+        cleaned.update(
+            {k: v for k, v in _load_settings().items() if isinstance(v, str)}
+        )
+        for key in DEFAULTS:
+            if key not in data:
+                continue  # 未提交 → 保留基底（磁盘值或默认值）
+            value = data.get(key)
+            # 显式 None = 清空回默认值；显式空串 = 就存空串
+            cleaned[key] = DEFAULTS.get(key, "") if value is None else str(value).strip()
+        for role in ROLES:
+            field = f"role_model_{role}"
+            if field in data:
+                cleaned[field] = str(data.get(field, "") or "").strip()
+        _atomic_write_text(
+            SETTINGS_PATH, json.dumps(cleaned, ensure_ascii=False, indent=2)
+        )
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """原子写文本：同目录临时文件 + `os.replace`（POSIX/Windows 都是原子替换）。
+
+    同目录很重要：跨文件系统 `os.replace` 可能退化成"复制+删除"，
+    就不再原子了。
+    """
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        # 替换成功后 tmp 已不存在；失败时清掉，避免留下垃圾文件
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _provider_keys() -> dict[str, str]:
@@ -722,6 +990,70 @@ def _update_env_file(path: Path, updates: dict[str, str]) -> list[str]:
     return changed
 
 
+def _looks_like_mask(value: str) -> bool:
+    """判断送进来的"密钥"其实是界面回显的**掩码**。
+
+    掩码（`sk-123…abcd`）只用于展示。一旦被当成真实密钥保存回去，
+    之后每次请求都拿着一个必然失败的假密钥——而界面还显示"已保存"，
+    用户只能看到"鉴权失败"，很难想到是掩码被存了。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if "…" in text or "***" in text:
+        return True
+    try:
+        saved = _provider_keys().values()
+    except Exception:  # noqa: BLE001 读配置失败不应阻断保存
+        return False
+    return any(secret and text == mask_key(secret) for secret in saved)
+
+
+def _secret_candidates(extra: str = "") -> list[str]:
+    """收集本机已知的密钥值（用于错误文本打码）。"""
+    values: list[str] = [extra, os.getenv("LLM_API_KEY", "")]
+    values.append(os.getenv("VISION_API_KEY", ""))
+    try:
+        values.extend(_provider_keys().values())
+    except Exception:  # noqa: BLE001 配置不可读时退化为只打码环境变量
+        pass
+    for preset in describe_presets():
+        values.append(os.getenv(str(preset.get("env_key") or ""), ""))
+    return [value.strip() for value in values if isinstance(value, str) and len(value.strip()) >= 8]
+
+
+def _scrub_secrets(text: str, extra: str = "") -> str:
+    """把错误文本里夹带的密钥替换成掩码后才允许展示。
+
+    为什么需要：提供商的报错经常**原样回显凭据**
+    （典型如 `Incorrect API key provided: sk-xxxx`）。这条文本会进界面、
+    日志和运行记录——密钥就顺着"报错"泄漏出去了。
+    """
+    out = str(text or "")
+    for secret in _secret_candidates(extra):
+        if secret in out:
+            out = out.replace(secret, mask_key(secret))
+    # 兜底：密钥不在本机配置里（例如用户刚粘贴、还没保存）也要打码。
+    out = re.sub(r"sk-[A-Za-z0-9_\-]{8,}", lambda m: mask_key(m.group(0)), out)
+    # `Bearer <token>` 是空格分隔的，单独一条规则（`key=value` 那条抓不到）。
+    out = re.sub(r"(?i)\b(bearer)\s+([A-Za-z0-9_\-\.=]{8,})", r"\1 ***", out)
+    out = re.sub(
+        r"(?i)\b(api[-_]?key|authorization|access[-_]?token|token)\b(\s*[:=]\s*)([A-Za-z0-9_\-\.=]{8,})",
+        r"\1\2***",
+        out,
+    )
+    return out
+
+
+def _request_hostname() -> str:
+    """取请求的 Host（去掉端口，IPv6 去掉方括号），小写。"""
+    host = str(getattr(request, "host", "") or "").strip()
+    if host.startswith("["):  # [::1]:5001
+        end = host.find("]")
+        return host[1:end].lower() if end > 0 else host.lower()
+    return (host.rsplit(":", 1)[0] if ":" in host else host).lower()
+
+
 def _settings_payload() -> dict:
     """给模板的完整设置（含 provider 相关字段与角色模型）。"""
     stored = _load_settings()
@@ -732,14 +1064,47 @@ def _settings_payload() -> dict:
     }
 
 
+#: 运行状态取值。刻意把"正在停止"与"已取消"单独成态：
+#: 早先停止后直接变回 `idle`，于是**界面看不出这次是被中断的**，
+#: 而且最终报告那条路径被 `if is_stopped: return` 直接跳过——
+#: 已经跑出来的步骤、发现与用量全都没落盘。
+STATUS_IDLE = "idle"
+STATUS_RUNNING = "running"
+STATUS_STOPPING = "stopping"
+STATUS_CANCELLED = "cancelled"
+STATUS_FAILED = "failed"
+STATUS_DONE = "done"
+
+#: 真实结束态（可以开始新任务的状态）
+TERMINAL_STATUSES = frozenset(
+    {STATUS_IDLE, STATUS_CANCELLED, STATUS_FAILED, STATUS_DONE}
+)
+
+#: 状态的用户可读文案（界面直接显示）
+STATUS_LABEL = {
+    STATUS_IDLE: "等待开始",
+    STATUS_RUNNING: "正在执行",
+    STATUS_STOPPING: "正在停止",
+    STATUS_CANCELLED: "已中断（部分结果已保存）",
+    STATUS_FAILED: "执行失败",
+    STATUS_DONE: "审计完成",
+}
+
+
 class RunState:
-    """后台审计运行的状态（线程安全）。"""
+    """后台审计运行的状态（线程安全）。
+
+    生命周期：`idle → running → (stopping → cancelled) | failed | done`。
+    `stopping` 是**过渡态**：停止请求已发出，审计线程还在收尾（写部分报告）。
+    这样界面能区分"已经停了"和"正在停"，也能防止在收尾期间重复启动。
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._token = 0
         self._cancel_event = threading.Event()
-        self.status = "idle"
+        self._running = False
+        self.status = STATUS_IDLE
         self.steps: list[dict] = []
         self.events: list[dict] = []
         self.findings: list[dict] = []
@@ -747,6 +1112,7 @@ class RunState:
         self.error = ""
         self.output_path = ""
         self.submission_path = ""
+        self.partial = False
         self.tokens = {
             "prompt_tokens": 0,
             "completion_tokens": 0,
@@ -756,11 +1122,32 @@ class RunState:
             "total_tokens": 0,
         }
 
+    # ---------- 启动 / 停止（互斥，防重叠执行）----------
+
+    def try_begin(self) -> bool:
+        """尝试占用"正在运行"名额。已占用返回 False。
+
+        为什么必须防重叠（P1-5 要求）：两个审计线程会同时写同一个攻面、
+        同一个 `runs/<host>-<ts>` 产物目录与同一个 `STATE`，
+        用量与结论互相污染，而且界面上看不出跑了两份。
+        """
+        with self._lock:
+            if self._running or self.status not in TERMINAL_STATUSES:
+                return False
+            self._running = True
+            return True
+
+    def abort_begin(self) -> None:
+        """释放占位（`try_begin` 成功但后续步骤失败时调用）。"""
+        with self._lock:
+            self._running = False
+
     def start(self) -> int:
         with self._lock:
             self._token += 1
             self._cancel_event.clear()
-            self.status = "running"
+            self._running = True
+            self.status = STATUS_RUNNING
             self.steps = []
             self.events = []
             self.findings = []
@@ -768,6 +1155,7 @@ class RunState:
             self.error = ""
             self.output_path = ""
             self.submission_path = ""
+            self.partial = False
             self.tokens = {
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
@@ -780,13 +1168,15 @@ class RunState:
 
     def add_step(self, step: dict, token: int) -> None:
         with self._lock:
-            if token == self._token and not self._cancel_event.is_set():
+            # 注意：**停止后仍然接收步骤**。收尾阶段（写部分报告、清点发现）
+            # 产生的记录属于"本次运行已完成的成果"，不能因为已经按下停止就丢掉。
+            if token == self._token:
                 self.steps.append(step)
 
     def add_event(self, event: dict, token: int) -> None:
         """记录一次编排事件（计划/波次/子任务起止/预警），供界面展示进度。"""
         with self._lock:
-            if token == self._token and not self._cancel_event.is_set():
+            if token == self._token:
                 self.events.append(event)
                 del self.events[:-200]
 
@@ -822,7 +1212,7 @@ class RunState:
 
     def update_tokens(self, usage: dict, token: int) -> None:
         with self._lock:
-            if token == self._token and not self._cancel_event.is_set():
+            if token == self._token:
                 self.tokens = {
                     "prompt_tokens": int(usage.get("prompt_tokens", 0)),
                     "completion_tokens": int(usage.get("completion_tokens", 0)),
@@ -838,45 +1228,66 @@ class RunState:
         output_path: str,
         token: int,
         submission_path: str = "",
+        *,
+        partial: bool = False,
     ) -> None:
+        """收尾。`partial=True` 表示这次是中断/异常下的部分结果。
+
+        完成与中断都写同一份成果（发现、用量、报告路径），只有 `status`
+        与 `partial` 不同——**中断不等于没有成果**，但报告必须写明不完整。
+        """
         with self._lock:
-            if token == self._token and not self._cancel_event.is_set():
-                self.status = "done"
-                self.findings = list(result.findings)
-                self.summary = result.final_summary
-                self.output_path = output_path
-                self.submission_path = submission_path
-                self.tokens = {
-                    "prompt_tokens": int(getattr(result, "prompt_tokens", 0)),
-                    "completion_tokens": int(getattr(result, "completion_tokens", 0)),
-                    "cache_hit_tokens": int(getattr(result, "cache_hit_tokens", 0)),
-                    "cache_miss_tokens": int(getattr(result, "cache_miss_tokens", 0)),
-                    "estimated_cost": float(getattr(result, "estimated_cost", 0.0)),
-                    "total_tokens": int(getattr(result, "total_tokens", 0)),
-                }
+            if token != self._token:
+                return
+            cancelled = self._cancel_event.is_set()
+            self.status = STATUS_CANCELLED if (partial or cancelled) else STATUS_DONE
+            self.partial = bool(partial or cancelled)
+            self.findings = list(getattr(result, "findings", []) or [])
+            self.summary = str(getattr(result, "final_summary", "") or "")
+            self.output_path = output_path
+            self.submission_path = submission_path
+            self.tokens = {
+                "prompt_tokens": int(getattr(result, "prompt_tokens", 0)),
+                "completion_tokens": int(getattr(result, "completion_tokens", 0)),
+                "cache_hit_tokens": int(getattr(result, "cache_hit_tokens", 0)),
+                "cache_miss_tokens": int(getattr(result, "cache_miss_tokens", 0)),
+                "estimated_cost": float(getattr(result, "estimated_cost", 0.0)),
+                "total_tokens": int(getattr(result, "total_tokens", 0)),
+            }
+            self._running = False
 
     def fail(self, message: str, token: int) -> None:
         with self._lock:
-            if token == self._token and not self._cancel_event.is_set():
-                self.status = "error"
+            if token == self._token:
+                self.status = STATUS_FAILED
                 self.error = message
+                self._running = False
 
     def stop_current(self) -> None:
+        """请求停止：进入 `stopping`，由审计线程收尾后转 `cancelled`。
+
+        **不清空已完成的成果**（早先把 summary/error 清成空串，
+        于是"跑到一半停下"看起来像"什么都没发生"）。
+        """
         with self._lock:
             self._cancel_event.set()
-            if self.status == "running":
-                self.status = "idle"
-                self.summary = ""
-                self.error = ""
+            if self.status == STATUS_RUNNING:
+                self.status = STATUS_STOPPING
 
     def is_stopped(self, token: int) -> bool:
         with self._lock:
             return token != self._token or self._cancel_event.is_set()
 
+    def status_label(self) -> str:
+        return STATUS_LABEL.get(self.status, self.status)
+
     def snapshot(self) -> dict:
         with self._lock:
             return {
                 "status": self.status,
+                "status_label": self.status_label(),
+                "partial": self.partial,
+                "running": self._running,
                 "steps": list(self.steps),
                 "findings": list(self.findings),
                 "summary": self.summary,
@@ -904,15 +1315,106 @@ def _goal_for(mode: str, path: str, target: str) -> str:
     )
 
 
-def _parse_auth_profile(raw: str) -> dict[str, str]:
-    """解析账号 Cookie/Token JSON，例如 {"Cookie":"session=..."}。"""
+def _parse_auth_profile(raw: str, *, label: str = "认证信息") -> dict[str, str]:
+    """解析账号 Cookie/Token JSON，例如 `{"Cookie":"session=..."}`。
+
+    校验必须是**严格**的，因为"配置写错了"和"故意匿名测试"在报告里含义完全不同：
+    早先非法 JSON 直接返回 `{}`，于是一次配置错误会**静默变成匿名评估**——
+    报告里看起来"这些接口匿名也能读"，而真实原因只是 Cookie 没解析成功。
+    那是最危险的一类错误方向（把配置错误写成访问控制缺陷）。
+
+    现在：非法 JSON / 顶层不是对象 / 值不是字符串 → 抛 `ValueError`，
+    并在**启动审计之前**校验（见 `_validate_run_settings`）。
+
+    **错误信息只包含字段名与类型，绝不回显值**——值里就是 Cookie 与 Token。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return {}  # 空 = 明确的匿名身份，不是错误
     try:
-        data = json.loads(raw or "{}")
-    except json.JSONDecodeError:
-        return {}
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{label} 不是合法 JSON（第 {exc.lineno} 行第 {exc.colno} 列：{exc.msg}）。"
+            '正确格式形如 {"Cookie":"name=value"}。'
+            "如需匿名测试请把该栏留空。"
+        ) from exc
     if not isinstance(data, dict):
-        return {}
-    return {str(key): str(value) for key, value in data.items() if str(value)}
+        raise ValueError(
+            f"{label} 必须是 JSON 对象（形如 {{\"Cookie\":\"name=value\"}}），"
+            f"当前是 {type(data).__name__}。"
+        )
+    profile: dict[str, str] = {}
+    for key, value in data.items():
+        name = str(key).strip()
+        if not name:
+            raise ValueError(f"{label} 里有空的请求头名。")
+        if not isinstance(value, str):
+            # 只报类型，不报值
+            raise ValueError(
+                f"{label} 的字段 {name!r} 必须是字符串，当前是 {type(value).__name__}。"
+            )
+        if not value.strip():
+            raise ValueError(f"{label} 的字段 {name!r} 是空字符串，请填写或删除该字段。")
+        profile[name] = value
+    return profile
+
+
+def _parse_auth_profiles(settings: dict) -> dict[str, dict[str, str]]:
+    """解析 A/B 两个身份；任一非法就抛错（由调用方转成用户可见的错误）。"""
+    return {
+        "A": _parse_auth_profile(settings.get("auth_a", ""), label="身份 A 的 Cookie/Token"),
+        "B": _parse_auth_profile(settings.get("auth_b", ""), label="身份 B 的 Cookie/Token"),
+    }
+
+
+def _validate_run_settings(settings: dict) -> dict[str, dict[str, str]]:
+    """启动审计**之前**的校验（把配置错误挡在跑之前，而不是让它在报告里变形）。
+
+    目前只做认证身份解析——它是唯一"错了以后会静默改变结论含义"的配置。
+    返回解析好的身份字典，供 `_run_audit` 复用（避免解析两次）。
+    """
+    try:
+        return _parse_auth_profiles(settings)
+    except ValueError as exc:
+        raise ValueError(f"认证身份配置有误，已阻止启动：{exc}") from exc
+
+
+def _mark_partial(result, settings: dict):
+    """给"被中断"的结果打上不完整标记（**不得让未测区域看起来像安全**）。
+
+    做法很克制、也很重要：
+
+    1. 在总结最前面加一段醒目的中断说明；
+    2. 让报告渲染出"本次运行未完成"；
+    3. **绝不**把未完成的端点/参数写成 `no_issue_found`——那会把"没测"
+       说成"测过没问题"。这里不新增、也不修改任何 coverage/finding。
+
+    与项目最重要的那条不变量一致：没测到 ≠ 已修复 / 已安全。
+    """
+    from .agent import AgentResult
+
+    previous_summary = str(getattr(result, "final_summary", "") or "")
+    note = (
+        "【本次运行被中断，报告不完整】\n"
+        "用户在该审计结束前停止了运行。已经完成的步骤、发现、覆盖记录与用量"
+        "都**如实保存在本报告中**；但**尚未测试的端点与参数没有被测过**，"
+        "它们既不代表安全，也不代表已修复。请把它当作一次未完成的评估，"
+        "需要完整结论时请重新运行。\n"
+    )
+    if isinstance(result, AgentResult):
+        result.final_summary = note + ("\n" + previous_summary if previous_summary else "")
+        result.finish_reason = "cancelled"
+        return result
+
+    # 兜底：极少数情况下 result 不是 AgentResult（例如单代理分支返回别的类型），
+    # 就地补两个属性，report 渲染器读的就是它们。
+    try:
+        result.final_summary = note + ("\n" + previous_summary if previous_summary else "")
+        result.finish_reason = "cancelled"
+    except Exception:  # noqa: BLE001 标注失败也不能让收尾崩掉
+        pass
+    return result
 
 
 def _run_audit(settings: dict, token: int) -> None:
@@ -965,10 +1467,9 @@ def _run_audit(settings: dict, token: int) -> None:
         from .cli import _build_llm_pool
 
         llm, llm_pool = _build_llm_pool(config)
-        auth_profiles = {
-            "A": _parse_auth_profile(settings.get("auth_a", "")),
-            "B": _parse_auth_profile(settings.get("auth_b", "")),
-        }
+        # 身份解析已在 `/api/run` 里预先校验过（错误会以 400 返回给界面）；
+        # 这里再解析一次拿到结果——线程里不做"静默降级成匿名"。
+        auth_profiles = _parse_auth_profiles(settings)
         budget = Budget(
             BudgetLimits(
                 max_cost=config.max_cost,
@@ -1039,12 +1540,18 @@ def _run_audit(settings: dict, token: int) -> None:
                 should_stop=lambda: STATE.is_stopped(token),
             )
             artifacts.save_surface(surface)
-        if STATE.is_stopped(token):
-            return
+        # ---- 收尾：**无论正常结束、用户中断还是异常，都要落盘成果** ----
+        #
+        # 早先这里是 `if STATE.is_stopped(token): return`——按下停止之后
+        # 连报告都不写，已经跑出来的发现、用量与覆盖率全部丢掉。
+        # 那正是 P1-5 要修的第一件事：中断时成果必须保存，且报告要**写明不完整**。
+        interrupted = STATE.is_stopped(token)
         output_value = settings.get("output") or DEFAULTS["output"]
         output_path = Path(output_value)
         if not output_path.is_absolute():
             output_path = PROJECT_ROOT / output_path
+        if interrupted:
+            result = _mark_partial(result, settings)
         output = write_report(result, goal, output_path)
         package = write_butian_package(result, output)
         STATE.finish(
@@ -1052,33 +1559,60 @@ def _run_audit(settings: dict, token: int) -> None:
             str(output),
             token,
             submission_path=str(package) if package else "",
+            partial=interrupted,
         )
     except Exception as exc:  # noqa: BLE001  # 后台线程兜底，任何异常转成界面错误
-        STATE.fail(f"{type(exc).__name__}: {exc}", token)
-
+        STATE.fail(_scrub_secrets(f"{type(exc).__name__}: {exc}"), token)
 
 def create_app() -> Flask:
     app = Flask(__name__)
+    #: 每次启动换一次；只有真正渲染出来的那个页面知道它（见 `index`）。
+    local_token = secrets.token_urlsafe(32)
+    app.config["HEXHOUND_LOCAL_TOKEN"] = local_token
+
+    def _deny(reason: str):
+        return jsonify({"error": reason}), 403
+
+    @app.before_request
+    def _guard_local_control_plane():
+        """本机控制面的准入检查：Host 只能是本机 + 有副作用请求必须带会话令牌。
+
+        这两条都不是"洁癖"，对应两个真实可利用的场景（见模块顶部常量注释）：
+        DNS rebinding 读走配置；恶意页面借本机发起审计/改配置/弹登录窗。
+        """
+        if _request_hostname() not in _LOCAL_HOSTS:
+            return _deny("拒绝访问：本机控制面只接受 127.0.0.1 / localhost。")
+        origin = request.headers.get("Origin") or request.headers.get("Referer") or ""
+        if origin and (urlparse(origin).hostname or "").lower() not in _LOCAL_HOSTS:
+            return _deny("拒绝访问：请求来源不是本机页面。")
+        if request.method != "GET" and request.headers.get(TOKEN_HEADER) != local_token:
+            return _deny("拒绝执行：缺少本机会话令牌，请在本程序窗口内操作。")
+        return None
 
     @app.route("/")
     def index() -> str:
-        return render_template_string(HTML, **_settings_payload())
+        return render_template_string(HTML, local_token=local_token, **_settings_payload())
 
     @app.route("/api/providers")
     def providers_api() -> str:
-        """预设清单 + 当前生效提供商 + 已保存的密钥（只回显掩码，不回传明文）。"""
+        """预设清单 + 当前生效提供商 + 已保存密钥的**掩码**。
+
+        这里**绝不回传明文密钥**。早先为了"一键填入密钥框"而回传了明文 `keys`，
+        等于把 `settings.json` 里的凭据通过 HTTP 暴露给任何能访问本机端口的
+        东西（含 DNS rebinding 页面）。现在改成：只回显掩码与"是否已保存"，
+        真正要用密钥时由**服务端**按 provider 取（`/api/provider_test`、
+        `_resolve_llm_settings`），密钥不再经过浏览器。
+        """
         stored = _load_settings()
         saved = _provider_keys()
         masked = {key: mask_key(value) for key, value in saved.items()}
         active = _active_provider(stored)
-        # 界面上"填入该提供商密钥"需要明文才能填进密码框，因此只对本机 GUI 回传；
-        # 界面本身就是本地单用户工具，能力等价于直接读 settings.json。
         return jsonify(
             {
                 "presets": describe_presets(),
                 "active": active,
-                "keys": saved,
                 "keys_masked": masked,
+                "keys_saved": {key: True for key in saved},
                 "env_keys": {
                     preset["key"]: bool(os.getenv(preset["env_key"], "").strip())
                     for preset in describe_presets()
@@ -1097,6 +1631,16 @@ def create_app() -> Flask:
         api_key = str(data.get("api_key") or "").strip()
         if not api_key:
             return jsonify({"error": "密钥为空。"}), 400
+        if _looks_like_mask(api_key):
+            return (
+                jsonify(
+                    {
+                        "error": "这看起来是界面回显的掩码（含 …），不是真实密钥。"
+                        "密钥已在服务端保存，留空即可继续使用；要换密钥请粘贴完整密钥。"
+                    }
+                ),
+                400,
+            )
         stored = _load_settings()
         try:
             keys = json.loads(stored.get("provider_keys") or "{}")
@@ -1135,8 +1679,12 @@ def create_app() -> Flask:
         try:
             check = client.test_connection()
         except Exception as exc:  # noqa: BLE001 兜底：任何异常都转成可读结论
-            return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
-        return jsonify(check.to_dict())
+            # 打码后再返回：提供商的鉴权报错经常原样回显 key。
+            return jsonify({"error": _scrub_secrets(f"{type(exc).__name__}: {exc}", api_key)}), 500
+        payload = check.to_dict()
+        # 只回掩码：界面据此显示"已保存 sk-123…abcd"，明文不出服务端。
+        payload["masked"] = mask_key(api_key)
+        return jsonify(payload)
 
     @app.route("/api/write_env", methods=["POST"])
     def write_env_api() -> str:
@@ -1176,10 +1724,27 @@ def create_app() -> Flask:
     @app.route("/api/run", methods=["POST"])
     def run() -> str:
         data = request.get_json(force=True) or {}
-        _save_settings(data)
-        token = STATE.start()
+        # 先校验再落盘：配置错误必须以 **400 + 明确原因** 返回给界面，
+        # 而不是保存下来、然后在后台线程里静默降级成匿名评估。
+        try:
+            _validate_run_settings(data)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        # 同一个运行未停止前不允许重复启动（否则两个审计线程会同时改同一份
+        # 攻面与产物目录，用量与结论互相污染）。
+        if not STATE.try_begin():
+            return (
+                jsonify({"error": "已有审计任务在运行或正在停止，请先等待其结束或点击停止。"}),
+                409,
+            )
+        try:
+            _save_settings(data)
+            token = STATE.start()
+        except Exception as exc:  # noqa: BLE001 落盘失败要把占位释放掉
+            STATE.abort_begin()
+            return jsonify({"error": f"保存配置失败：{exc}"}), 500
         threading.Thread(target=_run_audit, args=(data, token), daemon=True).start()
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "token": token})
 
     @app.route("/api/stop", methods=["POST"])
     def stop() -> str:
@@ -1205,7 +1770,8 @@ def create_app() -> Flask:
         try:
             result = capture_login_state(url, timeout_sec=timeout)
         except Exception as exc:  # noqa: BLE001  # 登录窗口异常兜底
-            return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+            detail = f"{type(exc).__name__}: {exc}"
+            return jsonify({"error": _scrub_secrets(detail)}), 500
         return jsonify(result)
 
     @app.route("/api/status")
@@ -1256,7 +1822,8 @@ def create_app() -> Flask:
             timeout = max(5, min(timeout, 120))
             image_bytes = capture_url(url, timeout=timeout)
         except Exception as exc:  # noqa: BLE001  # 截图接口兜底
-            return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+            detail = f"{type(exc).__name__}: {exc}"
+            return jsonify({"error": _scrub_secrets(detail)}), 500
 
         question = str(data.get("question") or "请描述这个页面，并指出可能存在漏洞的可疑点。")
         answer = "截图成功。"
@@ -1273,7 +1840,8 @@ def create_app() -> Flask:
                 )
                 answer = client.analyze(image_bytes, "image/png", question)
             except Exception as exc:  # noqa: BLE001  # 视觉接口兜底
-                answer = f"截图成功，但视觉分析失败：{type(exc).__name__}: {exc}"
+                detail = _scrub_secrets(f"{type(exc).__name__}: {exc}")
+                answer = f"截图成功，但视觉分析失败：{detail}"
         else:
             answer = "截图成功；未配置 VISION_API_KEY，无法自动分析。"
 
@@ -1306,7 +1874,8 @@ def create_app() -> Flask:
             answer = client.analyze(image_bytes, mime, question)
             return jsonify({"answer": answer})
         except Exception as exc:  # noqa: BLE001  # 视觉接口兜底
-            return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+            detail = f"{type(exc).__name__}: {exc}"
+            return jsonify({"error": _scrub_secrets(detail, api_key)}), 500
 
     return app
 

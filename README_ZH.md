@@ -766,6 +766,10 @@ hexhound setup     # 逐个询问该填什么（含提供商、按角色模型�
 
 ## 图形化界面
 
+双击项目根目录的 `hexhound.exe` 打开独立 Windows 桌面窗口，使用 WebView2 嵌入工作台，
+不打开外部浏览器，无地址栏和控制台窗口。关闭窗口即退出桌面进程。命令行操作请使用已安装的
+`hexhound` 命令或单独构建的 `dist/hexhound.exe`。仍可通过以下命令使用浏览器模式：
+
 ```bash
 hexhound gui       # 默认 http://127.0.0.1:5001
 ```
@@ -773,13 +777,21 @@ hexhound gui       # 默认 http://127.0.0.1:5001
 界面提供：可视化配置（含编排与预算参数）、一键开始审计、**编排进度**（计划 → 波次 → 子任务起止）、
 实时步骤流、结论区/候选区分开展示、报告查看与提交包下载。配置自动保存在 `~/.hexhound/settings.json`。
 
+响应式深色工作台通过侧栏切换审计、报告与视觉分析。概览卡实时展示步骤、已复核发现、Token
+与预估费用；执行参数可折叠，日志可关闭自动跟随。刷新或关闭页面不会取消审计，请使用中断按钮。
+模型设置使用支持键盘操作的弹窗（Escape 关闭）。无需前端构建或额外 UI 依赖。
+
+浏览器冒烟测试：`python -m pytest tests/test_gui_frontend.py`（需要 Playwright；Windows 默认使用
+Edge，其他平台使用 Chromium，可通过 `HEXHOUND_BROWSER` 指定浏览器通道）。测试使用隔离配置和
+模拟执行/视觉响应，不访问目标或调用 LLM。
+
 界面还内置**识图**面板：上传截图（如目标页面的报错/验证截图），交给多模态视觉模型分析，
 辅助漏洞验证。视觉模型通过 `.env` 的 `VISION_API_KEY` / `VISION_BASE_URL` / `VISION_MODEL` 配置。
 
 ## 构建可执行文件
 
 ```bash
-build_desktop.bat                     # 装依赖 → 构建 hexhound.exe → 复制到项目根目录
+build_desktop.bat                     # 安装依赖 → 构建桌面窗口版 → 复制为根目录 hexhound.exe
 python -m PyInstaller --noconfirm --clean HexHound.spec          # 只构建 CLI
 python -m PyInstaller --noconfirm --clean HexHound-desktop.spec  # 桌面窗口版（需 pywebview）
 ```

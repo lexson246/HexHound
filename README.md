@@ -879,6 +879,11 @@ hexhound setup     # asks for provider, per-role models, budget/concurrency/rate
 
 ## GUI
 
+Double-click the project-root `hexhound.exe` to open the standalone Windows desktop window.
+It embeds the console with WebView2, without an external browser, address bar or console window.
+Closing the window exits the desktop process. For CLI commands, use the installed `hexhound`
+command or the separate CLI build in `dist/hexhound.exe`. Browser mode remains available:
+
 ```bash
 hexhound gui       # default http://127.0.0.1:5001
 ```
@@ -888,6 +893,16 @@ audit start, an **orchestration progress** view (plan → wave → sub-task star
 stream, verified findings and candidates shown separately, report viewing and submission-package
 download. Settings persist to `~/.hexhound/settings.json`.
 
+The responsive dark workspace separates the audit console, reports and visual analysis through
+sidebar navigation. Live cards show steps, reviewed findings, token usage and estimated cost;
+execution parameters are collapsible, and log auto-follow can be switched off. Refreshing or
+closing the page does not cancel an audit; use the stop button explicitly. Model settings use a
+keyboard-accessible dialog (Escape to close). No frontend build or additional UI dependency is needed.
+
+Browser smoke check: `python -m pytest tests/test_gui_frontend.py` (requires Playwright and Edge
+on Windows, Chromium elsewhere; set `HEXHOUND_BROWSER` to override the browser channel).
+The check uses isolated settings and simulated execution/vision responses, with no target or LLM traffic.
+
 There is also a built-in **image analysis** panel: upload a screenshot (an error page, a proof
 screenshot) and have a multimodal model analyze it. Configure it through `VISION_API_KEY` /
 `VISION_BASE_URL` / `VISION_MODEL` in `.env`.
@@ -895,7 +910,7 @@ screenshot) and have a multimodal model analyze it. Configure it through `VISION
 ## Building the executable
 
 ```bash
-build_desktop.bat                     # installs deps, builds hexhound.exe, copies it to the root
+build_desktop.bat                     # builds desktop window app, copies it to root as hexhound.exe
 python -m PyInstaller --noconfirm --clean HexHound.spec          # CLI build only
 python -m PyInstaller --noconfirm --clean HexHound-desktop.spec  # desktop window build (needs pywebview)
 ```

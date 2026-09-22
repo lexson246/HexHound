@@ -4,8 +4,7 @@ chcp 65001 >nul
 
 echo ============================================
 echo  HexHound build script
-echo  Output: .\hexhound.exe  (CLI, console)
-echo          dist\HexHound-desktop.exe (GUI, optional)
+echo  Output: .\hexhound.exe  (desktop window, no console)
 echo ============================================
 echo.
 
@@ -16,43 +15,32 @@ if errorlevel 1 (
 )
 
 echo [1/4] Installing build dependencies...
-python -m pip install -e ".[dev]" >nul
-python -m pip install --upgrade pyinstaller >nul
+python -m pip install -e ".[dev,lab,desktop]"
 if errorlevel 1 (
-    echo [ERROR] Failed to install PyInstaller.
+    echo [ERROR] Failed to install desktop dependencies.
     exit /b 1
 )
 
-echo [2/4] Building CLI executable (hexhound.exe)...
-python -m PyInstaller --noconfirm --clean HexHound.spec
+echo [2/4] Building desktop executable...
+python -m PyInstaller --noconfirm --clean HexHound-desktop.spec
 if errorlevel 1 (
     echo [ERROR] PyInstaller failed.
     exit /b 1
 )
 
 echo [3/4] Copying executable to project root...
-copy /Y dist\hexhound.exe hexhound.exe >nul
+copy /Y dist\HexHound-desktop.exe hexhound.exe >nul
 if errorlevel 1 (
-    echo [ERROR] Failed to copy dist\hexhound.exe
+    echo [ERROR] Failed to copy dist\HexHound-desktop.exe
     exit /b 1
 )
 
-echo [4/4] Smoke test...
-hexhound.exe --version
-if errorlevel 1 (
-    echo [WARN] Smoke test failed - check the executable manually.
-) else (
-    echo       Smoke test passed.
-)
+echo [4/4] Desktop build complete.
 
 echo.
-echo Done. Run it with:
-echo     hexhound.exe providers
-echo     hexhound.exe setup
-echo     hexhound.exe audit --target http://127.0.0.1:5000 --mode blackbox
+echo Double-click hexhound.exe to open the desktop window.
 echo.
-echo Optional desktop build (needs pywebview):
-echo     python -m pip install -e ".[desktop]"
-echo     python -m PyInstaller --noconfirm --clean HexHound-desktop.spec
+echo Optional CLI build (dist\hexhound.exe):
+echo     python -m PyInstaller --noconfirm --clean HexHound.spec
 echo.
 endlocal

@@ -307,7 +307,11 @@ class ErrorClassificationTests(unittest.TestCase):
 
 
 class GuiProviderPanelTests(EnvIsolation):
-    """设置面板的后端接口（用 Flask test_client，不发真实请求）。"""
+    """设置面板的后端接口（用 Flask test_client，不发真实请求）。
+
+    注意：面板接口现在要求本机会话令牌（`gui.TOKEN_HEADER`）——那是防 CSRF 的
+    真实契约，所以这里**如实带上令牌**，而不是把校验关掉。
+    """
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -316,6 +320,13 @@ class GuiProviderPanelTests(EnvIsolation):
         cls.gui = gui_module
         cls.app = gui_module.create_app()
         cls.client = cls.app.test_client()
+        cls.token = cls.app.config["HEXHOUND_LOCAL_TOKEN"]
+
+    def post(self, *args, **kwargs):
+        """带会话令牌的 POST（模拟界面自己的请求）。"""
+        headers = dict(kwargs.pop("headers", None) or {})
+        headers.setdefault(self.gui.TOKEN_HEADER, self.token)
+        return self.client.post(*args, headers=headers, **kwargs)
 
     def test_index_renders_provider_panel(self) -> None:
         html = self.client.get("/").get_data(as_text=True)
@@ -350,7 +361,7 @@ class GuiProviderPanelTests(EnvIsolation):
                 patch.object(self.gui, "_load_settings", lambda: dict(saved)),
                 patch.object(self.gui, "_save_settings", fake_save),
             ):
-                resp = self.client.post(
+                resp = self.post(
                     "/api/provider_key",
                     json={"provider": "moonshot", "api_key": "sk-moonshot-abcdef123456"},
                 )
@@ -362,16 +373,16 @@ class GuiProviderPanelTests(EnvIsolation):
             self.assertEqual(keys["moonshot"], "sk-moonshot-abcdef123456")
 
     def test_provider_key_rejects_empty(self) -> None:
-        resp = self.client.post("/api/provider_key", json={"provider": "openai", "api_key": "  "})
+        resp = self.post("/api/provider_key", json={"provider": "openai", "api_key": "  "})
         self.assertEqual(resp.status_code, 400)
 
     def test_provider_test_requires_model(self) -> None:
-        resp = self.client.post("/api/provider_test", json={"provider": "custom", "model": ""})
+        resp = self.post("/api/provider_test", json={"provider": "custom", "model": ""})
         self.assertEqual(resp.status_code, 400)
         self.assertIn("模型名", resp.get_json()["error"])
 
     def test_provider_test_requires_url_for_custom(self) -> None:
-        resp = self.client.post(
+        resp = self.post(
             "/api/provider_test", json={"provider": "custom", "model": "local-model"}
         )
         self.assertEqual(resp.status_code, 400)
@@ -382,7 +393,7 @@ class GuiProviderPanelTests(EnvIsolation):
             os.environ, {"LLM_API_KEY": ""}, clear=False
         ):
             os.environ.pop("LLM_API_KEY", None)
-            resp = self.client.post(
+            resp = self.post(
                 "/api/provider_test", json={"provider": "openai", "model": "gpt-4o-mini"}
             )
         self.assertEqual(resp.status_code, 400)
@@ -403,7 +414,7 @@ class GuiProviderPanelTests(EnvIsolation):
                 )
 
         with patch.object(self.gui, "LLMClient", FakeClient):
-            resp = self.client.post(
+            resp = self.post(
                 "/api/provider_test",
                 json={"provider": "openai", "model": "gpt-4o-mini", "api_key": "sk-x"},
             )
@@ -413,14 +424,14 @@ class GuiProviderPanelTests(EnvIsolation):
 
     def test_provider_test_rejects_empty_provider(self) -> None:
         """没选提供商时，"自定义"需要一个 base_url；空提供商应给出明确提示。"""
-        resp = self.client.post("/api/provider_test", json={"provider": "", "model": "m"})
+        resp = self.post("/api/provider_test", json={"provider": "", "model": "m"})
         self.assertEqual(resp.status_code, 400)
         self.assertIn("base_url", resp.get_json()["error"])
 
     def _post_write_env(self, tmp: str, payload: dict):
         """write_env 写到 `Path.cwd()/.env`（打包后即 exe 同目录），测试里换掉 cwd。"""
         with patch("pathlib.Path.cwd", staticmethod(lambda: Path(tmp))):
-            return self.client.post("/api/write_env", json=payload)
+            return self.post("/api/write_env", json=payload)
 
     def test_write_env_updates_keys_and_keeps_comments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -33,6 +33,7 @@ Strix 通过 CDP 驱动 headless Chromium，能做 a11y 快照、截图、网络
 """
 from __future__ import annotations
 
+import secrets
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
@@ -54,12 +55,49 @@ CONFIRMED_LEVEL = "executed"
 MARKER_ATTRIBUTE = "data-hexhound-xss"
 EXECUTION_FLAG = "__hexhound_xss_executed__"
 
-#: 默认载荷：`<img src=x onerror=...>` 是最通用的"能执行就一定会执行"的形式。
-DEFAULT_PAYLOADS: tuple[str, ...] = (
-    '<img src=x onerror="document.documentElement.setAttribute(\'data-hexhound-xss\',\'1\')">',
-    "'\"><svg onload=\"document.documentElement.setAttribute('data-hexhound-xss','1')\">",
-    '<script>document.documentElement.setAttribute("data-hexhound-xss","1")</script>',
+#: 载荷模板里的**标记值占位符**。每次验证都会换成一个随机 nonce（见 `build_payloads`）。
+#:
+#: 为什么非要每次不同（实测踩到的假阳）：原来三种载荷都写死标记值 `1`，
+#: 于是"DOM 上存在这个属性"无法证明是**本次**注入造成的——
+#: 上一次验证留下的属性、页面自己写的同名属性，都会被算成本次执行的证据。
+#: 换成 nonce 之后，"标记值等于本次 nonce"才是证据，因果链闭合。
+_MARKER_TOKEN = "__HEXHOUND_MARKER__"
+
+#: 载荷模板（`_MARKER_TOKEN` 处填本次 nonce）。
+PAYLOAD_TEMPLATES: tuple[str, ...] = (
+    '<img src=x onerror="document.documentElement.setAttribute(\''
+    + MARKER_ATTRIBUTE
+    + "','"
+    + _MARKER_TOKEN
+    + "')\">",
+    "'\"><svg onload=\"document.documentElement.setAttribute('"
+    + MARKER_ATTRIBUTE
+    + "','"
+    + _MARKER_TOKEN
+    + "')\">",
+    "<script>document.documentElement.setAttribute(\""
+    + MARKER_ATTRIBUTE
+    + '","'
+    + _MARKER_TOKEN
+    + '")</script>',
 )
+
+#: 默认载荷（标记值为固定的 `1`，保持对外字符串稳定）。
+DEFAULT_PAYLOADS: tuple[str, ...] = tuple(
+    template.replace(_MARKER_TOKEN, "1") for template in PAYLOAD_TEMPLATES
+)
+
+
+def new_marker() -> str:
+    """生成一次验证专用的标记值（随机、无副作用）。"""
+    return "hh" + secrets.token_hex(8)
+
+
+def build_payloads(marker: str) -> tuple[str, ...]:
+    """用本次验证的标记值生成载荷。"""
+    value = str(marker or "").strip() or "1"
+    return tuple(template.replace(_MARKER_TOKEN, value) for template in PAYLOAD_TEMPLATES)
+
 
 #: 判定"被 CSP 拦下"的迹象（console 里会有这些字样）。
 _CSP_MARKERS = (
@@ -266,6 +304,39 @@ def _appears(payload: str, text: str) -> bool:
     return False
 
 
+def _flag_matches(value: Any, marker: str) -> bool:
+    """执行标记是否属于**本次**验证。
+
+    `marker` 为空 = 调用方没有提供 nonce（只做纯判据测试），此时任何真值都算数；
+    给了 nonce 就必须**等于**它：不同 nonce 的标记只能说明"页面别处执行过别的载荷"，
+    不能证明本次 payload 执行了。
+    """
+    if not value:
+        return False
+    if not marker:
+        return True
+    return str(value) == marker
+
+
+def _dialog_shows_payload(message: str, payload: str, marker: str) -> bool:
+    """对话框内容是否**可归因于本次载荷**。
+
+    只有两种归因才算证据：内容里出现本次载荷原文，或出现本次 nonce。
+    页面自己弹的 `alert('请输入用户名')` 与本次注入毫无关系——
+    把它算成"执行了"就是确认级误报。
+
+    注意 `payload` 必须用**实际使用的**载荷：早先这里写的是函数参数
+    （默认为空串），而 `"" in 任何文本` 恒为真，于是每个普通弹窗都会被
+    标注成"对话框内容包含 payload"。
+    """
+    text = str(message or "")
+    if not text:
+        return False
+    if payload and payload in text:
+        return True
+    return bool(marker) and marker in text
+
+
 def classify(
     *,
     payload: str,
@@ -275,6 +346,7 @@ def classify(
     execution_signals: list[str] | None = None,
     console: list[dict[str, Any]] | None = None,
     blocked_by: str = "",
+    marker_value: str = "",
 ) -> str:
     """把观测结果分级。**这是整个模块的核心判据**，单独测。
 
@@ -284,10 +356,17 @@ def classify(
     `dom` 与 `reflected` 的判据包含**转义与 URL 编码形式**（见 `_appears`）：
     被转义的输出点仍然是一个输出点，把它判成 `absent` 是低估风险，
     而低估风险比高估更危险——读者会因此不再跟进这个参数。
+
+    `marker_value`（本次验证的 nonce）给出时，执行标记必须与它相符才算数；
+    `execution_signals` 由调用方负责**只**放入已归因到本次载荷的信号。
     """
     flags = executed_flags or {}
     signals = list(execution_signals or [])
-    if flags.get(MARKER_ATTRIBUTE) or flags.get(EXECUTION_FLAG) or signals:
+    if (
+        _flag_matches(flags.get(MARKER_ATTRIBUTE), marker_value)
+        or _flag_matches(flags.get(EXECUTION_FLAG), marker_value)
+        or signals
+    ):
         return "executed"
     if blocked_by:
         return "blocked"
@@ -417,15 +496,19 @@ class BrowserVerifier:
                 observation.rendered_html = page.content()
             except Exception:  # noqa: BLE001
                 observation.rendered_html = ""
-            # 执行标记：脚本改写 DOM 属性 / 显式设置全局变量 / 触发 dialog
+            # 执行标记：脚本改写 DOM 属性 / 显式设置全局变量。
+            # 取的是**值**而不是"有没有"：值要和本次 nonce 对上才算本次执行的证据。
             try:
                 observation.executed_flags = page.evaluate(
                     """() => {
                         const out = {};
                         const root = document.documentElement;
-                        if (root && root.hasAttribute('data-hexhound-xss')) out['data-hexhound-xss'] = true;
-                        if (window.__hexhound_xss_executed__) out['__hexhound_xss_executed__'] = true;
-                        if (document.querySelector('[data-hexhound-xss]')) out['data-hexhound-xss'] = true;
+                        const attr = root && root.getAttribute('data-hexhound-xss');
+                        if (attr) out['data-hexhound-xss'] = attr;
+                        const anywhere = document.querySelector('[data-hexhound-xss]');
+                        if (anywhere && !attr) out['data-hexhound-xss'] = anywhere.getAttribute('data-hexhound-xss');
+                        const flag = window.__hexhound_xss_executed__;
+                        if (flag) out['__hexhound_xss_executed__'] = (typeof flag === 'string' ? flag : true);
                         return out;
                     }"""
                 ) or {}
@@ -482,20 +565,35 @@ class BrowserVerifier:
 
         `baseline=True` 时先取一次**不带 payload** 的页面：payload 在基线里
         就出现（页面自己就含这段文本）时判据失效，此时明确标注而不是给结论。
+
+        **执行证据必须能归因到本次载荷**（两条独立要求，都是实测假阳驱动的）：
+
+        1. 每次验证用**自己的随机标记值**（`new_marker`）。DOM 标记属性 / 全局变量
+           的值必须等于本次 nonce——上一次验证残留、页面自己写的同名标记都不算。
+        2. 对话框只在**内容与本次载荷相关**（含载荷原文或含本次 nonce）时才算执行证据。
+           页面自己弹的 `alert('请输入用户名')` 与注入无关，早先却直接把结论推成
+           `executed`（**确认级误报**：payload 明明躺在 `<textarea>` 里没执行）。
+           基线里已有的弹窗同样被扣除。
         """
-        chosen = payload or DEFAULT_PAYLOADS[0]
+        method_value = method.upper()
+        if method_value not in ("GET", "POST"):
+            raise ValueError(f"浏览器 XSS 验证只支持 GET/POST，收到 {method!r}。")
+
+        # 自定义载荷无法带我们的标记值，此时只能靠"载荷原文"归因。
+        marker = "" if payload else new_marker()
+        chosen = payload or build_payloads(marker)[0]
         target_url = url
         if param:
             from urllib.parse import quote
 
             separator = "&" if "?" in url else "?"
             target_url = f"{url}{separator}{param}={quote(chosen, safe='')}"
-        if method.upper() not in ("GET", "POST"):
-            raise ValueError(f"浏览器 XSS 验证只支持 GET/POST，收到 {method!r}。")
 
         notes: list[str] = []
+        baseline_dialogs: list[str] = []
         if baseline:
             baseline_observation = self.observe(url, wait_ms=wait_ms)
+            baseline_dialogs = list(baseline_observation.dialogs)
             if chosen in baseline_observation.raw_body or chosen in baseline_observation.rendered_html:
                 notes.append(
                     "基线页面里**本来就含**这段 payload 文本，本次判据不可靠——"
@@ -504,20 +602,33 @@ class BrowserVerifier:
 
         observation = self.observe(target_url, wait_ms=wait_ms)
         signals: list[str] = []
-        if observation.executed_flags.get(MARKER_ATTRIBUTE):
-            signals.append("DOM 上出现了执行标记属性 " + MARKER_ATTRIBUTE)
-        if observation.executed_flags.get(EXECUTION_FLAG):
+        if _flag_matches(observation.executed_flags.get(MARKER_ATTRIBUTE), marker):
+            signals.append(
+                f"DOM 上出现了执行标记属性 {MARKER_ATTRIBUTE}={marker}"
+                if marker
+                else "DOM 上出现了执行标记属性 " + MARKER_ATTRIBUTE
+            )
+        if _flag_matches(observation.executed_flags.get(EXECUTION_FLAG), marker):
             signals.append("页面设置了执行标记全局变量 " + EXECUTION_FLAG)
-        if observation.dialogs:
-            signals.append(f"页面弹出了对话框（{len(observation.dialogs)} 个）")
-        if any(payload in str(item) for item in observation.dialogs):
-            signals.append("对话框内容包含 payload")
+
+        # 只把"基线里没有的"弹窗纳入考虑，再只把"能归因到本次载荷的"当证据。
+        fresh_dialogs = [d for d in observation.dialogs if d not in baseline_dialogs]
+        correlated = [
+            message for message in fresh_dialogs if _dialog_shows_payload(message, chosen, marker)
+        ]
+        if correlated:
+            signals.append(f"页面弹出了与本次载荷相关的对话框（{len(correlated)} 个）")
+        elif fresh_dialogs:
+            notes.append(
+                f"页面弹出了 {len(fresh_dialogs)} 个对话框，但内容与本次载荷无关"
+                "（页面自身行为，如表单校验提示）——**不作为执行证据**。"
+            )
 
         blocked_by = ""
         joined_console = " ".join(
             str(item.get("text") or "") for item in observation.console
         ).lower()
-        if any(marker in joined_console for marker in _CSP_MARKERS):
+        if any(marker_text in joined_console for marker_text in _CSP_MARKERS):
             blocked_by = "CSP / 浏览器安全策略"
 
         level = classify(
@@ -528,6 +639,7 @@ class BrowserVerifier:
             execution_signals=signals,
             console=observation.console,
             blocked_by=blocked_by,
+            marker_value=marker,
         )
         verdict = XssVerdict(
             level=level,
@@ -552,9 +664,13 @@ class BrowserVerifier:
         return verdict
 
 
-def verification_payloads(limit: int = 0) -> list[str]:
-    """返回可用的无破坏性验证载荷（供工具描述与测试共用）。"""
-    payloads = list(DEFAULT_PAYLOADS)
+def verification_payloads(limit: int = 0, marker: str = "") -> list[str]:
+    """返回可用的无破坏性验证载荷（供工具描述与测试共用）。
+
+    给了 `marker` 就返回**带该标记值**的载荷（真实验证走这条，见 `build_payloads`）；
+    否则返回对外稳定的默认载荷。
+    """
+    payloads = list(build_payloads(marker) if marker else DEFAULT_PAYLOADS)
     return payloads[:limit] if limit else payloads
 
 
@@ -603,13 +719,16 @@ __all__ = [
     "DEFAULT_PAYLOADS",
     "EXECUTION_FLAG",
     "MARKER_ATTRIBUTE",
+    "PAYLOAD_TEMPLATES",
     "VERDICT_LEVELS",
     "BrowserUnavailable",
     "BrowserVerifier",
     "PageObservation",
     "ScopeRefused",
     "XssVerdict",
+    "build_payloads",
     "classify",
+    "new_marker",
     "playwright_available",
     "summarize_verdict",
     "verification_payloads",
