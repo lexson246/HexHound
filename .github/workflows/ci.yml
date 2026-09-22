@@ -5,9 +5,12 @@ name: CI
 # 无从回答。更实际的问题是：这个项目在 Windows 上开发、在 WSL/Linux 上跑沙箱，
 # **两端行为必须一致**——只有矩阵构建能把"在我机器上能过"变成可核对的事实。
 #
-# 三个作业的分工：
+# 作业的分工：
 #   lint        静态检查（ruff 已经配置在 pyproject.toml 里）
 #   test        两个平台跑全部单元测试（第三方依赖只用 pyproject 里声明的）
+#   gui         **显式**装上 Flask + Playwright + 浏览器，跑界面与浏览器验证层；
+#               依赖缺失在这里是**失败**而不是跳过（HEXHOUND_REQUIRE_GUI=1）
+#   desktop     Windows 上真的构建桌面版 exe，并校验它是窗口子系统（不弹控制台）
 #   self-check  不需要任何 API key 的确定性自检（工具层检测能力 + 编排链路）
 
 on:
@@ -41,7 +44,7 @@ jobs:
       - name: Install ruff
         run: python -m pip install --upgrade pip ruff
       - name: Ruff check
-        run: python -m ruff check src tests
+        run: python -m ruff check src tests tools
       - name: Ruff format check (advisory)
         # 格式不是门禁：这个项目的注释与提示词是中文，行宽规则对它不友好。
         # 这里只报告差异，不因此让构建失败。
@@ -74,6 +77,67 @@ jobs:
         # pytest 的退出码不会因为 skip 而失败，但"跳过数量突然变多"通常意味着
         # 某个可选依赖悄悄缺失、一整层测试没跑。这里给出可见的数字。
         run: python -m pytest -q -rs 2>&1 | tail -20
+
+  gui:
+    name: gui (frontend + real browser)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install project + GUI dependencies
+        # 刻意与 test 作业相反：这里**必须**装上 Playwright 与浏览器，
+        # 因为界面层与浏览器验证层是"依赖没装就等于没测"的那一类。
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,lab]"
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
+      - name: Frontend smoke test (real browser, isolated settings)
+        # HEXHOUND_REQUIRE_GUI=1：缺依赖/缺浏览器时**失败**，不许静默跳过。
+        env:
+          HEXHOUND_REQUIRE_GUI: "1"
+          HEXHOUND_BROWSER: chromium
+        run: python -m pytest tests/test_gui_frontend.py tests/test_xssverify.py tests/test_gui_settings.py -q -rs
+      - name: Local console smoke (no window, no target, no model)
+        run: python tools/smoke_gui_server.py
+
+  desktop:
+    name: desktop exe (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,lab,desktop]"
+      - name: Build desktop executable
+        run: python -m PyInstaller --noconfirm --clean HexHound-desktop.spec
+      - name: Install it the way users get it (project root)
+        run: copy dist\HexHound-desktop.exe hexhound.exe
+        shell: cmd
+      - name: Verify it is a windowed build (double-click must not open a console)
+        # 这是"用户双击后有没有黑色控制台窗口"唯一能在 CI 里确定检查的性质：
+        # PE 可选头的 Subsystem 必须等于 2（WINDOWS_GUI）。
+        run: |
+          python tools/check_desktop_exe.py hexhound.exe
+          python tools/check_desktop_exe.py dist\HexHound-desktop.exe
+      - name: Build the CLI executable as well (it must stay a console app)
+        run: |
+          python -m PyInstaller --noconfirm --clean HexHound.spec
+          python tools/check_desktop_exe.py dist\hexhound.exe --expect-console
+      - name: Packaging entry points dispatch correctly
+        run: python -m pytest tests/test_packaged_entry.py -q
+      - name: Desktop launch acceptance (window + config + history)
+        # 需要可交互桌面会话与 WebView2 运行时；GitHub 的 windows runner 通常具备，
+        # 但这一点无法在本机预先证实，因此标记为 advisory：
+        # 它失败会显示出来，但不作为门禁（冒烟与打包校验已经是硬门禁）。
+        continue-on-error: true
+        run: python tools/verify_desktop_exe.py hexhound.exe
 
   self-check:
     name: self-check (no API key needed)

@@ -5,6 +5,12 @@
 >
 > 基线：`8cb2843 chore: capture project handover baseline`（254 passed）
 > 本轮结束：`847c166`（**653 passed, 1 skipped**）
+>
+> ⚠ **本文的数字是本轮结束时的快照，不是当前状态。** 后续轮次又改了代码与测试：
+> 当前状态见 [`docs/WORK-REPORT-ROUND3.md`](WORK-REPORT-ROUND3.md)
+> （现在 `python -m pytest` = 756 passed / 1 skipped）。
+> 正文里出现的 653 / 674 都以"本轮快照"理解，不要当成今天的数字。
+
 
 ---
 

@@ -489,13 +489,24 @@ findings and finish, not cut off.
 ## Verify it yourself
 
 ```bash
-python -m pytest                                    # 653 passed, 1 skipped
-python -m ruff check src tests                      # All checks passed
+python -m pytest                                    # 756 passed, 1 skipped
+python -m ruff check src tests tools                # All checks passed
+python tools/smoke_gui_server.py                    # local console smoke, no window/target/model
+python -m pytest tests/test_gui_frontend.py         # browser smoke (needs Playwright; see below)
+python tools/check_desktop_exe.py hexhound.exe      # double-click must not open a console
+python tools/verify_desktop_exe.py hexhound.exe     # desktop launch acceptance (19 checks)
 python examples/tool_selftest.py                    # 31 detection checks, no API key
 SWARM_MOCK=1 python examples/swarm_demo.py          # full orchestration, no model calls
 wsl -d Ubuntu-24.04 -u root -- bash /mnt/c/.../tools/verify_lab_new_vulns.sh      # 5/5
 wsl -d Ubuntu-24.04 -u root -- bash /mnt/c/.../tools/verify_lab_business_logic.sh # 7/7
 ```
+
+> `HEXHOUND_BROWSER` selects the browser channel for the frontend smoke test
+> (`msedge` / `chrome`, empty = bundled Chromium). CI sets
+> `HEXHOUND_REQUIRE_GUI=1`, which turns "dependency missing" into a **failure**
+> instead of a silent skip — a GUI layer that quietly skips is no test layer at all.
+> `tools/verify_desktop_exe.py` isolates settings and run artifacts through
+> `HEXHOUND_SETTINGS_PATH` / `HEXHOUND_HOME`, so it never touches your real config.
 
 > The WSL lab is a **separate copy**: editing `vulnlab/app.py` on Windows does not
 > change `/opt/hexhound-lab/app.py`. Copy it across and restart the lab (kill by
@@ -834,12 +845,31 @@ N, not a proof of safety — the report says so in those words.
 
 ```ini
 MAX_COST=0.5          # CNY; crossing it ends the run and records the reason in the report
+MAX_TOKENS=200000     # total token cap
+MAX_LLM_CALLS=60      # model call cap
 MAX_TOOL_CALLS=300    # total request cap
 MAX_SECONDS=900       # wall-clock cap
 RATE_LIMIT=0.3        # minimum gap between requests
 MAX_TASKS=6           # sub-task cap
 PARALLEL=3            # concurrent sub-agents
 ```
+
+**All five budget dimensions share one definition between the CLI and the desktop app**
+(`runparams.FIELDS`): the form inputs, the backend parser and the `Config`/`Budget`
+construction all derive from it, and limits leave through `budget.limits_from_config`
+only. The semantics are pinned by tests:
+
+* budget fields: `0` or empty means **unlimited**;
+* every other numeric field: `0` or a negative number is an **error** (zero has no
+  sensible meaning there, and silently substituting a default makes users believe
+  their setting took effect);
+* non-numeric / non-finite / out-of-range values are errors, and **all problems are
+  reported at once**;
+* messages carry the field label and unit ("费用上限 不能小于 0（单位：元）").
+
+When a run starts, the **active guardrails** are written into the activity log
+(e.g. `费用 ≤ ¥0.50；Token ≤ 200000`), so you can confirm the caps are actually in
+force without waiting for the run to finish.
 
 At **70% / 85% / 95%** of any limit, a wrap-up directive is injected into the conversation so the
 model converges on its own instead of being cut off at the hard threshold (when it usually has no
@@ -859,6 +889,7 @@ completed instead of pretending it was.
 │   ├── surface.json     # attack-surface snapshot (endpoints/params/fingerprints/tried combos/coverage)
 │   ├── tasks.json       # sub-task ledger (role/steps/tokens/cost/model/conclusion)
 │   ├── run.json         # run summary (budget, coverage, dedup stats, trace digest)
+│   ├── report.md        # copy of the report as delivered (for later review)
 │   ├── trace.jsonl      # append-only audit trace (model steps, tool calls, orchestrator events)
 │   ├── snapshot.json    # the full state the report renders from (offline rebuild)
 │   ├── spill/           # full originals of oversized tool output (opaque names)
@@ -869,7 +900,42 @@ completed instead of pretending it was.
 On the next run against the same target, the long-term memory is injected into the planning prompt
 ("which parameters hit last time") and the surface can be reused from `surface.json`. The data root
 defaults to `~/.hexhound` and can be moved with the `HEXHOUND_HOME` environment variable (handy for
-tests/CI).
+tests/CI); the settings file honors `HEXHOUND_SETTINGS_PATH`.
+
+### Run history in the UI
+
+Both the desktop app and the web console have a **run history** panel on the reports page: it lists
+previous runs found under `~/.hexhound/runs/` (target, time, status, findings/endpoints, tokens and
+cost, whether a report is available) and opens the report of any of them.
+
+Two hard rules are enforced by tests:
+
+* **disk only** — listing history and opening a report never call a model and never touch the
+  target, so reviewing the past cannot create new cost or traffic;
+* the report shown is **the one written at the time** (`report.md`); only when that file is gone is
+  it rebuilt offline from `snapshot.json`, and the rebuilt version says so in its header.
+
+Statuses stay honest: a run counts as `done` only when `snapshot.json` exists; a directory with just
+`run.json` is `unfinished (interrupted or failed)`. **An incomplete run is never displayed as a
+complete audit.**
+
+## Local control plane
+
+The console is a local single-user tool, and the endpoints behind it treat that as a security
+boundary rather than an assumption:
+
+* **no secret ever leaves the server** — `/api/providers` returns masked keys and
+  "saved or not" booleans only; the real key is resolved server-side per provider. Pasting a
+  displayed mask back in is rejected instead of being stored as a broken key;
+* **session token** — a fresh random token is rendered into the page and required on every
+  state-changing request. A cross-site page cannot read it, and cannot set the custom header
+  without a preflight this server never grants, so it cannot start an audit, change the allow-list,
+  write `.env` or open a login window on your behalf;
+* **Host/Origin checks** — only `127.0.0.1` / `localhost` are accepted, which also blunts DNS
+  rebinding (an attacker domain resolving to loopback still arrives with its own `Host`);
+* **error text is scrubbed** — provider errors frequently echo the credential
+  (`Incorrect API key provided: sk-...`), so known keys and `Bearer`/`api_key=` shapes are masked
+  before anything is displayed or logged.
 
 ## Interactive setup wizard
 
@@ -973,7 +1039,7 @@ write `.env` next to the executable (or in the current directory), and reports g
 │   ├── tool_selftest.py      # 31 detection checks (no API key needed)
 │   ├── swarm_demo.py         # end-to-end orchestration demo (SWARM_MOCK=1 works offline)
 │   └── mock_demo.py          # minimal single-agent demo
-└── tests/                    # 653 unit tests (fully offline)
+└── tests/                    # 756 unit tests (fully offline)
 ```
 
 ## Safety boundaries and disclaimer

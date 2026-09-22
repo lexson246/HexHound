@@ -65,7 +65,13 @@ def _project_root() -> Path:
 
 
 PROJECT_ROOT = _project_root()
-SETTINGS_PATH = Path.home() / ".hexhound" / "settings.json"
+#: 设置文件路径。可用 `HEXHOUND_SETTINGS_PATH` 覆盖——测试/CI 与"打包后验收"
+#: 都靠它用临时文件跑，不碰用户真实配置（与 `memory.data_home` 的
+#: `HEXHOUND_HOME` 约定一致）。
+SETTINGS_PATH = Path(
+    os.getenv("HEXHOUND_SETTINGS_PATH", "").strip()
+    or (Path.home() / ".hexhound" / "settings.json")
+)
 
 #: 本机控制面只接受这些主机名（见 `create_app` 的请求守卫）。
 #:

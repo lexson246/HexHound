@@ -13,8 +13,46 @@ import pytest
 from hexhound import gui
 
 
+def _skip_or_fail(reason: str) -> None:
+    """缺少 GUI 依赖时：本地跳过，CI（`HEXHOUND_REQUIRE_GUI=1`）**失败**。
+
+    为什么要有这个开关：一个"依赖没装就静默跳过"的 GUI 测试层等于没有测试层——
+    正是一个没被导入的函数（`_build_llm_pool`）让"从界面启动审计"长期必定
+    报 NameError 却没人发现。CI 里必须让它变成红的。
+    """
+    if os.environ.get("HEXHOUND_REQUIRE_GUI", "").strip():
+        pytest.fail(f"GUI 测试依赖缺失，但本环境要求必须运行：{reason}")
+    pytest.skip(reason)
+
+
+def _browser_candidates() -> list[dict]:
+    """按优先级给出可尝试的浏览器启动参数。
+
+    `HEXHOUND_BROWSER` 的取值语义：
+    * 空 / `chromium` → Playwright 自带的 chromium（**不传 channel**，
+      因为 `channel="chromium"` 不是合法频道名，传了会启动失败）；
+    * `msedge` / `chrome` → 系统浏览器频道；
+    * 其余值按"频道名"原样尝试。
+    """
+    requested = os.environ.get("HEXHOUND_BROWSER", "").strip().lower()
+    if requested in ("", "chromium"):
+        order = [{}, {"channel": "msedge"}, {"channel": "chrome"}]
+    else:
+        order = [{"channel": requested}, {}, {"channel": "msedge"}, {"channel": "chrome"}]
+    if not requested and sys.platform == "win32":
+        # Windows 上通常没装 Playwright 自带的 chromium，先用系统 Edge。
+        order = [{"channel": "msedge"}, {"channel": "chrome"}, {}]
+    return order
+
+
 def test_console_interactions(monkeypatch, tmp_path):
-    playwright = pytest.importorskip("playwright.sync_api")
+    # 注意不能用 `pytest.importorskip`：它抛的 `Skipped` 继承自 BaseException，
+    # 会把"CI 必须跑"的要求一起吞掉。这里显式导入，缺依赖时交给 _skip_or_fail 决定。
+    try:
+        from playwright import sync_api as playwright
+    except ImportError as exc:
+        _skip_or_fail(f"未安装 playwright：{exc}")
+        raise
     monkeypatch.setattr(gui, "SETTINGS_PATH", tmp_path / "settings.json")
     monkeypatch.setattr(gui, "STATE", gui.RunState())
     # 历史面板读的是运行产物目录：隔离到临时目录，别去读用户真实的历史
@@ -28,10 +66,16 @@ def test_console_interactions(monkeypatch, tmp_path):
     screenshots = os.environ.get("HEXHOUND_GUI_SCREENSHOTS")
 
     with playwright.sync_playwright() as pw:
-        try:
-            browser = pw.chromium.launch(channel=os.environ.get("HEXHOUND_BROWSER", "msedge" if sys.platform == "win32" else "chromium"))
-        except playwright.Error as exc:
-            pytest.skip(f"Browser unavailable: {exc}")
+        browser = None
+        failures: list[str] = []
+        for options in _browser_candidates():
+            try:
+                browser = pw.chromium.launch(**options)
+                break
+            except playwright.Error as exc:  # noqa: PERF203 逐个候选尝试
+                failures.append(f"{options or 'bundled chromium'} → {exc}")
+        if browser is None:
+            _skip_or_fail("没有可用的浏览器：" + "；".join(failures))
         page = browser.new_page(viewport={"width": 1440, "height": 1050}, device_scale_factor=1)
         page.on("pageerror", lambda error: errors.append(str(error)))
 

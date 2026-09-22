@@ -677,6 +677,17 @@ class DialogAttributionTests(unittest.TestCase):
         )
 
 
+def _skip_or_fail(reason: str) -> None:
+    """缺少浏览器时：本地跳过，CI（`HEXHOUND_REQUIRE_GUI=1`）**失败**。
+
+    与 `tests/test_gui_frontend.py` 同一个开关：CI 里必须让"没装浏览器"
+    变成红灯，否则整层真实浏览器验证可以静默消失。
+    """
+    if os.environ.get("HEXHOUND_REQUIRE_GUI", "").strip():
+        raise AssertionError(f"浏览器依赖缺失，但本环境要求必须运行：{reason}")
+    raise unittest.SkipTest(reason)
+
+
 class _LocalPageLab:
     """临时本地测试页（随机端口，只跑在本机），用于真实浏览器回归。"""
 
@@ -726,7 +737,7 @@ class DialogFalsePositiveBrowserTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         ready, reason = playwright_available()
         if not ready:
-            raise unittest.SkipTest(reason)
+            _skip_or_fail(reason)
         from playwright.sync_api import sync_playwright
 
         with sync_playwright() as playwright:
@@ -741,7 +752,7 @@ class DialogFalsePositiveBrowserTests(unittest.TestCase):
                 except Exception:  # noqa: BLE001 这个候选不可用，换下一个
                     continue
         if cls.channel is None:
-            raise unittest.SkipTest("没有可用的浏览器（chromium / msedge / chrome）")
+            _skip_or_fail("没有可用的浏览器（chromium / msedge / chrome）")
         cls.server, cls.base = _LocalPageLab.start()
 
     @classmethod

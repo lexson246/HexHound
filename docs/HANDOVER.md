@@ -1,18 +1,23 @@
 # HexHound — handover to Codex
 
-> **⚠ 本文件描述的是 `8cb2843` 基线。** 基线之后已经落地了一整轮工作
-> （9→11 个提交，测试 254 → 653）。**先读
-> [`docs/WORK-REPORT-ROUND2.md`](WORK-REPORT-ROUND2.md)**，它记录了：
-> 新增的 7 个模块、每项行为变化的验证方式、7 个真实运行暴露的缺陷、
-> **明确未达成的事项**（含唯一一条未通过的验收标准）、以及本轮踩到的坑。
-> 下面的内容仍然有效（架构、约束、陷阱、验证协议），但有两处已过时：
+> **⚠ 本文件描述的是 `8cb2843` 基线。** 基线之后已经落地了两轮工作。
+> 阅读顺序：**[`docs/WORK-REPORT-ROUND3.md`](WORK-REPORT-ROUND3.md)**（最新：四个 P0 缺陷的
+> 修复与证据、桌面端验收、预算护栏与任务历史、CI 门禁）→
+> [`docs/WORK-REPORT-ROUND2.md`](WORK-REPORT-ROUND2.md)（新增的 7 个模块、每项行为变化的
+> 验证方式、7 个真实运行暴露的缺陷、明确未达成的事项）。
+> 下面的内容仍然有效（架构、约束、陷阱、验证协议），但有三处已过时：
 >
 > 1. §0 第 1 条说"这不是 git 仓库"——**已过时**，现在是 git 仓库，
->    基线提交 `8cb2843`，本轮结束于 `847c166`。**不要修改或覆盖基线提交。**
+>    基线提交 `8cb2843`，round 2 结束于 `847c166`，round 3 见 ROUND3 报告。
+>    **不要修改或覆盖基线提交。**
 > 2. §7 表格里"whatweb 乱码 / `sandbox_script` 静默失败"两条——**已修复**，
 >    见 `docs/WORK-REPORT-ROUND2.md` §3。
+> 3. §9 的实测数字是 2026-09-20 的快照（254 passed）。**测试数字请以实际运行为准**
+>    （`python -m pytest`，当前 756 passed / 1 skipped），不要引用本文里的 254。
 >
-> 测试数字请以实际运行为准（`python -m pytest`），不要引用本文里的 254。
+> 另有两处**行为约定**在 round 3 变了，读旧文档时要留意：
+> 本机控制面要求会话令牌与 Host/Origin 校验；`/api/providers` 不再回传明文密钥。
+
 
 Audience: an AI coding agent picking this repo up cold. Everything below was verified on
 2026-09-20 in this working copy; where something is *not* verified, it says so explicitly.

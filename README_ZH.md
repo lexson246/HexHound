@@ -418,13 +418,23 @@ pip install playwright && python -m playwright install chromium   # 可选
 ## 自己验证一遍
 
 ```bash
-python -m pytest                                    # 664 passed, 1 skipped
-python -m ruff check src tests                      # All checks passed
+python -m pytest                                    # 756 passed, 1 skipped
+python -m ruff check src tests tools                # All checks passed
+python tools/smoke_gui_server.py                    # 本机控制台冒烟（不起窗口、不打目标、不调模型）
+python -m pytest tests/test_gui_frontend.py         # 浏览器冒烟（需 Playwright，见下）
+python tools/check_desktop_exe.py hexhound.exe      # 双击不弹控制台（PE 子系统校验）
+python tools/verify_desktop_exe.py hexhound.exe     # 桌面版启动验收（19 项）
 python examples/tool_selftest.py                    # 31 项检出能力，不需要 key
 SWARM_MOCK=1 python examples/swarm_demo.py          # 完整编排，不调模型
 wsl -d Ubuntu-24.04 -u root -- bash /mnt/c/.../tools/verify_lab_new_vulns.sh      # 5/5
 wsl -d Ubuntu-24.04 -u root -- bash /mnt/c/.../tools/verify_lab_business_logic.sh # 7/7
 ```
+
+> `HEXHOUND_BROWSER` 选择浏览器频道（`msedge` / `chrome`，留空 = Playwright 自带 chromium）。
+> CI 里设 `HEXHOUND_REQUIRE_GUI=1`：依赖缺失会**失败**而不是静默跳过——
+> 一个"缺依赖就跳过"的界面测试层等于没有测试层。
+> `tools/verify_desktop_exe.py` 通过 `HEXHOUND_SETTINGS_PATH` / `HEXHOUND_HOME`
+> 把配置与产物隔离到临时目录，不会碰你的真实配置。
 
 > WSL 里的靶场是**独立副本**：在 Windows 侧改 `vulnlab/app.py` 不会影响
 > `/opt/hexhound-lab/app.py`。要先把文件拷过去、再重启靶场（按**端口**杀进程，
@@ -727,12 +737,27 @@ agent 跑出你的授权范围，隔离边界仍然是容器。
 
 ```ini
 MAX_COST=0.5          # 人民币，越线优雅收尾并把原因写进报告
+MAX_TOKENS=200000     # 总 token 上限
+MAX_LLM_CALLS=60      # 模型调用次数上限
 MAX_TOOL_CALLS=300    # 请求总数上限
 MAX_SECONDS=900       # 墙钟时间上限
 RATE_LIMIT=0.3        # 每次请求最小间隔
 MAX_TASKS=6           # 子任务数上限
 PARALLEL=3            # 并发子代理数
 ```
+
+**这五个预算维度在 CLI 与桌面端是同一份定义**（`runparams.FIELDS`）：界面上的
+输入框、后端解析、`Config`/`Budget` 构造都从它来，预算出口统一走
+`budget.limits_from_config`。语义写死并有测试守着：
+
+* 预算类字段填 `0` 或留空 = **不限制**；
+* 其它字段（步数/并发/超时…）填 `0` 或负数 = **报错**（这些字段的 0 没有合理含义，
+  静默改成默认值只会让人以为设置生效了）；
+* 非法数字 / 非有限值 / 超出范围 = 报错，并且**一次报出全部问题**；
+* 报错文本带字段标签与单位（"费用上限 不能小于 0（单位：元）"）。
+
+一次运行开始时，"生效中的护栏"会写进执行记录（例如 `费用 ≤ ¥0.50；Token ≤ 200000`），
+不用等跑完才知道上限有没有设上。
 
 用量的 **70% / 85% / 95%** 会分三档把"收尾指令"插进对话，让模型自己收敛，
 而不是跑到硬阈值被直接掐断（那时往往连结论都来不及写）。子代理层面同理：
@@ -750,13 +775,30 @@ PARALLEL=3            # 并发子代理数
 │   ├── surface.json     # 攻面快照（端点/参数/指纹/已试组合/覆盖）
 │   ├── tasks.json       # 子任务台账（角色/步数/token/费用/模型/结论）
 │   ├── run.json         # 本次运行汇总（预算、覆盖、去重统计）
+│   ├── report.md        # 本次交付的报告副本（历史复盘用）
+│   ├── snapshot.json    # 报告离线重建快照（可事后重渲染，不碰网络）
 │   └── poc/HH-001.sh    # 可复现 PoC：按顺序重放证据请求的 curl 脚本
 └── memory/<host>.json   # 跨运行长期记忆：指纹、参数命中经验、历史已报漏洞
 ```
 
-下次对同一目标运行时，长期记忆会作为简报注入规划提示词（"上次哪些参数命中过"），
+下次对同一目标运行时，长期记忆会作为简报注入规划提示词（"上次哪些参数命穿过"），
 攻面也可通过 `surface.json` 复用。数据根目录默认 `~/.hexhound`，可用环境变量
-`HEXHOUND_HOME` 改到别处（测试/CI 常用）。
+`HEXHOUND_HOME` 改到别处（测试/CI 常用）；设置文件可用 `HEXHOUND_SETTINGS_PATH`
+指向别处。
+
+### 任务历史（界面里的"历史运行"）
+
+桌面端与网页端的报告页都有"历史运行"面板：列出 `~/.hexhound/runs/` 里的历次运行
+（目标、时间、状态、发现/端点、token 与费用、报告是否可用），点开可看那次运行的报告。
+
+两条硬约束有测试守着：
+
+* **只读磁盘**——列历史与看报告都不调用模型、不访问目标，复盘历史不会产生新的费用或流量；
+* 报告优先用**当时写下的那一份**（`report.md`）；原文不存在时才用 `snapshot.json`
+  离线重渲染，并在报告开头写明"这是重建的"，不让重建稿看起来像原文。
+
+状态如实区分：有 `snapshot.json` 才算"已完成"，只有 `run.json` 的是
+"未完成（中断或异常）"。**没跑完的运行不会被显示成完整审计。**
 
 ## 交互式初始化向导
 
@@ -853,7 +895,7 @@ windowed 模式会把这些全部吞掉。打包后向导与设置面板把 `.en
 │   ├── tool_selftest.py      # 工具检出能力自检（31 项，无需 API key）
 │   ├── swarm_demo.py         # 端到端编排演练（SWARM_MOCK=1 可离线运行）
 │   └── mock_demo.py          # 单代理模式最小演示
-└── tests/                    # 664 个单元测试（纯本地，无网络）
+└── tests/                    # 756 个单元测试（纯本地，无网络）
 ```
 
 ## 安全边界与免责声明
