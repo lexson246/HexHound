@@ -348,7 +348,7 @@ HTML = r"""<!doctype html>
 <div id="notice" role="status" hidden></div>
 <dialog class="modal-overlay" id="settingsModal" aria-labelledby="settingsTitle">
   <div class="modal">
-    <h2 id="settingsTitle">模型与设置</h2><p class="hint">密钥以明文保存在本机，请勿在共用设备上保存。</p>
+    <h2 id="settingsTitle">模型与设置</h2><p class="hint">密钥只在本机使用：不经浏览器回传，Windows 上以 DPAPI 加密保存（换机器/换用户需重填）。共用设备上仍建议跑完即清除。</p>
     <form id="settingsForm">
       <h3 style="margin:14px 0 6px;font-size:14px;">模型提供商</h3>
       <label>提供商预设</label>

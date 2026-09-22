@@ -219,6 +219,16 @@ def test_console_interactions(monkeypatch, tmp_path):
             for view in ("reports", "vision", "workspace"):
                 page.locator(f'[data-view="{view}"]').click()
                 assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), (width, view)
+            # 提示条是 fixed 定位（右下角）：整页截图里它会被画在"原视口位置"，
+            # 看起来像压住了中间的内容。这里断言它确实在视口之内，
+            # 把"截图假象"和"真的压住内容"区分开。
+            page.locator('[data-view="reports"]').click()
+            page.locator("#compareBtn").click()
+            expect(page.locator("#notice")).to_be_visible()
+            box = page.locator("#notice").bounding_box()
+            assert box["x"] >= 0 and box["y"] >= 0, (width, box)
+            assert box["x"] + box["width"] <= width + 1, (width, box)
+            assert box["y"] + box["height"] <= 900 + 1, (width, box)
             if width == 390:
                 screenshot("console-mobile.png")
         assert not errors
