@@ -4,21 +4,25 @@
 `/cart（受保护，值得进一步探测）` 这种带自然语言后缀的假端点。
 
 根因不是"后缀没剥掉"，而是 `_enumerate_common` 把自己**给人看的命中文本**
-（`f"{status}  {url}（受保护…）"`）用 `split("  ")[-1]` 反解回 URL——
+（`f"{status}  {url}（受保护…）"`）用 `split("  ")[-2]` 反解回 URL——
 带内容特征的命中更糟：`[-1]` 取到的是 `特征: <title>…` 整段文字。
 展示与数据必须分开。
 
 这里用一个本地临时 HTTP 服务真实跑一遍 `enumerate_common`
 （只监听 127.0.0.1，不碰任何真实目标）。
+
+**刻意只用标准库 `http.server`**：CI 的 `test` 作业只装 `[dev]`（不含 flask），
+若这里依赖 flask，整份测试会在收集阶段就 ERROR——那正是本地 CI 执行器第一次跑
+就抓到的真问题（见 docs/WORK-REPORT-ROUND3.md §8）。
 """
 from __future__ import annotations
 
 import sys
 import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-
-from werkzeug.serving import make_server
+from urllib.parse import urlsplit
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
@@ -27,28 +31,36 @@ from hexhound.surface import AttackSurface, looks_like_url, normalize_endpoint  
 from hexhound.tools import ToolRegistry  # noqa: E402
 
 
-class _LocalLab:
+class _Handler(BaseHTTPRequestHandler):
     """三种命中形态各一个端点 + SPA 式 catch-all（让基线走软 404 分支）。"""
 
+    def do_GET(self) -> None:  # noqa: N802 标准库回调名
+        path = urlsplit(self.path).path
+        if path == "/admin":
+            self._send(403, "forbidden")
+        elif path == "/broken":
+            self._send(500, "boom")
+        else:
+            self._send(200, f"<html><head><title>Page {path}</title></head><body>spa</body></html>")
+
+    def _send(self, code: int, body: str) -> None:
+        payload = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args) -> None:  # noqa: D102 静音，别污染测试输出
+        return
+
+
+class _LocalLab:
+    """本地临时 HTTP 服务（随机端口，只跑在本机）。"""
+
     @classmethod
-    def start(cls) -> tuple[object, str]:
-        from flask import Flask
-
-        app = Flask("hexhound-enumerate-hygiene")
-
-        @app.route("/admin")
-        def admin():
-            return "forbidden", 403
-
-        @app.route("/broken")
-        def broken():
-            return "boom", 500
-
-        @app.route("/<path:anything>")
-        def catch_all(anything: str):
-            return f"<html><head><title>Page {anything}</title></head><body>spa</body></html>", 200
-
-        server = make_server("127.0.0.1", 0, app)
+    def start(cls) -> tuple[ThreadingHTTPServer, str]:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         return server, f"http://127.0.0.1:{server.server_port}"
 

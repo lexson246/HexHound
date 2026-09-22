@@ -15,6 +15,16 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
 
+#: 打桩模块上的标记：让**别的测试文件**能分辨"真 flask"与"这个假替身"。
+#:
+#: 为什么必须有这个标记（CI 抓到的真问题）：这里的替身会把假的 `flask` 塞进
+#: `sys.modules`，于是同一次 pytest 进程里别的文件 `import flask` 也会成功——
+#: 接着 `Flask(__name__)` 在 `Flask = object` 上炸出
+#: `TypeError: object() takes no arguments`。缺 flask 时 `test_providers` 的
+#: 界面用例本该"跳过"，却变成了 12 个 ERROR。
+STUB_MARKER = "__hexhound_flask_stub__"
+
+
 def _stub_flask() -> None:
     """只替换 flask 的模板渲染与响应对象，保留真实模块结构。"""
     try:
@@ -29,6 +39,7 @@ def _stub_flask() -> None:
     flask.render_template_string = lambda *a, **k: ""
     flask.request = object
     flask.send_file = object
+    setattr(flask, STUB_MARKER, True)
     sys.modules["flask"] = flask
 
 

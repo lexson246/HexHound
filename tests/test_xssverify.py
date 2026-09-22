@@ -464,13 +464,19 @@ class RealBrowserTests(unittest.TestCase):
     判据必须给出四种不同的结论。没有这一层，整个分级机制就只是推理。
     """
 
+    channel: str | None = None
+
     @classmethod
     def setUpClass(cls) -> None:
         if not _lab_available():
             raise unittest.SkipTest(f"靶场未运行（{LAB}）：跳过真实浏览器验证层")
+        # 浏览器频道必须**探测**而不是写死 `msedge`：写死的话，在 Linux 上
+        # （只有 Playwright 自带的 chromium）会直接
+        # `Chromium distribution 'msedge' is not found`，把整层测试挂在环境上。
+        cls.channel = _pick_channel()
 
     def make_verifier(self) -> BrowserVerifier:
-        return BrowserVerifier(allowed_hosts=ALLOWED, channel="msedge", timeout_ms=15000)
+        return BrowserVerifier(allowed_hosts=ALLOWED, channel=self.channel or "", timeout_ms=15000)
 
     def test_html_context_executes(self) -> None:
         """`/reflect` 把 payload 放进 HTML 正文 → 应当判为 executed。"""
@@ -734,6 +740,30 @@ def _skip_or_fail(reason: str) -> None:
     raise unittest.SkipTest(reason)
 
 
+def _pick_channel() -> str:
+    """挑一个**真的能启动**的浏览器频道。
+
+    为什么不能写死：Windows 开发机上通常只有系统 Edge（`msedge`），
+    Linux/CI 上只有 Playwright 自带的 chromium——写死任一个，
+    另一侧的整层测试就会挂在环境上而不是被测代码上。
+    返回 `""` 表示用自带的 chromium。
+    """
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        for candidate in ("", "msedge", "chrome"):
+            try:
+                kwargs: dict[str, Any] = {"headless": True}
+                if candidate:
+                    kwargs["channel"] = candidate
+                playwright.chromium.launch(**kwargs).close()
+                return candidate
+            except Exception:  # noqa: BLE001 这个候选不可用，换下一个
+                continue
+    _skip_or_fail("没有可用的浏览器（chromium / msedge / chrome）")
+    return ""  # 不可达：_skip_or_fail 一定抛出
+
+
 class _LocalPageLab:
     """临时本地测试页（随机端口，只跑在本机），用于真实浏览器回归。"""
 
@@ -808,21 +838,7 @@ class DialogFalsePositiveBrowserTests(unittest.TestCase):
         ready, reason = playwright_available()
         if not ready:
             _skip_or_fail(reason)
-        from playwright.sync_api import sync_playwright
-
-        with sync_playwright() as playwright:
-            for candidate in ("", "msedge", "chrome"):
-                try:
-                    kwargs: dict[str, Any] = {"headless": True}
-                    if candidate:
-                        kwargs["channel"] = candidate
-                    playwright.chromium.launch(**kwargs).close()
-                    cls.channel = candidate
-                    break
-                except Exception:  # noqa: BLE001 这个候选不可用，换下一个
-                    continue
-        if cls.channel is None:
-            _skip_or_fail("没有可用的浏览器（chromium / msedge / chrome）")
+        cls.channel = _pick_channel()
         cls.server, cls.base = _LocalPageLab.start()
 
     @classmethod

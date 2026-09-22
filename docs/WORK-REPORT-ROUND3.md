@@ -230,7 +230,7 @@ PE 子系统：2（WINDOWS_GUI）← 双击不会弹黑色控制台窗口
 | 报表工作区进阶（筛选、详情分栏、导出、跨运行对比） | 原：未开始（用户列为"按收益推进"） | **已完成** → §7.1 |
 | 浏览器验证层只覆盖 GET（POST 表单型 XSS） | 原：未变 | **已完成** → §7.2 |
 | 覆盖率记录里混入自然语言后缀的端点表 | 原：未修；既有数据质量问题 | **已修复**（根因是"展示文本被当数据"）→ §7.3 |
-| CI workflow 在 GitHub 上真实执行 | 本机无 runner，**仍未验证** | 部分缓解：新增静态一致性校验工具 → §7.4 |
+| CI workflow 在 GitHub 上真实执行 | 本机无 runner，**仍未验证** | 部分缓解：静态校验工具 §7.4；**并已用本机执行器把 7 个作业全跑绿** §8 |
 | 桌面版真机"肉眼"验收 | 原：没有人眼截图确认 | **已完成**（含一处截图假象的澄清）→ §7.5 |
 | Windows DPAPI 保护本机密钥（静态加密） | 原：未做（明文存在 settings.json） | **已完成** → §7.6 |
 | WSL 靶场侧脚本重跑 | 原：未跑 | **已跑通**：5/5 与 7/7 → §7.7 |
@@ -291,6 +291,9 @@ PE 子系统：2（WINDOWS_GUI）← 双击不会弹黑色控制台窗口
 步骤里引用的仓库文件存在、`pip extras` 在 pyproject 里真的有定义、
 `HEXHOUND_*` 环境变量代码里真的有人读。当前 26 项检查全过。
 
+**静态校验只能查引用**；"作业里的命令到底跑不跑得通"由 `tools/run_ci_locally.py`
+真跑（见 §8——它第一次运行就抓出了 5 个会 CI 变红的问题）。
+
 **依然未验证**：GitHub runner 上的真实执行（跑一次才知道）。工具输出里明写了
 "不能替代真跑一次 CI"，避免被当成"CI 已验过"。
 
@@ -324,4 +327,74 @@ verify_lab_new_vulns.sh      → 5 项符合预期，0 项异常（竞态 ×2 + 
 verify_lab_business_logic.sh → 7 项成立，0 项异常（价格篡改/负数数量/跳过步骤/重复提交/状态一致性）
 ```
 两个脚本都是纯 HTTP，不调用模型、不消耗额度；只改本地靶场内存状态并在结束前重置。
+
+---
+
+## 8. CI 真的跑起来了（本机执行器，不依赖 GitHub）
+
+§6/§7.4 一直留着一条"CI 未在 runner 上真跑过"。用户的要求是"没有 runner 就下载一个"——
+于是先试了标准答案，再落到能真正给出结论的方案上。
+
+### 8.1 试过的两条路（以及为什么第一条不通）
+
+1. **自托管 GitHub runner（`actions/runner`）**：需要绑定一个 GitHub 仓库 + 注册令牌。
+   本仓库**没有 git remote**、机器上没有 `gh`、没有 `GITHUB_TOKEN`——
+   没有可绑定的目标，也没法在不经过用户登录的情况下创建。
+   （这是唯一能验证"GitHub 自己的编排"的方式，需要用户提供仓库与凭据。）
+2. **`act`（本机执行 GitHub Actions）**：在 WSL 里装了 Docker 29.1.3 + act 0.2.89，
+   拉下了 runner 镜像（2.3GB，走国内镜像站），`act -l` 能正确识别 5 个作业。
+   但本机网络**大文件传输会中途卡死**（pypi 索引 46MB 传到 173KB 就停、
+   `actions/setup-python` 下载 Python 卡住十几分钟不动）。act 因此无法跑完任何作业。
+
+### 8.2 落地方案：`tools/run_ci_locally.py`
+
+直接按 `.github/workflows/ci.yml` **在匹配的操作系统上执行每一步**：
+Linux 作业在 WSL 的真 Ubuntu 24.04 里跑，windows 作业在 Windows 上跑；
+`env:`（含把 key 清空那几条）照搬；平台不匹配的作业**拒绝执行**（跑了只会给出误导性结果）。
+两处刻意与 CI 保持一致的处理：
+
+* 仓库根目录的 `.env` 在跑作业时**临时移开**（GitHub 上没有这个文件，它是 gitignored），
+  否则 `self-check` 里那句 `grep "还没有选择模型提供商"` 会因为本机 `.env`
+  推出了提供商而假失败；结束时无论成败都会恢复；
+* `uses:` 步骤（checkout / setup-python）跳过并打印出来——本地已在仓库里、
+  解释器已就位，对应 runner 上由 action 提供的那部分。
+
+### 8.3 结果：矩阵全绿（本机）
+
+| 作业 | 平台 | 结果 |
+| --- | --- | --- |
+| lint | ubuntu（WSL 24.04） | **通过** |
+| self-check | ubuntu | **通过** |
+| gui（真实浏览器层） | ubuntu | **通过** |
+| test（ubuntu / py3.12） | ubuntu | **通过** |
+| desktop（构建 + PE 校验 + 启动验收 21 项） | windows | **通过** |
+| test（windows / py3.12） | windows | **通过** |
+| test（windows / py3.11） | windows | **通过** |
+| test（ubuntu / py3.11） | — | **未跑**：Ubuntu 24.04 仓库里没有 python3.11，需要外部解释器 |
+
+**仍然不等价于 GitHub**：runner 镜像的预装工具、权限、缓存、网络都不同。
+但"作业里的每条命令在干净的对应系统上能跑通"这件事，现在有实测而不是推断。
+
+### 8.4 这一轮 CI 真实跑出来的 5 个问题（都已修）
+
+1. **新测试文件在收集阶段就 ERROR**：`test_enumerate_hygiene.py` 依赖 werkzeug、
+   两个 GUI 测试文件依赖 flask，而 flask 属于 `[lab]` extra——
+   `test` 作业只装 `[dev]`，于是在 GitHub 上会**整个作业变红**（收集期报错）。
+   修法：枚举工具测试改用标准库 `http.server`（不再依赖 flask）；
+   GUI 测试在**收集阶段**判断依赖，缺了就跳过（`HEXHOUND_REQUIRE_GUI=1` 时失败）。
+2. **替身 flask 泄漏到别的测试文件**：`test_gui_state.py` 在缺 flask 时把
+   `Flask = object` 的假模块塞进 `sys.modules`，于是 `test_providers` 的界面用例
+   `import flask` 成功、`Flask(__name__)` 抛 `TypeError`——本该 12 个 skip 变成 12 个 ERROR。
+   修法：给替身打标记（`__hexhound_flask_stub__`），依赖检查同时辨认"真身还是替身"
+   （提取到 `tests/_gui_deps.py` 共用）。
+3. **写死 `channel="msedge"`**：靶场层测试在 Linux 上必然
+   `Chromium distribution 'msedge' is not found`；只要靶场在跑就会挂整层。
+   修法：探测可用频道（自带 chromium → msedge → chrome）。
+4. **DPAPI 断言在 Linux 上不成立**：我上一轮写的"文件里不能出现明文"只在 Windows 成立。
+   修法：按平台**分别断言**（Windows 要求密文；非 Windows 明确断言"如实明文 + 给出原因"），
+   而不是让断言在别的平台上无声消失。
+5. **CI 步骤依赖 Git 的 coreutils**：`python -m pytest -q -rs 2>&1 | tail -20`
+   里的 `tail` 在 GitHub 的 windows runner 上恰好存在（Git for Windows 在 PATH），
+   其它 Windows 环境没有。修法：去掉管道，直接 `pytest -q -rs`。
+
 

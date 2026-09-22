@@ -75,8 +75,14 @@ jobs:
         run: python -m pytest
       - name: Fail if any test was silently skipped for a bad reason
         # pytest 的退出码不会因为 skip 而失败，但"跳过数量突然变多"通常意味着
-        # 某个可选依赖悄悄缺失、一整层测试没跑。这里给出可见的数字。
-        run: python -m pytest -q -rs 2>&1 | tail -20
+        # 某个可选依赖悄悄缺失、一整层测试没跑。这里**再跑一次并打印 skip 明细**
+        # （`-rs`），给出可见的数字。
+        #
+        # 刻意**不**接 `| tail -20`：那依赖 Git 的 coreutils 在 PATH 里
+        # （GitHub 的 windows runner 恰好有，其它 Windows 环境没有）——
+        # 本地 CI 执行器第一次跑就因此报 rc=1。日志长一点没关系，
+        # 依赖运行器镜像的隐含工具才是问题。
+        run: python -m pytest -q -rs
 
   gui:
     name: gui (frontend + real browser)

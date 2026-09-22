@@ -492,6 +492,8 @@ findings and finish, not cut off.
 python -m pytest                                    # 786 passed, 1 skipped
 python -m ruff check src tests tools                # All checks passed
 python tools/check_ci_workflow.py                   # CI workflow references are consistent
+python tools/run_ci_locally.py --list               # run the CI jobs on THIS machine
+python tools/run_ci_locally.py --all                # every job this platform can run
 python tools/smoke_gui_server.py                    # local console smoke, no window/target/model
 python -m pytest tests/test_gui_frontend.py         # browser smoke (needs Playwright; see below)
 python tools/check_desktop_exe.py hexhound.exe      # double-click must not open a console
@@ -501,6 +503,18 @@ SWARM_MOCK=1 python examples/swarm_demo.py          # full orchestration, no mod
 wsl -d Ubuntu-24.04 -u root -- bash /mnt/c/.../tools/verify_lab_new_vulns.sh      # 5/5
 wsl -d Ubuntu-24.04 -u root -- bash /mnt/c/.../tools/verify_lab_business_logic.sh # 7/7
 ```
+
+> **Running CI without GitHub.** `tools/run_ci_locally.py` executes the steps of
+> `.github/workflows/ci.yml` on the matching OS (Linux jobs under WSL/Linux, the windows
+> job on Windows) with the workflow's own `env:` — including the lines that blank the
+> keys, so a test that secretly depends on real credentials fails here too. It refuses to
+> run a job on the wrong platform, prints the `uses:` steps it skipped (checkout and
+> setup-python are provided by your machine), and temporarily moves the repo's `.env`
+> aside so the run resembles a fresh CI checkout (restored afterwards either way).
+> All 7 runnable jobs pass locally; only `ubuntu / py3.11` cannot be reproduced here
+> (Ubuntu 24.04 ships no `python3.11`). This is **not** the same as GitHub — runner
+> images, permissions, caches and network differ. It did catch five breakages that would
+> have turned the `test` job red; see `docs/WORK-REPORT-ROUND3.md` §8.
 
 > `HEXHOUND_BROWSER` selects the browser channel for the frontend smoke test
 > (`msedge` / `chrome`, empty = bundled Chromium). CI sets

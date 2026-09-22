@@ -434,6 +434,8 @@ python -m ruff check src tests tools                # All checks passed
 python tools/smoke_gui_server.py                    # 本机控制台冒烟（不起窗口、不打目标、不调模型）
 python -m pytest tests/test_gui_frontend.py         # 浏览器冒烟（需 Playwright，见下）
 python tools/check_ci_workflow.py                   # CI 工作流引用一致性（本机可跑）
+python tools/run_ci_locally.py --list               # 在本机执行 CI 作业（按平台自动匹配）
+python tools/run_ci_locally.py --all                # 跑完本平台能跑的全部作业
 python tools/check_desktop_exe.py hexhound.exe      # 双击不弹控制台（PE 子系统校验）
 python tools/verify_desktop_exe.py hexhound.exe     # 桌面版启动验收（21 项）
 python examples/tool_selftest.py                    # 31 项检出能力，不需要 key
@@ -441,6 +443,17 @@ SWARM_MOCK=1 python examples/swarm_demo.py          # 完整编排，不调模�
 wsl -d Ubuntu-24.04 -u root -- bash /mnt/c/.../tools/verify_lab_new_vulns.sh      # 5/5
 wsl -d Ubuntu-24.04 -u root -- bash /mnt/c/.../tools/verify_lab_business_logic.sh # 7/7
 ```
+
+> **没有 GitHub 也能跑 CI。** `tools/run_ci_locally.py` 按 `.github/workflows/ci.yml`
+> 在**匹配的操作系统**上逐步执行：Linux 作业在 WSL/Linux 里跑，windows 作业在 Windows 上跑，
+> `env:` 照搬（包括把 key 清空那几条——偷偷依赖真实凭据的测试在这里也会失败）。
+> 平台不匹配的作业**拒绝执行**；`uses:` 步骤（checkout / setup-python）跳过并打印出来；
+> 跑之前会把仓库根目录的 `.env` **临时移开**（GitHub 上是干净 checkout），
+> 无论成败都会恢复。
+> 当前 7 个能跑的作业全绿；唯一跑不了的是 `ubuntu / py3.11`
+> （Ubuntu 24.04 仓库里没有 python3.11）。
+> 这**不等于** GitHub runner：镜像预装工具、权限、缓存、网络都不同。
+> 但它抓出了 5 个会让 `test` 作业变红的问题，见 `docs/WORK-REPORT-ROUND3.md` §8。
 
 > `HEXHOUND_BROWSER` 选择浏览器频道（`msedge` / `chrome`，留空 = Playwright 自带 chromium）。
 > CI 里设 `HEXHOUND_REQUIRE_GUI=1`：依赖缺失会**失败**而不是静默跳过——

@@ -1,4 +1,9 @@
-"""Browser smoke check; all requests stay inside Flask's isolated test client."""
+"""Browser smoke check; all requests stay inside Flask's isolated test client.
+
+依赖：flask（控制台本体）+ playwright（浏览器）。两者都缺时按 `HEXHOUND_REQUIRE_GUI`
+决定"跳过还是失败"，且判断必须在**收集阶段**做——否则 CI 的 `test` 作业
+（只装 `[dev]`）会在收集时报 ERROR，把不相关的作业也带红。
+"""
 from __future__ import annotations
 
 import json
@@ -10,7 +15,27 @@ from urllib.parse import urlsplit
 
 import pytest
 
-from hexhound import gui
+SRC = Path(__file__).resolve().parents[1] / "src"
+TESTS = Path(__file__).resolve().parent
+sys.path.insert(0, str(SRC))
+sys.path.insert(0, str(TESTS))
+
+
+def _require_flask() -> None:
+    """缺真 flask 时跳过整个模块；`HEXHOUND_REQUIRE_GUI=1` 时失败（含替身识别）。"""
+    from _gui_deps import flask_available
+
+    ok, reason = flask_available()
+    if ok:
+        return
+    if os.environ.get("HEXHOUND_REQUIRE_GUI", "").strip():
+        raise AssertionError(f"GUI 测试依赖缺失，但本环境要求必须运行：{reason}")
+    pytest.skip(reason, allow_module_level=True)
+
+
+_require_flask()
+
+from hexhound import gui  # noqa: E402
 
 
 def _skip_or_fail(reason: str) -> None:

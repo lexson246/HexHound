@@ -8,10 +8,17 @@
 * P0-4 `/api/providers` 回传明文密钥 + 本机接口无 CSRF 防护。
 
 约定：只用临时配置目录与假密钥（`sk-fake-*`），绝不读写真实 `.env` 或真实密钥。
+
+**依赖处理**：这些用例需要 flask（桌面端控制台）。CI 的 `test` 作业只装 `[dev]`
+（刻意不装可选依赖），因此这里在**收集阶段**就先判断：缺 flask 时本地跳过，
+而 `HEXHOUND_REQUIRE_GUI=1`（`gui` 作业里设置）时**直接失败**——
+"依赖没装就静默跳过"的界面测试层等于没有测试层。
+不这样写的话，缺依赖会让整份测试在收集阶段 ERROR，把无关作业也带红。
 """
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 from pathlib import Path
@@ -19,7 +26,28 @@ from pathlib import Path
 import pytest
 
 SRC = Path(__file__).resolve().parents[1] / "src"
+TESTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SRC))
+sys.path.insert(0, str(TESTS))
+
+
+def _require_flask() -> None:
+    """缺真 flask 时跳过整个模块；`HEXHOUND_REQUIRE_GUI=1` 时失败。
+
+    注意判定要认得出 `test_gui_state.py` 注入的**替身** flask——否则
+    `import flask` 会成功，随后在 `Flask(__name__)` 上炸成 TypeError。
+    """
+    from _gui_deps import flask_available
+
+    ok, reason = flask_available()
+    if ok:
+        return
+    if os.environ.get("HEXHOUND_REQUIRE_GUI", "").strip():
+        raise AssertionError(f"GUI 测试依赖缺失，但本环境要求必须运行：{reason}")
+    pytest.skip(reason, allow_module_level=True)
+
+
+_require_flask()
 
 from hexhound import gui  # noqa: E402
 
@@ -88,25 +116,34 @@ def test_explicit_none_clears_a_field_to_its_default(settings_file: Path) -> Non
 
 
 def test_keys_are_not_stored_in_plaintext(settings_file: Path) -> None:
-    """密钥落盘后，文件里**不能出现明文**（Windows 用 DPAPI 加密）。
+    """Windows 上密钥落盘必须是密文；**非 Windows 明文是已知且被说明的行为**。
 
     上一轮补掉了"密钥经 HTTP 回传浏览器"，但文件本身一直是明文——
     同步盘、备份、误发的截图都可能带上它。
+
+    这里刻意按平台**分别断言**（而不是"跳过"）：非 Windows 没有 DPAPI，
+    `secretstore` 明确不假装加密，测试要钉住这个契约，
+    而不是让断言在 Linux 上无声消失（CI 的 gui 作业就是在 Linux 上跑的）。
     """
-    gui._save_settings({"provider_keys": json.dumps({"deepseek": "sk-fake-0001"})})
-    text = settings_file.read_text(encoding="utf-8")
-    assert "sk-fake-0001" not in text
     from hexhound import secretstore
 
-    available, _reason = secretstore.protection_available()
+    gui._save_settings({"provider_keys": json.dumps({"deepseek": "sk-fake-0001"})})
+    text = settings_file.read_text(encoding="utf-8")
+    available, reason = secretstore.protection_available()
     if available:
+        assert "sk-fake-0001" not in text
         assert secretstore.is_protected(_read_settings(settings_file)["provider_keys"])
+    else:
+        assert "sk-fake-0001" in text, "无 DPAPI 时应如实明文保存"
+        assert reason, "不可用时必须给出原因（供界面提示）"
     # 无论哪种形态，读回来都必须是原值（加密不能丢数据）
     assert gui._provider_keys() == {"deepseek": "sk-fake-0001"}
 
 
 def test_legacy_plaintext_is_migrated_without_losing_keys(settings_file: Path) -> None:
     """旧文件里的明文密钥要在下一次保存时自动迁移，且**一个都不能丢**。"""
+    from hexhound import secretstore
+
     _write_settings(
         settings_file,
         {"provider_keys": json.dumps({"deepseek": "sk-fake-0001", "qwen": "sk-fake-0002"})},
@@ -114,7 +151,8 @@ def test_legacy_plaintext_is_migrated_without_losing_keys(settings_file: Path) -
     assert gui._provider_keys() == {"deepseek": "sk-fake-0001", "qwen": "sk-fake-0002"}
     gui._save_settings({"target": "http://127.0.0.1:5000"})
     assert gui._provider_keys() == {"deepseek": "sk-fake-0001", "qwen": "sk-fake-0002"}
-    assert "sk-fake-0001" not in settings_file.read_text(encoding="utf-8")
+    if secretstore.protection_available()[0]:
+        assert "sk-fake-0001" not in settings_file.read_text(encoding="utf-8")
 
 
 def test_double_save_does_not_double_encrypt(settings_file: Path) -> None:
@@ -131,11 +169,16 @@ def test_double_save_does_not_double_encrypt(settings_file: Path) -> None:
         assert first == second, "未改动密钥时不应重新加密"
 
 
-def test_undecryptable_keys_report_a_reason(app, client, token, monkeypatch) -> None:
-    """换机器/换用户导致解不开时：必须给出原因，**不能**静默当成"没配过"。"""
+def test_undecryptable_keys_report_a_reason(app, client, token, monkeypatch, settings_file) -> None:
+    """换机器/换用户导致解不开时：必须给出原因，**不能**静默当成"没配过"。
+
+    刻意**直接写入一个"看起来是密文"的值**（而不是先保存再改），
+    这样在非 Windows 平台（没有 DPAPI）也走同一条解密分支——
+    否则这个用例会变成"只在 Windows 上有意义"，在 CI 的 Linux 作业里失真。
+    """
     from hexhound import secretstore
 
-    gui._save_settings({"provider_keys": json.dumps({"deepseek": "sk-fake-0001"})})
+    _write_settings(settings_file, {"provider_keys": secretstore.PREFIX + "ZmFrZS1ibG9i"})
     monkeypatch.setattr(
         secretstore, "unprotect", lambda value: ("", "模拟：密文与当前用户不匹配")
     )

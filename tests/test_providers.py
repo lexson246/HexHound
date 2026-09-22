@@ -10,7 +10,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 SRC = Path(__file__).resolve().parents[1] / "src"
+TESTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SRC))
+sys.path.insert(0, str(TESTS))
 
 from hexhound.config import (  # noqa: E402
     Config,
@@ -311,10 +313,18 @@ class GuiProviderPanelTests(EnvIsolation):
 
     注意：面板接口现在要求本机会话令牌（`gui.TOKEN_HEADER`）——那是防 CSRF 的
     真实契约，所以这里**如实带上令牌**，而不是把校验关掉。
+
+    依赖：需要 flask（属于 `[lab]` extra）。CI 的 `test` 作业只装 `[dev]`，
+    因此缺 flask 时**跳过这一组**（`HEXHOUND_REQUIRE_GUI=1` 的 `gui` 作业里
+    不跳过，缺依赖会失败）。
     """
 
     @classmethod
     def setUpClass(cls) -> None:
+        from _gui_deps import require_flask_or_skip
+
+        require_flask_or_skip("应用面板用例需要真 flask：")
+
         from hexhound import gui as gui_module
 
         cls.gui = gui_module
