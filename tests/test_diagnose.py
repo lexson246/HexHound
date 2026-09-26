@@ -17,10 +17,12 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
+from hexhound import diagnose  # noqa: E402
 from hexhound.diagnose import (  # noqa: E402
     describe_exception,
     exception_chain,
@@ -30,11 +32,25 @@ from hexhound.diagnose import (  # noqa: E402
     proxy_environment,
 )
 from hexhound.llm import classify_error  # noqa: E402
+from hexhound.surface import AttackSurface  # noqa: E402
+from hexhound.tools import ToolRegistry  # noqa: E402
 
 
 def _chained(outer: Exception, inner: Exception) -> Exception:
     outer.__cause__ = inner
     return outer
+
+
+def _fake_probe():
+    """一个固定的探测结果（避免测试真的去连网络）。"""
+    from hexhound.diagnose import EndpointProbe, ProbeStep
+
+    probe = EndpointProbe(base_url="http://127.0.0.1:1", host="127.0.0.1", port=1)
+    probe.steps = [
+        ProbeStep("解析主机名", True, "127.0.0.1", 1),
+        ProbeStep("TCP 连接", False, "ConnectionRefusedError: 拒绝", 2),
+    ]
+    return probe
 
 
 class ExceptionChainTests(unittest.TestCase):
@@ -226,6 +242,153 @@ class ListModelsTests(unittest.TestCase):
         """报错里绝不能带 key（这个字符串会进日志与界面）。"""
         _models, error = list_models(self.base, "sk-secret-value", timeout=5)
         self.assertNotIn("sk-secret-value", error)
+
+
+class SelfDiagnosisOnFailureTests(unittest.TestCase):
+    """失败现场要**自动取证**：网络类错误必须带上分步探测结果。
+
+    为什么放在这里测：真实事故只留下 `APIConnectionError: Connection error.`，
+    用户既不知道原因也不知道下一步做什么。失败那一刻是唯一能观察到现场的时刻，
+    所以 agent/orchestrator 必须在收尾前自动探测一次（不发凭据、不消耗额度）。
+    """
+
+    def test_is_network_error_matches_connection_failures_only(self) -> None:
+        from hexhound.diagnose import is_network_error
+
+        network_like = _chained(RuntimeError("Connection error."), OSError(10061, "拒绝"))
+        self.assertTrue(is_network_error(network_like))
+        dns_like = _chained(RuntimeError("Connection error."), socket.gaierror(-2, "not known"))
+        self.assertTrue(is_network_error(dns_like))
+        auth_like = RuntimeError("Error code: 401 - invalid api key")
+        self.assertFalse(is_network_error(auth_like), "401 不该触发连通性探测")
+        model_like = RuntimeError("model_not_found: deepseek-v4-flash")
+        self.assertFalse(is_network_error(model_like))
+
+    def test_probe_lines_are_indented_and_conclusive(self) -> None:
+        from hexhound.diagnose import probe_lines
+
+        with patch.object(diagnose, "probe_endpoint", lambda url, timeout=6.0: _fake_probe()):
+            lines = probe_lines("http://127.0.0.1:1", indent="  ")
+        self.assertTrue(all(line.startswith("  ") for line in lines), lines)
+        self.assertTrue(any("结论" in line for line in lines))
+
+    def test_probe_failure_does_not_break_wrapup(self) -> None:
+        """探测本身炸了也不能影响收尾——失败现场最忌讳"诊断把程序弄挂"。"""
+        from hexhound.diagnose import probe_lines
+
+        def boom(url, timeout=6.0):
+            raise RuntimeError("探测内部错误")
+
+        with patch.object(diagnose, "probe_endpoint", boom):
+            lines = probe_lines("http://127.0.0.1:1")
+        self.assertEqual(len(lines), 1)
+        self.assertIn("未能完成", lines[0])
+
+    def test_agent_reports_chain_and_probe_on_provider_error(self) -> None:
+        """端到端（打桩模型）：agent 的失败文案要含因果链 + 现场探测。"""
+        from hexhound.agent import ReActAgent
+
+        class _BoomLLM:
+            base_url = "http://127.0.0.1:1"
+
+            def complete(self, messages):
+                raise _chained(RuntimeError("Connection error."), socket.gaierror(-2, "Name or service not known"))
+
+        registry = ToolRegistry(
+            base_dir=Path("."),
+            allowed_hosts=frozenset({"127.0.0.1"}),
+            timeout=5,
+            mode="blackbox",
+            surface=AttackSurface(target="http://127.0.0.1:5000", mode="blackbox"),
+            role="recon",
+        )
+        agent = ReActAgent(_BoomLLM(), registry, max_steps=2, verbose=False,
+                           target="http://127.0.0.1:5000", role="recon")
+        with patch.object(diagnose, "probe_endpoint", lambda url, timeout=6.0: _fake_probe()):
+            result = agent.run("测试目标")
+        summary = str(getattr(result, "final_summary", "") or "")
+        self.assertIn("gaierror", summary, "必须带底层原因")
+        self.assertIn("连通性现场探测", summary)
+        self.assertEqual(getattr(result, "finish_reason", ""), "provider_error")
+
+
+class LocalNetworkFactsTests(unittest.TestCase):
+    """"为什么只有挂 VPN 才行"这一类问题，靠解析本机路由/适配器来回答。
+
+    最常见的成因：VPN 客户端退出/crash 后留下一条指向死隧道的默认路由，
+    于是**换任何网络都不通**，而重新打开 VPN 又"好了"。
+    这里用真实命令输出片段钉住解析逻辑（不执行命令、不联网）。
+    """
+
+    WINDOWS_ROUTE = """
+===========================================================================
+Interface List
+ 12...aa bb cc dd ee ff ......Intel(R) Wi-Fi 6E AX210 160MHz
+===========================================================================
+
+IPv4 Route Table
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+          0.0.0.0          0.0.0.0   10.134.173.147   10.134.173.236     25
+        127.0.0.0        255.0.0.0         On-link         127.0.0.1    331
+===========================================================================
+"""
+
+    WINDOWS_ROUTE_DOUBLE = WINDOWS_ROUTE.replace(
+        "===========================================================================\n\nIPv4 Route Table",
+        "          0.0.0.0          0.0.0.0      10.0.0.1      10.0.0.5     5\n"
+        "===========================================================================\n\nIPv4 Route Table",
+    )
+
+    def test_parses_single_windows_default_route(self) -> None:
+        routes = diagnose.parse_default_routes(self.WINDOWS_ROUTE)
+        self.assertEqual(routes, [("10.134.173.147", "10.134.173.236")])
+
+    def test_parses_linux_default_route(self) -> None:
+        routes = diagnose.parse_default_routes(
+            "default via 192.168.1.1 dev wlan0 proto dhcp metric 600\n"
+            "192.168.1.0/24 dev wlan0 proto kernel scope link src 192.168.1.20\n"
+        )
+        self.assertEqual(routes, [("192.168.1.1", "wlan0")])
+
+    def test_ignores_non_default_routes(self) -> None:
+        routes = diagnose.parse_default_routes(self.WINDOWS_ROUTE)
+        self.assertEqual(len(routes), 1, "只应取默认路由")
+
+    def test_adapter_names_from_ipconfig(self) -> None:
+        names = diagnose.parse_adapter_names(
+            "Windows IP Configuration\n\n"
+            "Ethernet adapter 以太网:\n   Media State . . . . . . . . . . . : Media disconnected\n\n"
+            "Unknown adapter Tailscale:\n   Media State . . . . . . . . . . . : Media disconnected\n"
+        )
+        self.assertIn("Tailscale", names)
+        self.assertIn("以太网", names)
+
+    def test_two_default_routes_are_flagged(self) -> None:
+        """多条默认路由必须报警——这正是"只有挂 VPN 才行"的典型残留。"""
+        with patch("subprocess.run") as run:
+            run.side_effect = [
+                _Proc(self.WINDOWS_ROUTE_DOUBLE),
+                _Proc("Unknown adapter Tailscale:\n"),
+            ]
+            facts = diagnose.local_network_facts()
+        joined = "\n".join(facts)
+        self.assertIn("默认路由 2 条", joined)
+        self.assertIn("[!!]", joined)
+
+    def test_command_failure_does_not_raise(self) -> None:
+        with patch("subprocess.run", side_effect=OSError("no route cmd")):
+            facts = diagnose.local_network_facts()
+        self.assertTrue(facts)
+        self.assertIn("读取失败", "\n".join(facts))
+
+
+class _Proc:
+    """subprocess.run 的最小替身（只用到 stdout）。"""
+
+    def __init__(self, stdout: str) -> None:
+        self.stdout = stdout
 
 
 if __name__ == "__main__":

@@ -798,7 +798,21 @@ class Orchestrator:
                     }
                 )
         except Exception as exc:  # noqa: BLE001 规划失败不该让整次运行失败
-            self._event(kind="plan_error", message=f"规划阶段失败，改用默认计划：{exc}")
+            # 规划失败常常是"模型根本调不通"的第一现场（实测：规划 7.8 秒失败，
+            # 紧接着子任务也失败，而记录里只有一句 `Connection error.`）。
+            # 因此网络类错误在这里**当场取证**：不发凭据、不消耗额度。
+            from .diagnose import describe_exception, is_network_error, probe_lines
+
+            message = f"规划阶段失败，改用默认计划：{describe_exception(exc)}"
+            self._event(kind="plan_error", message=message)
+            if is_network_error(exc):
+                self._event(
+                    kind="notice",
+                    task="连通性",
+                    level="error",
+                    message="模型端点现场探测（未使用凭据、不消耗额度）：\n"
+                    + "\n".join(probe_lines(getattr(self.llm, "base_url", ""), indent="  ")),
+                )
             return self._refine_plan(_fallback_plan(self.target, self.surface, self.max_tasks))
         tasks = self._refine_plan(
             _parse_plan(content, self.target, self.surface, self.max_tasks)

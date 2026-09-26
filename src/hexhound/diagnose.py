@@ -255,9 +255,140 @@ def format_probe(probe: EndpointProbe, *, title: str = "连通性诊断") -> lis
         lines.append("  注意：httpx/openai 默认 trust_env=True，会**真的**走这些代理；端口写错会直接连不上。")
     else:
         lines.append("代理环境变量：（无）—— 直连；若本机需要代理才能出网，这里就是失败原因。")
+    lines.extend(local_network_facts())
     for step in probe.steps:
         flag = "[ OK ]" if step.ok else "[FAIL]"
         lines.append(f"{flag} {step.name}（{step.elapsed_ms} ms）：{step.detail}")
     lines.append("")
     lines.append("结论：" + probe.verdict())
     return lines
+
+
+def probe_lines(base_url: str, *, timeout: float = 6.0, indent: str = "  ") -> list[str]:
+    """给"模型调用失败"现场用的一小段探测输出（**不发凭据、不消耗额度**）。
+
+    为什么在失败现场自动跑一次：真实事故里只留下 `APIConnectionError: Connection error.`，
+    用户既不知道是谁的问题，也不知道下一步做什么。失败的那一刻恰恰是**唯一**
+    能观察到现场的时刻（网络状态稍后就变了），所以必须当场取证。
+    探测耗时几百毫秒，比"事后猜"便宜得多。
+    """
+    try:
+        probe = probe_endpoint(base_url, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 诊断本身失败绝不能影响收尾
+        return [f"{indent}（连通性探测未能完成：{type(exc).__name__}: {exc}）"]
+    lines: list[str] = []
+    for step in probe.steps:
+        flag = "[OK]" if step.ok else "[!!]"
+        lines.append(f"{indent}{flag} {step.name}：{step.detail}")
+    if probe.proxy_env:
+        lines.append(f"{indent}[!!] 检测到代理环境变量：{'，'.join(probe.proxy_env)}")
+    lines.append(f"{indent}结论：{probe.verdict()}")
+    return lines
+
+
+def is_network_error(exc: BaseException) -> bool:
+    """这个异常是否属于"连不上"（网络类）——决定要不要在失败现场做连通性探测。"""
+    from .llm import classify_error
+
+    try:
+        category, _advice = classify_error(exc if isinstance(exc, Exception) else Exception(str(exc)))
+    except Exception:  # noqa: BLE001 归类失败时保守处理：不探测
+        return False
+    return category == "network"
+
+
+#: 名字里带这些词的适配器多半是隧道/虚拟网卡（VPN、WSL、虚拟机、代理的 TUN 模式）。
+TUNNEL_HINTS = (
+    "tun", "tap", "wireguard", "tailscale", "openvpn", "clash", "wintun",
+    "v2ray", "singbox", "sing-box", "warp", "zerotier", "softether", "anyconnect",
+)
+
+
+def parse_default_routes(route_print: str) -> list[tuple[str, str]]:
+    """从 `route print -4` / `ip route` 文本里取默认路由 `(网关, 接口)`。
+
+    为什么关心这个：VPN 客户端崩溃/退出后常留下一条指向死隧道的默认路由，
+    于是**换任何网络都不通**（流量被送进黑洞），而重新打开 VPN 又"好了"。
+    这是"必须挂 VPN 才能上网/调模型"最常见的成因，值得单独报出来。
+    """
+    routes: list[tuple[str, str]] = []
+    for line in str(route_print or "").splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        # Windows: "0.0.0.0          0.0.0.0    10.134.173.147     10.134.173.106     25"
+        parts = text.split()
+        if len(parts) >= 4 and parts[0] == "0.0.0.0" and parts[1] == "0.0.0.0":
+            gateway = parts[2]
+            interface = next(
+                (item for item in parts[3:] if item.count(".") == 3 and item != "0.0.0.0"),
+                "",
+            )
+            routes.append((gateway, interface))
+        # Linux: "default via 192.168.1.1 dev wlan0 proto dhcp metric 600"
+        elif parts[0] == "default":
+            gateway = parts[parts.index("via") + 1] if "via" in parts else ""
+            interface = parts[parts.index("dev") + 1] if "dev" in parts else ""
+            routes.append((gateway, interface))
+    return routes
+
+
+def parse_adapter_names(ipconfig_text: str) -> list[str]:
+    """从 `ipconfig /all`（或 `ip -br link`）里取出适配器名字。"""
+    names: list[str] = []
+    for line in str(ipconfig_text or "").splitlines():
+        text = line.strip()
+        if text.endswith(":") and "adapter" in text.lower():
+            name = text.split("adapter", 1)[1].strip().rstrip(":").strip()
+            if name:
+                names.append(name)
+        elif " " in text and text.split()[0].isdigit():
+            # Linux `ip -br link`: "2: wlan0    UP   ..."
+            names.append(text.split()[1].split("@")[0])
+    return names
+
+
+def local_network_facts() -> list[str]:
+    """本机网络事实（默认路由 / 隧道适配器 / DNS）——用于解释"为什么只有挂 VPN 才行"。
+
+    只读本机命令输出，不联网。任何一步失败都不影响结论（返回已获得的部分）。
+    """
+    import subprocess
+
+    facts: list[str] = []
+    is_windows = os.name == "nt"
+    try:
+        route_out = subprocess.run(
+            ["route", "print", "-4"] if is_windows else ["ip", "route"],
+            capture_output=True, text=True, timeout=10, check=False,
+        ).stdout
+        routes = parse_default_routes(route_out)
+        if routes:
+            described = "；".join(f"网关 {gw}" + (f"（接口 {iface}）" if iface else "") for gw, iface in routes)
+            facts.append(f"默认路由 {len(routes)} 条：{described}")
+            if len(routes) > 1:
+                facts.append(
+                    "  [!!] 存在多条默认路由：VPN/虚拟网卡退出后残留的路由会把流量送进死隧道——"
+                    "症状正是「换任何网络都不通，重新打开 VPN 又好了」。"
+                )
+        else:
+            facts.append("默认路由：未解析到（可能全部走 VPN 隧道，或命令输出格式不同）")
+    except (OSError, subprocess.SubprocessError) as exc:
+        facts.append(f"默认路由：读取失败（{type(exc).__name__}: {exc}）")
+
+    try:
+        cfg_out = subprocess.run(
+            ["ipconfig", "/all"] if is_windows else ["ip", "-br", "link"],
+            capture_output=True, text=True, timeout=10, check=False,
+        ).stdout
+        adapters = parse_adapter_names(cfg_out)
+        tunnels = [name for name in adapters if any(h in name.lower() for h in TUNNEL_HINTS)]
+        if tunnels:
+            facts.append(f"隧道/虚拟适配器：{'，'.join(tunnels)}")
+            facts.append(
+                "  [i] 若这些适配器在 VPN 关闭后仍处于启用状态，先禁用/重启它们再试——"
+                "半初始化状态（例如 Tailscale 报 starting）会拖慢或阻断解析。"
+            )
+    except (OSError, subprocess.SubprocessError) as exc:
+        facts.append(f"适配器：读取失败（{type(exc).__name__}: {exc}）")
+    return facts
