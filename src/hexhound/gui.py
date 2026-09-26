@@ -616,7 +616,8 @@ function formatHistoryRun(run) {
     <span class="tag">${escapeHtml(label)}</span>
     ${run.mode ? `<span class="tag">${escapeHtml(run.mode)}</span>` : ''}
     <div class="muted">${escapeHtml(when)} · 发现 ${run.findings || 0} · 端点 ${run.endpoints || 0} · ${Number(run.tokens || 0).toLocaleString()} token · ¥${cost}</div>
-    <div class="muted">${escapeHtml(run.id)}</div>
+    <div class="muted">产物目录：${escapeHtml(run.dir || run.id)}</div>
+    ${run.report_path ? `<div class="hint">报告文件：${escapeHtml(run.report_path)}</div>` : '<div class="muted">这次运行没有留下报告文件</div>'}
     <button type="button" data-run="${escapeHtml(run.id)}">查看这次报告</button>
   </div>`;
 }
@@ -1700,14 +1701,25 @@ def _findings_markdown(findings: list[dict], *, title: str) -> str:
 def _archive_report(artifacts: RunArtifacts, report_path: Path) -> None:
     """把最终报告复制进本次运行的产物目录（历史复盘用）。
 
+    路径刻意是**运行目录根**下的 `report.md`，不是 `write_artifact()` 的
+    `artifacts/` 子目录——`history.render_run_report()` 读的就是运行目录根，
+    两边不一致时"优先用当时写下的报告原文"会静默失效（实测踩到：
+    副本落在 artifacts/ 下，历史面板于是显示成"由快照重渲染"）。
+
     失败**不影响**审计收尾：报告已经写在输出路径上了，副本只是"历史里也有一份"。
-    但失败要留痕——否则用户会以为历史里那份就是当时的原文。
     """
     try:
         text = Path(report_path).read_text(encoding="utf-8")
     except OSError:
         return
-    artifacts.write_artifact("report.md", text)
+    if not getattr(artifacts, "enabled", False):
+        return
+    try:
+        target = Path(artifacts.dir) / "report.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    except OSError:
+        return
 
 
 def _mark_partial(result, settings: dict):

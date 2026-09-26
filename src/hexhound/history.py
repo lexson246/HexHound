@@ -87,6 +87,8 @@ def list_runs(
         usage = summary.get("usage") or {}
         stats = summary.get("stats") or {}
         report = run_dir / "report.md"
+        legacy_report = run_dir / "artifacts" / "report.md"
+        report_path = report if report.exists() else (legacy_report if legacy_report.exists() else None)
         entries.append(
             {
                 "id": run_dir.name,
@@ -101,7 +103,9 @@ def list_runs(
                 "cost": float(usage.get("estimated_cost") or 0.0),
                 "llm_calls": int(usage.get("llm_calls") or 0),
                 "tool_calls": int(usage.get("tool_calls") or 0),
-                "report_available": report.exists(),
+                #: 这次运行的报告文件在磁盘上的位置（界面直接显示，省得用户去翻目录）。
+                "report_path": str(report_path) if report_path else "",
+                "report_available": report_path is not None,
                 "snapshot_available": (run_dir / "snapshot.json").exists(),
                 "trace_available": (run_dir / "trace.jsonl").exists(),
             }
@@ -195,13 +199,18 @@ def render_run_report(run_dir: Path) -> tuple[str, str]:
     * `report`——当时写下的那一份（最可信）；
     * `snapshot`——用 `snapshot.json` 离线重渲染（报告里会写明是重建的）；
     * `none`——两者都没有。
+
+    查找顺序：运行目录根的 `report.md`（现在的写法）→ `artifacts/report.md`
+    （早期构建把副本写进了子目录）→ 快照重渲染。
+    两个位置都认，是为了让**已经跑过的历史运行**也能显示原文，
+    而不是把"路径约定变过"变成用户看到的"原文丢了"。
     """
-    report = run_dir / "report.md"
-    if report.exists():
-        try:
-            return report.read_text(encoding="utf-8"), "report"
-        except OSError:
-            pass
+    for candidate in (run_dir / "report.md", run_dir / "artifacts" / "report.md"):
+        if candidate.exists():
+            try:
+                return candidate.read_text(encoding="utf-8"), "report"
+            except OSError:
+                continue
     markdown = _rerender_from_snapshot(run_dir)
     if markdown:
         return markdown, "snapshot"

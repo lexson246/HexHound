@@ -150,3 +150,50 @@ def test_directory_without_any_summary_is_unknown(tmp_path: Path) -> None:
     (tmp_path / "runs" / "empty").mkdir(parents=True)
     runs = history.list_runs(home=tmp_path)
     assert runs[0]["status"] == history.STATUS_UNKNOWN
+
+
+def test_archived_report_is_found_at_the_real_path(tmp_path: Path, monkeypatch) -> None:
+    """**真实路径**回归：审计收尾写的副本，历史必须能当作"原文"读到。
+
+    这条用例存在的原因（实测漏洞）：`_archive_report()` 早期走
+    `RunArtifacts.write_artifact()`，把副本写进了运行目录的 `artifacts/` 子目录，
+    而 `render_run_report()` 读的是运行目录根 —— 于是"优先用当时写下的报告原文"
+    静默失效，界面显示成"由快照重渲染"。当时的测试把报告直接放在根目录，
+    所以没抓到；这里改成**调用真实的归档函数**再看历史能不能找到。
+    """
+    from hexhound import gui as gui_module
+    from hexhound.memory import RunArtifacts
+
+    monkeypatch.setattr(gui_module.history, "data_home", lambda home=None: tmp_path)
+    artifacts = RunArtifacts("http://127.0.0.1:5000", home=tmp_path)
+    assert artifacts.enabled, "产物目录应可用"
+    (artifacts.dir / "run.json").write_text(
+        json.dumps({"target": "http://127.0.0.1:5000", "mode": "blackbox"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    delivered = tmp_path / "delivered-report.md"
+    delivered.write_text("## 当时写下的报告\n\n正文\n", encoding="utf-8")
+
+    gui_module._archive_report(artifacts, delivered)
+
+    detail = history.run_detail(artifacts.dir.name, home=tmp_path)
+    assert detail is not None
+    assert detail["markdown_source"] == "report", detail
+    assert "当时写下的报告" in detail["markdown"]
+    entry = history.list_runs(home=tmp_path)[0]
+    assert entry["report_available"] is True
+    assert entry["report_path"].endswith("report.md"), entry["report_path"]
+
+
+def test_legacy_artifacts_subdir_report_still_reads(tmp_path: Path) -> None:
+    """早期构建把副本写在 `artifacts/report.md`：已跑过的运行也要能显示原文。"""
+    run_dir = _make_run(tmp_path, "legacy-run", report=None, snapshot=True)
+    legacy = run_dir / "artifacts"
+    legacy.mkdir(parents=True, exist_ok=True)
+    (legacy / "report.md").write_text("## 旧位置的原文\n\n内容\n", encoding="utf-8")
+    detail = history.run_detail("legacy-run", home=tmp_path)
+    assert detail is not None
+    assert detail["markdown_source"] == "report"
+    assert "旧位置的原文" in detail["markdown"]
+    entry = history.list_runs(home=tmp_path)[0]
+    assert "artifacts" in entry["report_path"].replace("\\", "/")
