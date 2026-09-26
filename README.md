@@ -618,8 +618,27 @@ target host to `ALLOWED_HOSTS` in `.env` first, otherwise every request is refus
 ALLOWED_HOSTS=127.0.0.1,localhost,authorized-target.com
 ```
 
-> ⚠️ Both modes are **read-only and non-destructive**. HexHound never touches any host outside
-> `ALLOWED_HOSTS`.
+**Or turn the host restriction off entirely** with the `*` sentinel — no list to maintain:
+
+```ini
+ALLOWED_HOSTS=*          # 不限制主机：任何主机都可以被访问
+```
+
+What that changes and what it does not:
+
+* it removes the **host** restriction at every entry point (tools, browser verification, screenshots,
+  sandbox commands *and* the sandbox's in-process DNS/socket guard);
+* it does **not** remove the other boundaries: only `http`/`https` are allowed (`file:`/`data:` are
+  still refused), the sandbox still blocks destructive/privilege-escalation/reverse-shell fragments,
+  the tool allowlist still applies, and replanned sub-tasks still cannot point at a host other than
+  this run's target;
+* the mode is **stated where it matters** — CLI banner, the GUI run log, and the report header
+  (`范围：不限制主机（ALLOWED_HOSTS=*）——任何主机都可能被访问`), plus inside `surface.json`, so an
+  offline re-render of that report keeps saying so. It never silently looks scoped.
+
+> ⚠️ Both modes are **read-only and non-destructive**. With a list, HexHound never touches any host
+> outside `ALLOWED_HOSTS`; with `*`, that guarantee is yours to keep — only point it at targets you
+> are authorized to test.
 
 ## Model providers and per-role models
 

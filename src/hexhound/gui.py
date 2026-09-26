@@ -26,6 +26,8 @@ from .config import (
     _normalize_host,
     normalize_base_url,
     resolve_provider,
+    scope_allows,
+    scope_unrestricted,
     write_env_file,
 )
 from .diff import diff_findings
@@ -1791,7 +1793,7 @@ def _run_audit(settings: dict, token: int) -> None:
         config.validate()
         target = settings.get("target", "")
         target_host = (urlparse(target).hostname or "").lower()
-        if target_host not in allowed:
+        if not scope_allows(allowed, target_host):
             raise ValueError(
                 f"目标主机 {target_host!r} 不在 ALLOWED_HOSTS 白名单内，请先把它加进去。"
             )
@@ -1824,6 +1826,19 @@ def _run_audit(settings: dict, token: int) -> None:
             )
             if getattr(config, field.key)
         ]
+        if scope_unrestricted(allowed):
+            STATE.add_event(
+                {
+                    "kind": "notice",
+                    "task": "范围",
+                    "level": "warn",
+                    "message": (
+                        "未限制主机（ALLOWED_HOSTS=*）：任何主机都可能被访问，"
+                        "请确认为已授权目标。范围会写进报告。"
+                    ),
+                },
+                token,
+            )
         STATE.add_event(
             {
                 "kind": "notice",
@@ -1834,7 +1849,9 @@ def _run_audit(settings: dict, token: int) -> None:
             token,
         )
         artifacts = RunArtifacts(target)
-        surface = AttackSurface(target=target, mode=mode, path=artifacts.surface_path)
+        surface = AttackSurface(
+            target=target, mode=mode, path=artifacts.surface_path, allowed_hosts=allowed
+        )
         goal = _goal_for(mode, settings.get("path", ""), target)
 
         def on_step(step: dict) -> None:
@@ -2129,7 +2146,7 @@ def create_app() -> Flask:
         allowed = frozenset(
             _normalize_host(item) for item in allowed_raw.split(",") if item.strip()
         )
-        if parsed.scheme not in ("http", "https") or not host or host not in allowed:
+        if parsed.scheme not in ("http", "https") or not host or not scope_allows(allowed, host):
             return jsonify({"error": "登录 URL 不在 ALLOWED_HOSTS 白名单内。"}), 400
         timeout = int(str(data.get("timeout") or "300"))
         timeout = max(60, min(timeout, 600))
@@ -2301,7 +2318,7 @@ def create_app() -> Flask:
         allowed = frozenset(
             _normalize_host(item) for item in allowed_raw.split(",") if item.strip()
         )
-        if parsed.scheme not in ("http", "https") or not host or host not in allowed:
+        if parsed.scheme not in ("http", "https") or not host or not scope_allows(allowed, host):
             return jsonify({"error": "目标 URL 不在 ALLOWED_HOSTS 白名单内。"}), 400
         try:
             timeout = int(str(data.get("request_timeout") or "30"))

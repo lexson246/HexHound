@@ -230,11 +230,23 @@ class Finding:
 class AttackSurface:
     """一次运行共享的攻面状态（线程安全）。"""
 
-    def __init__(self, target: str = "", mode: str = "blackbox", path: Path | None = None) -> None:
+    def __init__(
+        self,
+        target: str = "",
+        mode: str = "blackbox",
+        path: Path | None = None,
+        allowed_hosts: Iterable[str] = (),
+    ) -> None:
         self.target = target
         self.mode = mode
         self.host = host_of(target)
         self.path = path
+        #: 本次运行的授权主机范围（`("*",)` 表示不限制）。
+        #: 跟着攻面一起落盘：这样**离线重渲染**的报告也知道当时的范围，
+        #: 而不是让"没限制主机"的运行看起来像严格限定过范围。
+        self.allowed_hosts: tuple[str, ...] = tuple(
+            sorted({str(item).strip().lower() for item in allowed_hosts if str(item).strip()})
+        )
         self._lock = threading.RLock()
         self.endpoints: dict[str, Endpoint] = {}
         self.forms: dict[str, dict[str, Any]] = {}
@@ -902,6 +914,7 @@ class AttackSurface:
             return {
                 "target": self.target,
                 "mode": self.mode,
+                "allowed_hosts": list(self.allowed_hosts),
                 "started_at": self.started_at,
                 "endpoints": [asdict(item) for item in self.endpoints.values()],
                 "forms": list(self.forms.values()),
@@ -934,13 +947,27 @@ class AttackSurface:
         return target
 
     @classmethod
-    def load(cls, path: str | Path, target: str = "", mode: str = "blackbox") -> AttackSurface:
-        """从磁盘恢复攻面；文件不存在或损坏时返回空攻面。"""
-        surface = cls(target=target, mode=mode, path=Path(path))
+    def load(
+        cls,
+        path: str | Path,
+        target: str = "",
+        mode: str = "blackbox",
+        allowed_hosts: Iterable[str] = (),
+    ) -> AttackSurface:
+        """从磁盘恢复攻面；文件不存在或损坏时返回空攻面。
+
+        `allowed_hosts` 优先取文件里记的那份（那次运行的实际范围），
+        调用方传的值只作为**旧文件没有这个字段**时的回退——否则离线重渲染
+        会把当时"不限制主机"的运行说成"限定了白名单"。
+        """
+        surface = cls(target=target, mode=mode, path=Path(path), allowed_hosts=allowed_hosts)
         try:
             raw = json.loads(Path(path).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return surface
+        recorded = raw.get("allowed_hosts")
+        if isinstance(recorded, list) and recorded:
+            surface.allowed_hosts = tuple(sorted({str(item).strip().lower() for item in recorded if str(item).strip()}))
         for item in raw.get("endpoints", []) or []:
             key = surface.add_endpoint(
                 str(item.get("url") or ""),

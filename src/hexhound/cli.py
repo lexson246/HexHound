@@ -25,6 +25,7 @@ from .config import (
     _legacy_or_preset_base_url,
     normalize_base_url,
     resolve_provider,
+    scope_allows,
     write_env_file,
 )
 from .console import (
@@ -255,11 +256,12 @@ def _run_audit(
 
     # 目标主机必须在白名单内，否则 http_request 会被全部拒绝。
     target_host = (urlparse(target).hostname or "").lower()
-    if target_host not in config.allowed_hosts:
+    if not scope_allows(config.allowed_hosts, target_host):
         allowed = ", ".join(sorted(config.allowed_hosts))
         raise click.ClickException(
             f"目标主机 {target_host!r} 不在 ALLOWED_HOSTS 白名单（{allowed}）内，"
             "请在 .env 的 ALLOWED_HOSTS 中追加该主机后重试（或运行 hexhound setup）。"
+            "\n如果本次不需要限制主机，把 ALLOWED_HOSTS 设为 * 即可（会写进报告的范围说明）。"
         )
 
     if mode == "source":
@@ -284,6 +286,11 @@ def _run_audit(
             "按 OWASP Top 10 覆盖，只记录有真实请求证据的漏洞。"
         )
 
+    if config.scope_unrestricted:
+        click.echo(
+            f"{MARK_WARN} 范围：**不限制主机**（ALLOWED_HOSTS=*）——"
+            "任何主机都可能被访问；请自行确认为已授权目标。这条会写进报告。"
+        )
     llm, llm_pool = _build_llm_pool(config, verbose)
     budget = Budget(limits_from_config(config))
 
@@ -308,7 +315,10 @@ def _run_audit(
                 click.echo(f"  {probe['hint']}")
             sandbox = None
     artifacts = RunArtifacts(target)
-    surface = AttackSurface(target=target, mode=mode, path=artifacts.surface_path)
+    surface = AttackSurface(
+            target=target, mode=mode, path=artifacts.surface_path,
+            allowed_hosts=config.allowed_hosts,
+        )
 
     # ---- API 合约导入（OpenAPI 3 / Swagger 2）----
     # 位置很关键：**在规划之前**导入。接口必须先进入攻面，规划者才看得到

@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from .config import scope_allows
 from .sanitize import clip_head_tail, decode_output, sanitize_terminal_text
 
 # ---------------------------------------------------------------------------
@@ -117,13 +118,21 @@ FORBIDDEN_SCRIPT_PATTERNS: tuple[tuple[str, str], ...] = (
 #: 在真正发包前就被拒绝——拼接、编码、变量间接都绕不过去。
 #: 代价是这层护栏是 Python 级的（脚本理论上能把钩子改回去），
 #: 所以静态扫描 + 白名单双保险，且脚本通道只对注入/认证/复核角色开放。
+#:
+#: 不限制模式（`ALLOWED_HOSTS=*`）下**不注入这层护栏**：护栏的判据是
+#: "主机名在允许集合里"，把 `*` 当普通成员传进去会让它拒绝**所有**主机——
+#: 那就成了"设了不限制，沙箱脚本反而全挂"。此时靠静态扫描保住工具白名单与
+#: 破坏性片段拦截，网络层面不做主机限制（与工具的 `scope_allows` 语义一致）。
 _SCRIPT_GUARD = '''
 import socket as _socket
 _ALLOW = set({allow!r})
+_ANY = "*" in _ALLOW
 _getaddrinfo = _socket.getaddrinfo
 _connect = _socket.socket.connect
 
 def _check(host):
+    if _ANY:
+        return
     name = str(host).strip().strip("[]").lower()
     if name in _ALLOW:
         return
@@ -551,7 +560,7 @@ class Sandbox:
                 hosts.add(candidate.lower())
             for candidate in _BARE_IPV6_RE.findall(command):
                 hosts.add(candidate.strip("[]").lower())
-        outside = sorted(host for host in hosts if host not in self.allowed_hosts)
+        outside = sorted(host for host in hosts if not scope_allows(self.allowed_hosts, host))
         if outside:
             raise ScopeViolation(
                 "命令里出现白名单外的主机，已拒绝执行："
@@ -875,7 +884,7 @@ class Sandbox:
         # 引号/字典里的裸域名：脚本里最常见的形式是 "http://host" 或 {"host": ...}
         for candidate in re.findall(r"""['"]([a-z0-9][a-z0-9.\-]{2,253}\.[a-z]{2,24})['"]""", text, re.I):
             hosts.add(candidate.lower())
-        outside = sorted(host for host in hosts if host not in self.allowed_hosts)
+        outside = sorted(host for host in hosts if not scope_allows(self.allowed_hosts, host))
         if outside:
             raise ScopeViolation(
                 "脚本里出现白名单外的主机，已拒绝执行："
@@ -1203,7 +1212,7 @@ class Sandbox:
             command += " " + extra
         # nmap 的裸主机不会被 _BARE_HOST_RE 之外的写法绕过——但 host 形如
         # "127.0.0.1"（无点分域名）时正则抠不到，因此显式再校验一次。
-        outside = [h for h in [host.lower()] if h not in self.allowed_hosts and h]
+        outside = [h for h in [host.lower()] if h and not scope_allows(self.allowed_hosts, h)]
         if outside:
             return ExecResult(
                 ok=False, command=command, exec_id=self._next_id(),

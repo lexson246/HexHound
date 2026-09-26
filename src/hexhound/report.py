@@ -411,6 +411,25 @@ def _finding_section(finding: dict, goal: str, index: int) -> list[str]:
     return lines
 
 
+def _scope_line(result: AgentResult) -> str:
+    """报告头里的范围说明（来自快照/结果里的 allowed_hosts）。"""
+    allowed = getattr(result, "allowed_hosts", None)
+    if allowed is None:
+        surface = getattr(result, "surface", None)
+        allowed = getattr(surface, "allowed_hosts", None) if surface else None
+    if not allowed:
+        return ""
+    hosts = sorted(str(item) for item in allowed if item)
+    if not hosts:
+        return ""
+    if "*" in hosts:
+        return (
+            "- 范围：**不限制主机（ALLOWED_HOSTS=*）**——本次运行未启用主机白名单，"
+            "任何主机都可能被访问；结论仅对已明确授权的目标有效"
+        )
+    return "- 范围（ALLOWED_HOSTS）：" + ", ".join(hosts)
+
+
 def to_markdown(result: AgentResult, goal: str) -> str:
     """Markdown 报告。"""
     findings = result.findings or []
@@ -436,6 +455,10 @@ def to_markdown(result: AgentResult, goal: str) -> str:
         ),
         f"- 预估费用：¥{result.estimated_cost:.6f}",
     ]
+    # 作用域模式如实写进报告头：**不限制主机**时报告不能看起来像"只打了授权范围内的目标"。
+    scope_note = _scope_line(result)
+    if scope_note:
+        lines.append(scope_note)
     if stats:
         lines.append(
             "- 攻面：端点 {endpoints} 个｜表单 {forms} 个｜尝试 {attempts} 次"

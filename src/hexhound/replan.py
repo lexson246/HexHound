@@ -28,6 +28,11 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
+#: 作用域判据与全项目同一份（支持 `ALLOWED_HOSTS=*`）。
+#: 注意：**"新任务主机必须等于本次目标主机"这条规则与白名单无关**，
+#: 不限制主机时它照样生效——否则重规划就成了"跑到别的目标去"的旁路。
+from .config import scope_allows
+
 # ---------------------------------------------------------------------------
 # 上限（全部是硬编码常量，不通过提示词约束——提示词失效时这些仍然生效）
 # ---------------------------------------------------------------------------
@@ -345,7 +350,7 @@ def check_scope_unchanged(
     host = (urlparse(text).hostname or "").lower()
     if not host:
         return f"无法从 url={text!r} 解析主机。"
-    if host not in allowed_hosts:
+    if not scope_allows(allowed_hosts, host):
         return (
             f"新任务的目标主机 {host!r} 不在白名单内。"
             "重规划不能扩大授权范围。"

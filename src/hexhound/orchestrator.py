@@ -617,7 +617,12 @@ class Orchestrator:
         self.parallel = max(1, min(parallel, 6))
         self.budget = budget or Budget()
         self.artifacts = artifacts or RunArtifacts(target, enabled=False)
-        self.surface = surface or AttackSurface(target=target, mode=mode, path=self.artifacts.surface_path)
+        self.surface = surface or AttackSurface(
+            target=target,
+            mode=mode,
+            path=self.artifacts.surface_path,
+            allowed_hosts=self.allowed_hosts,
+        )
         self.auth_profiles = auth_profiles or {}
         self.rate_limit = rate_limit
         self.verbose = verbose

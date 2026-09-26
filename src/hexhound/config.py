@@ -18,6 +18,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -123,6 +124,16 @@ DEFAULT_MODEL = ""
 DEFAULT_MAX_STEPS = 30
 DEFAULT_REQUEST_TIMEOUT = 10
 DEFAULT_ALLOWED_HOSTS = "127.0.0.1,localhost"
+#: "不限制主机"的哨兵值：`ALLOWED_HOSTS=*`。
+#:
+#: 为什么是哨兵而不是"删掉白名单"：作用域校验在 10 处生效（工具、浏览器、
+#: 截图、沙箱命令与脚本、CLI、GUI…），其中沙箱还有一层**进程内 DNS/socket 拦截**
+#: （拼接域名也绕不过）。把机制删掉等于同时失去"限制"与"能限制"的能力；
+#: 保留机制 + 一个显式开关，既能让你不再维护列表，又能在需要时一键收紧。
+#:
+#: 代价必须说清：不限制时，**任何**主机都可能被访问。这份配置换来的行为差异
+#: 会写进运行记录与报告（见 `Config.scope_unrestricted`），不会静默发生。
+ANY_HOST = "*"
 # 多代理编排相关默认值（与 orchestrator.py 的常量保持一致）。
 DEFAULT_MAX_TASKS = 6
 DEFAULT_TASK_STEPS = 10
@@ -155,13 +166,37 @@ def _parse_float(name: str, default: float) -> float:
 
 
 def _normalize_host(raw: str) -> str:
-    """把用户输入归一化成裸主机名（容忍带 scheme/端口/路径的 URL）。"""
+    """把用户输入归一化成裸主机名（容忍带 scheme/端口/路径的 URL）。
+
+    `*` 是**不限制主机**的哨兵（见 `ANY_HOST`），必须原样保留——
+    走 URL 解析会被 `urlparse("//*").hostname` 变成 `"*"` 或空串，
+    两种结果都不能接受（后者会让"不限制"静默退化成"什么都不允许"）。
+    """
     value = raw.strip().lower()
     if not value:
         return ""
+    if value == ANY_HOST or value in ("any", "all", "0.0.0.0/0"):
+        return ANY_HOST
     if "://" not in value:
         value = "//" + value
     return (urlparse(value).hostname or "").lower()
+
+
+def scope_allows(allowed_hosts: Any, host: str) -> bool:
+    """这个主机是否在允许范围内（**全项目唯一的作用域判据**）。
+
+    所有作用域检查都必须走这里，而不是各处自己写 `host in allowed_hosts`：
+    漏掉一处的后果是"某个入口在 `ALLOWED_HOSTS=*` 下仍然拒绝"，
+    表现为"我明明设了不限制，它还是说不在白名单"。
+    """
+    if ANY_HOST in set(allowed_hosts or ()):
+        return True
+    return str(host or "").strip().lower() in set(allowed_hosts or ())
+
+
+def scope_unrestricted(allowed_hosts: Any) -> bool:
+    """是否处于"不限制主机"模式（供界面/报告如实标注）。"""
+    return ANY_HOST in set(allowed_hosts or ())
 
 
 def normalize_base_url(raw: str) -> str:
@@ -373,14 +408,29 @@ class Config:
         return source
 
     def describe(self) -> str:
-        """一行摘要：提供商/模型 + 角色覆盖。"""
+        """一行摘要：提供商/模型 + 角色覆盖 + 作用域模式。"""
         parts = [f"{self.provider}/{self.model}"]
         overrides = [
             f"{role}={model}" for role, model in sorted(self.role_models.items()) if model
         ]
         if overrides:
             parts.append("角色覆盖 " + ", ".join(overrides))
+        if self.scope_unrestricted:
+            parts.append("作用域：不限制主机（ALLOWED_HOSTS=*）")
+        else:
+            parts.append("作用域：" + ", ".join(sorted(self.allowed_hosts)))
         return "；".join(parts)
+
+    @property
+    def scope_unrestricted(self) -> bool:
+        """当前是否"不限制主机"（报告与界面要如实标注，不能静默）。"""
+        return scope_unrestricted(self.allowed_hosts)
+
+    def scope_description(self) -> str:
+        """给报告/界面用的一句范围说明。"""
+        if self.scope_unrestricted:
+            return "不限制主机（ALLOWED_HOSTS=*）——任何主机都可能被访问"
+        return ", ".join(sorted(self.allowed_hosts))
 
     # ---------- 校验 ----------
 

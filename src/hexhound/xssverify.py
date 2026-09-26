@@ -38,6 +38,10 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
+#: 作用域判据与全项目同一份（支持 `ALLOWED_HOSTS=*` 的不限制模式）：
+#: 各入口自己写 `host in allowed_hosts`，会出现"设了不限制、某些入口仍然拒绝"。
+from .config import scope_allows
+
 #: 验证结论的级别（从弱到强）。
 VERDICT_LEVELS = ("absent", "blocked", "reflected", "dom", "executed")
 
@@ -257,7 +261,7 @@ def _validate_browser_url(url: str, allowed_hosts: frozenset[str]) -> str:
     host = (parsed.hostname or "").lower()
     if not host:
         return f"无法从 URL 解析主机：{text}"
-    if host not in allowed_hosts:
+    if not scope_allows(allowed_hosts, host):
         allowed = ", ".join(sorted(allowed_hosts))
         return f"拒绝：主机 {host!r} 不在白名单（{allowed}）内，浏览器不会打开它。"
     return ""
@@ -578,7 +582,7 @@ class BrowserVerifier:
         ]
         # 最终 URL 也要在范围内：重定向是绕过作用域的经典手法
         final_host = (urlparse(observation.final_url).hostname or "").lower()
-        if final_host and final_host not in self.allowed_hosts:
+        if final_host and not scope_allows(self.allowed_hosts, final_host):
             raise ScopeRefused(
                 f"页面被重定向到白名单外的 {final_host!r}（{observation.final_url}）。"
                 "已停止验证——浏览器只允许访问授权范围内的目标。"

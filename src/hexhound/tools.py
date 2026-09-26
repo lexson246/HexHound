@@ -32,6 +32,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from . import knowledge as KB
+from .config import scope_allows
 from .dedupe import dedupe_key, vuln_class
 from .memory import RunArtifacts
 from .sanitize import sanitize_terminal_text
@@ -175,9 +176,12 @@ def validate_url_against(url: str, allowed_hosts: Any) -> tuple[Any, str | None]
     host = (parsed.hostname or "").lower()
     if not host:
         return parsed, f"错误：无法从 URL 解析主机：{url}"
-    if host not in allowed_hosts:
+    if not scope_allows(allowed_hosts, host):
         allowed = ", ".join(sorted(allowed_hosts))
-        return parsed, f"拒绝：主机 {host!r} 不在白名单（{allowed}）内，已阻止该请求。"
+        return parsed, (
+            f"拒绝：主机 {host!r} 不在白名单（{allowed}）内，已阻止该请求。"
+            "（若本次不需要限制主机，把 ALLOWED_HOSTS 设为 * 。）"
+        )
     return parsed, None
 
 
