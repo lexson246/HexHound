@@ -462,10 +462,18 @@ class ReActAgent:
             except Exception as exc:  # noqa: BLE001 provider 故障必须形成明确终态
                 # 以前这里会把异常抛到 TaskWorker，结果是"整个子任务的产出丢失"。
                 # 现在转成一个明确的终态 + 保留已有产出（steps/findings/coverage）。
+                #
+                # 错误文案必须带**因果链**：SDK 顶层摘要常常只是 "Connection error."，
+                # 真正的判据（getaddrinfo failed / 连接被拒 / 证书错误）在 __cause__ 里。
+                # 实测过一次运行只留下 "APIConnectionError: Connection error."，
+                # 事后完全无法判定是 DNS、代理还是网络的问题（见 diagnose 模块）。
+                from .diagnose import describe_exception
+
                 finish_reason = "provider_error"
                 final_summary = (
-                    f"模型调用失败（{type(exc).__name__}: {exc}）。"
+                    f"模型调用失败（{describe_exception(exc)}）。"
                     "已保留中断前的全部产出（步骤、发现、覆盖记录）。"
+                    "排查可运行 `hexhound doctor`（分步探测 DNS/TCP/TLS，不消耗额度）。"
                 )
                 emit({"step": step_no, "action": "provider_error", "observation": final_summary})
                 break

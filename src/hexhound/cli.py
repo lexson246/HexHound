@@ -22,6 +22,7 @@ from .budget import Budget, limits_from_config
 from .config import (
     ROLES,
     Config,
+    _legacy_or_preset_base_url,
     normalize_base_url,
     resolve_provider,
     write_env_file,
@@ -946,6 +947,67 @@ def memory_cmd(
         f"{MARK_OK} 已删除 {outcome['removed']} 条，剩余 {outcome['kept']} 条"
         + ("（已整体重置）" if reset else "")
     )
+
+
+@main.command("doctor")
+@click.option("--base-url", "base_url", default=None, help="覆盖要诊断的 base_url（默认取配置）")
+@click.option("--timeout", default=8.0, show_default=True, help="每一步的超时（秒）")
+@click.option("--models", "show_models", is_flag=True, help="再列出该 key 可用的模型名（GET /v1/models，不计费）")
+def doctor_cmd(base_url: str | None, timeout: float, show_models: bool) -> None:
+    """诊断"模型调不通"：分步探测 DNS → TCP → TLS → 未认证 HTTP。
+
+    **探测本身不消耗任何模型额度**（不发带凭据的请求）；`--models` 会带 key 调
+    `GET /v1/models`，该接口同样不计费——这是核对模型名最便宜的权威手段。
+
+    为什么单独有这个命令：一次真实运行只留下 `APIConnectionError: Connection error.` ——
+    SDK 的摘要把底层原因（DNS 失败 / 连接被拒 / 证书被替换 / 代理端口写错）全吞了，
+    事后无法判定。这里把每一步单独列出来，并**报出代理环境变量**
+    （httpx/openai 默认 trust_env=True，会真的走代理）。
+    """
+    from .diagnose import format_probe, list_models, probe_endpoint
+
+    config = None
+    try:
+        config = Config.from_env()
+    except ValueError as exc:
+        # 配置不全也要能诊断：用预设的 base_url 兜底
+        click.echo(f"{MARK_WARN} 配置不完整（{exc}）——改用默认/预设地址诊断。")
+    target = (
+        base_url
+        or (config.base_url if config else "")
+        or _legacy_or_preset_base_url(resolve_provider())
+    )
+    if not target:
+        click.echo(f"{MARK_FAIL} 没有可诊断的 base_url：请在 .env 里设置 LLM_BASE_URL，或用 --base-url 指定。")
+        raise SystemExit(2)
+    if config is not None:
+        key_state = "已配置" if config.api_key else "未配置"
+        click.echo(f"提供商：{config.provider or '(未选择)'}    模型：{config.model or '(未填写)'}")
+        click.echo(f"key：{key_state}（探测不使用 key）")
+    probe = probe_endpoint(target, timeout=max(1.0, timeout))
+    for line in format_probe(probe, title="模型端点连通性"):
+        click.echo(line)
+
+    if show_models:
+        click.echo("")
+        click.echo("== 该 key 可用的模型名（GET /v1/models，不计费）==")
+        api_key = config.api_key if config is not None else ""
+        models, error = list_models(target, api_key, timeout=max(5.0, timeout))
+        if error:
+            click.echo(f"{MARK_FAIL} {error}")
+        else:
+            click.echo("  " + "，".join(models) if models else "  （列表为空）")
+            configured = (config.model if config is not None else "") or ""
+            if configured:
+                if configured in models:
+                    click.echo(f"{MARK_OK} 当前配置的模型 {configured} 在列表里。")
+                else:
+                    click.echo(
+                        f"{MARK_FAIL} 当前配置的模型 {configured} **不在**列表里——"
+                        "模型调用会失败（这不是网络问题）。"
+                    )
+    if not probe.reachable:
+        raise SystemExit(1)
 
 
 @main.command("providers")

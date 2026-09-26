@@ -79,12 +79,20 @@ class ConnectionCheck:
 
 
 def classify_error(exc: Exception) -> tuple[str, str]:
-    """把 SDK 异常归成 (类别, 可读建议)，供界面给出下一步提示。"""
-    text = f"{type(exc).__name__}: {exc}"
-    low = text.lower()
+    """把 SDK 异常归成 (类别, 可读建议)，供界面给出下一步提示。
+
+    **必须带上因果链**：SDK 的顶层摘要常常是 `Connection error.` 这种零信息量的话，
+    真正的判据（`getaddrinfo failed` / `连接被积极拒绝` / 证书错误）在 `__cause__` 里。
+    只用顶层摘要归类，会把"DNS 解析失败"和"代理端口写错"混成同一条建议。
+    """
+    from .diagnose import describe_exception
+
+    chain_text = describe_exception(exc)
+    # 归类与实际展示都用链条文本：底层 errno/域名才是可操作的信息
+    low = chain_text.lower()
     if any(token in low for token in ("supported api model names", "supported model", "available models")):
         # 有些提供商在 400 里直接列出合法模型名——把原文带出来，比泛泛提示有用得多
-        return "model", f"模型名不被接受，提供商的合法模型见下；或改用下拉里列出的名称。\n{text[:400]}"
+        return "model", f"模型名不被接受，提供商的合法模型见下；或改用下拉里列出的名称。\n{chain_text[:400]}"
     if "401" in low or "authentication" in low or "invalid api key" in low or "unauthorized" in low:
         return "auth", "API key 无效或未授权：检查 key 是否填对、是否属于该提供商。"
     if "403" in low or "permission" in low:
@@ -98,9 +106,30 @@ def classify_error(exc: Exception) -> tuple[str, str]:
         return "model", "模型名不存在：用界面里的模型下拉选一个，或核对提供商文档里的确切名称。"
     if "429" in low or "rate limit" in low or "quota" in low or "insufficient" in low:
         return "quota", "限流或余额不足：稍后重试，或换一个提供商/降低并发（PARALLEL）。"
-    if any(token in low for token in ("timeout", "timed out", "connection", "ssl", "proxy", "getaddrinfo", "unreachable")):
-        return "network", "网络不可达：检查 base_url 是否正确、是否需要代理（国内直连 OpenAI/Anthropic 常失败）。"
-    return "unknown", "未知错误：把完整报错贴出来，或用 --verbose 看请求细节。"
+    if "getaddrinfo" in low or "name or service not known" in low or "nodename nor servname" in low:
+        return "network", (
+            f"域名解析失败（不是 key 的问题）：检查 DNS/网络，或 base_url 是否写错。\n{chain_text[:400]}\n"
+            "可用 `hexhound doctor` 看分步探测结果。"
+        )
+    if "refused" in low or "10061" in low:
+        return "network", (
+            f"连接被拒（对方端口没开，或代理端口写错）：若配了代理，先确认代理在运行。\n{chain_text[:400]}\n"
+            "可用 `hexhound doctor` 看分步探测结果。"
+        )
+    if any(token in low for token in ("timeout", "timed out")):
+        return "network", f"请求超时：网络慢或被拦。\n{chain_text[:400]}\n可用 `hexhound doctor` 看分步探测结果。"
+    if any(token in low for token in ("certificate", "ssl", "tls")):
+        return "network", (
+            f"TLS/证书失败：可能是中间设备替换了证书（公司代理、杀软）或根证书异常。\n{chain_text[:400]}\n"
+            "可用 `hexhound doctor` 看证书签发者。"
+        )
+    if any(token in low for token in ("connection", "proxy", "unreachable", "eof", "reset")):
+        return "network", (
+            "网络不可达：检查 base_url 是否正确、是否需要代理"
+            "（国内直连 OpenAI/Anthropic 常失败）。"
+            f"\n{chain_text[:400]}\n可用 `hexhound doctor` 看分步探测结果。"
+        )
+    return "unknown", f"未知错误：把完整报错贴出来，或用 --verbose 看请求细节。\n{chain_text[:400]}"
 
 
 def build_llm_pool(

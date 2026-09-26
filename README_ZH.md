@@ -569,6 +569,25 @@ hexhound audit --target URL --provider custom \
   --base-url https://your-gateway/v1 --model your-model           # 自定义端点
 ```
 
+### 模型调不通时，先查清"为什么"
+
+`APIConnectionError: Connection error.` 是 OpenAI SDK 的**摘要**，它同时覆盖
+"DNS 挂了""代理端口写错""证书被替换"——真实运行里只留下这一句时，事后根本无法判定。
+现在有两处改动补上这个缺口：
+
+* 失败信息带**因果链**（`… ← httpx.ConnectError: [Errno 11001] getaddrinfo failed`），
+  出现在运行记录、报告与界面报错里；
+* `hexhound doctor` 对配置的端点做分步探测：DNS → TCP → TLS → 未认证 HTTP，
+  并报出代理环境变量。**不发凭据，因此不消耗任何额度**：
+
+```bash
+hexhound doctor                    # 每步的耗时、证书签发者、代理变量，一眼看出卡在哪
+hexhound doctor --models           # 列出该 key 可用的模型名（GET /v1/models，不计费）
+```
+
+`--models` 是核对模型名最便宜的办法：模型名写错时提供商往往只回一句"模型不存在"，
+而合法名字就在这个列表里——命令会直接告诉你**当前配的名字在不在列表里**。
+
 `.env` 里对应这样写（`hexhound setup` 或 GUI 面板会自动生成）：
 
 ```ini
