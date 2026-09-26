@@ -191,7 +191,9 @@ class ProbeEndpointTests(unittest.TestCase):
             self.assertEqual(proxy_environment().get("HTTPS_PROXY"), "http://127.0.0.1:7892")
             probe = probe_endpoint(self.base, timeout=5)
         self.assertIn("HTTPS_PROXY", probe.proxy_env)
-        self.assertIn("trust_env", "\n".join(format_probe(probe)))
+        text = "\n".join(format_probe(probe))
+        self.assertIn("代理环境变量", text)
+        self.assertIn("httpx 实际会用的代理", text, "必须报告 httpx 真正会用的代理，而不只是环境变量")
 
 
 class ListModelsTests(unittest.TestCase):
@@ -389,6 +391,90 @@ class _Proc:
 
     def __init__(self, stdout: str) -> None:
         self.stdout = stdout
+
+
+class EffectiveProxyTests(unittest.TestCase):
+    """系统代理（Windows 注册表）也必须看见——这是"只有挂 VPN 才行"的真实成因。
+
+    事故链条（已受控复现，见 docs/WORK-REPORT-ROUND3.md）：
+    代理客户端（Clash/V2Ray 那类）把系统代理设成 127.0.0.1:7892；
+    退出时**没复位**；httpx 经 urllib.request.getproxies() 读到它 →
+    请求全打到没人监听的端口 → SDK 重试 3 次 → ~7.3 秒后 APIConnectionError、0 token。
+    系统代理是用户级/机器级设置，**与当前连哪个网络无关**，
+    所以"换任何网络都不行"这个观察完全对得上。
+    """
+
+    def test_effective_proxy_reflects_what_httpx_uses(self) -> None:
+        from unittest.mock import patch
+
+        with patch(
+            "urllib.request.getproxies",
+            lambda: {"http": "http://127.0.0.1:7892", "https": "http://127.0.0.1:7892"},
+        ):
+            self.assertEqual(
+                diagnose.effective_proxy(),
+                {"http": "http://127.0.0.1:7892", "https": "http://127.0.0.1:7892"},
+            )
+        with patch("urllib.request.getproxies", lambda: {}):
+            self.assertEqual(diagnose.effective_proxy(), {})
+
+    def test_dead_proxy_is_detected(self) -> None:
+        with patch("socket.socket") as sock_cls:
+            sock_cls.return_value.connect.side_effect = ConnectionRefusedError(10061, "拒绝")
+            dead, detail = diagnose.proxy_health({"https": "http://127.0.0.1:7892"})
+        self.assertTrue(dead)
+        self.assertIn("连不上", detail)
+        self.assertIn("7892", detail)
+
+    def test_live_proxy_is_not_flagged(self) -> None:
+        with patch("socket.socket") as sock_cls:
+            sock_cls.return_value.connect.return_value = None
+            dead, detail = diagnose.proxy_health({"https": "http://127.0.0.1:7892"})
+        self.assertFalse(dead)
+        self.assertIn("可连", detail)
+
+    def test_no_proxy_configured_is_not_flagged(self) -> None:
+        dead, detail = diagnose.proxy_health({})
+        self.assertFalse(dead)
+        self.assertEqual(detail, "")
+
+    def test_proxy_report_names_the_registry_state(self) -> None:
+        from unittest.mock import patch
+
+        with patch.object(diagnose, "effective_proxy", lambda: {"https": "http://127.0.0.1:7892"}), \
+             patch.object(diagnose, "proxy_health", lambda proxies=None, timeout=1.5: (True, "代理 http://127.0.0.1:7892 **连不上**")), \
+             patch.object(diagnose, "registry_proxy_state", lambda: {"ProxyEnable": 1, "ProxyServer": "127.0.0.1:7892"}):
+            text = "\n".join(diagnose.proxy_report())
+        self.assertIn("httpx 实际会用的代理", text)
+        self.assertIn("连不上", text)
+        self.assertIn("ProxyEnable=1", text)
+
+    def test_dead_proxy_is_bypassed_by_the_llm_client(self) -> None:
+        """死代理下客户端要自动直连（并留下说明），而不是白等 7 秒后失败。"""
+        from unittest.mock import patch
+
+        from hexhound.llm import LLMClient
+
+        def boom(url, timeout=6.0):
+            raise RuntimeError("探测失败")
+
+        with patch.object(diagnose, "proxy_health", lambda proxies=None, timeout=1.5: (True, "代理 http://127.0.0.1:7892 **连不上**")), \
+             patch.object(diagnose, "effective_proxy", lambda: {"https": "http://127.0.0.1:7892"}):
+            client = LLMClient("sk-fake", "https://api.deepseek.com", "deepseek-flash", provider="deepseek")
+        self.assertIn("已改为直连", client.network_note)
+        self.assertIn("7892", client.network_note)
+
+    def test_live_proxy_keeps_default_behaviour(self) -> None:
+        from unittest.mock import patch
+
+        from hexhound.llm import LLMClient
+
+        with patch.object(diagnose, "proxy_health", lambda proxies=None, timeout=1.5: (False, "代理可连")):
+            client = LLMClient("sk-fake", "https://api.deepseek.com", "deepseek-flash", provider="deepseek")
+        self.assertEqual(client.network_note, "", "代理正常时不该改动任何行为")
+        with patch.object(diagnose, "proxy_health", side_effect=RuntimeError("boom")):
+            client2 = LLMClient("sk-fake", "https://api.deepseek.com", "deepseek-flash", provider="deepseek")
+        self.assertEqual(client2.network_note, "", "诊断异常时保守：不动 SDK 默认行为")
 
 
 if __name__ == "__main__":

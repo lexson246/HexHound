@@ -153,6 +153,10 @@ def build_llm_pool(
         label=f"{config.provider}/{config.model}",
     )
     pool: dict[str, LLMClient] = {"planner": default}
+    # 网络侧的重要提醒（例如"绕过了已死的系统代理"）必须让人看见，
+    # 否则"流量实际走了哪条路"就成了隐式行为。
+    if echo is not None and getattr(default, "network_note", ""):
+        echo(f"注意：{default.network_note}")
     resolver = getattr(config, "role_models_resolved", None)
     if resolver is None:
         return default, pool
@@ -178,6 +182,50 @@ def build_llm_pool(
     return default, pool
 
 
+def _dead_proxy_detail() -> tuple[bool, str]:
+    """代理配置存在但端口连不上时返回 `(True, 说明)`。"""
+    from .diagnose import effective_proxy, proxy_health
+
+    try:
+        dead, detail = proxy_health()
+        if dead:
+            resolved = effective_proxy()
+            url = resolved.get("https") or resolved.get("http") or ""
+            return True, url or detail
+    except Exception:  # noqa: BLE001 诊断失败就当没有代理问题
+        return False, ""
+    return False, ""
+
+
+def _http_client_for_timeout(timeout: float):
+    """需要绕过"已死的代理"时返回一个 `trust_env=False` 的 httpx 客户端，否则 None。
+
+    为什么必须处理（真实事故，已受控复现）：Windows 上"系统代理"是用户级、机器级设置，
+    代理客户端退出时**未必把它复位**。于是 `ProxyEnable=1 → 127.0.0.1:7892` 而端口没人监听：
+    httpx 在 `trust_env=True` 时经 `urllib.request.getproxies()` 读到它，
+    把每个请求都打到死端口 → SDK 重试 3 次 → 约 7.3 秒后 `APIConnectionError`、0 token。
+    用户的观感是"关掉 VPN 就再也连不上，而且换任何网络都一样"（系统代理与网络无关）。
+
+    这里的处理很克制：**只在代理端口确实连不上时**才绕开（那种情况下走代理必然失败，
+    直连是唯一可能成功的路径），并在 `network_note` 里写明发生了什么，
+    绝不静默改变流量走向。
+    """
+    from .diagnose import proxy_health
+
+    try:
+        dead, detail = proxy_health()
+    except Exception:  # noqa: BLE001 诊断失败时保持 SDK 默认行为
+        return None
+    if not dead:
+        return None
+    try:
+        import httpx
+
+        return httpx.Client(timeout=timeout, trust_env=False)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class LLMClient:
     """对 openai.OpenAI 的薄封装，返回补全内容与 token 用量。"""
 
@@ -198,11 +246,21 @@ class LLMClient:
         self.provider = provider or "custom"
         self.label = label or self.provider
         self.base_url = base_url or ""
+        #: 建客户端时的网络侧说明（例如"绕过了已死的系统代理"），供界面/CLI 展示。
+        self.network_note = ""
+        dead_proxy, proxy_url = _dead_proxy_detail()
+        if dead_proxy:
+            self.network_note = (
+                f"检测到系统/环境代理 {proxy_url} 当前不可用，本次已改为直连。"
+                "若你需要走代理出网，请先启动代理客户端；否则请在系统设置里关掉代理。"
+            )
+        http_client = _http_client_for_timeout(timeout) if dead_proxy else None
         # 本地服务/自定义端点常常不需要 key；SDK 只是要求非空字符串。
         self._client = OpenAI(
             api_key=api_key or "EMPTY",
             base_url=base_url or None,
             timeout=timeout,
+            **({"http_client": http_client} if http_client is not None else {}),
         )
         #: 计价表（按提供商预设，或调用方显式传入）。
         self.pricing = pricing or (pricing_for(self.provider) if get_preset(self.provider) else DEFAULT_PRICING)

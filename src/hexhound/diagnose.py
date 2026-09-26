@@ -65,6 +65,78 @@ def proxy_environment() -> dict[str, str]:
     return {key: os.getenv(key, "") for key in PROXY_ENV_KEYS if os.getenv(key, "").strip()}
 
 
+def effective_proxy() -> dict[str, str]:
+    """**httpx/openai 真正会用的**代理：环境变量 + Windows 系统代理（注册表）。
+
+    为什么不能只看环境变量（真实事故）：一台机器上 `ProxyEnable=1`、
+    `ProxyServer=127.0.0.1:7892`（Clash/V2Ray 那类"设置系统代理"），
+    而代理客户端已经退出、端口没人监听。环境变量是空的，于是所有诊断都说"直连"，
+    但 httpx 在 `trust_env=True` 时会调用 `urllib.request.getproxies()`，
+    而后者在 Windows 上回落到注册表 —— 请求实际全打到那个死端口上，
+    症状是"关掉 VPN 就再也连不上，且换任何网络都一样"（系统代理是用户级、
+    机器级设置，**与当前连的是哪个网络无关**）。
+
+    这里返回 httpx 会用的那份解析结果（含来源说明）。
+    """
+    resolved: dict[str, str] = {}
+    try:
+        import urllib.request
+
+        for key, value in (urllib.request.getproxies() or {}).items():
+            if value:
+                resolved[str(key)] = str(value)
+    except Exception:  # noqa: BLE001 拿不到就当没有
+        pass
+    return resolved
+
+
+def registry_proxy_state() -> dict[str, object]:
+    """Windows 系统代理的原始注册表状态（供诊断展示；非 Windows 返回空）。"""
+    if os.name != "nt":
+        return {}
+    try:
+        import winreg
+
+        state: dict[str, object] = {}
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        ) as key:
+            for name in ("ProxyEnable", "ProxyServer", "AutoConfigURL"):
+                try:
+                    state[name] = winreg.QueryValueEx(key, name)[0]
+                except FileNotFoundError:
+                    continue
+        return state
+    except OSError:
+        return {}
+
+
+def proxy_health(proxies: dict[str, str] | None = None, *, timeout: float = 1.5) -> tuple[bool, str]:
+    """配置了代理但端口没人监听 → `(True, 说明)`；否则 `(False, "")`。
+
+    这一条把"连不上"从玄学变成一句话：**代理端口是死的**。
+    """
+    proxies = effective_proxy() if proxies is None else proxies
+    url = proxies.get("https") or proxies.get("http") or proxies.get("all") or ""
+    if not url:
+        return False, ""
+    parsed = urlparse(url if "://" in url else "http://" + url)
+    host = (parsed.hostname or "").lower()
+    port = int(parsed.port or (443 if parsed.scheme == "https" else 80))
+    if not host:
+        return False, ""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((host, port))
+        return False, f"代理 {url} 可连"
+    except OSError as exc:
+        return True, f"代理 {url} **连不上**（{type(exc).__name__}: {exc}）"
+    finally:
+        sock.close()
+
+
 @dataclass
 class ProbeStep:
     """一步探测的结果。"""
@@ -250,17 +322,47 @@ def list_models(base_url: str, api_key: str, *, timeout: float = 15.0) -> tuple[
 def format_probe(probe: EndpointProbe, *, title: str = "连通性诊断") -> list[str]:
     """把探测结果渲染成人类可读的多行文本（CLI 与界面共用）。"""
     lines = [f"== {title} ==", f"目标：{probe.base_url}（{probe.host}:{probe.port}）"]
-    if probe.proxy_env:
-        lines.append("代理环境变量：" + "，".join(f"{k}={v}" for k, v in probe.proxy_env.items()))
-        lines.append("  注意：httpx/openai 默认 trust_env=True，会**真的**走这些代理；端口写错会直接连不上。")
-    else:
-        lines.append("代理环境变量：（无）—— 直连；若本机需要代理才能出网，这里就是失败原因。")
+    lines.extend(proxy_report())
     lines.extend(local_network_facts())
     for step in probe.steps:
         flag = "[ OK ]" if step.ok else "[FAIL]"
         lines.append(f"{flag} {step.name}（{step.elapsed_ms} ms）：{step.detail}")
     lines.append("")
     lines.append("结论：" + probe.verdict())
+    return lines
+
+
+def proxy_report() -> list[str]:
+    """代理情况的两行报告：环境变量 + **系统代理（注册表）** + 端口是否活着。
+
+    系统代理那一行是这次事故的关键：环境变量全空、但注册表里挂着
+    `ProxyEnable=1 → 127.0.0.1:7892`，httpx 照样走它，于是"直连正常"的结论是错的。
+    """
+    lines: list[str] = []
+    env = proxy_environment()
+    lines.append(
+        "代理环境变量：" + ("，".join(f"{k}={v}" for k, v in env.items()) if env else "（无）")
+    )
+    resolved = effective_proxy()
+    if resolved:
+        lines.append(
+            "httpx 实际会用的代理：" + "，".join(f"{k}={v}" for k, v in resolved.items())
+        )
+        dead, detail = proxy_health(resolved)
+        if dead:
+            lines.append(f"  [!!] {detail} —— 请求会全部打到这个端口，"
+                         "表现为「突然连不上、换任何网络都一样」。")
+            lines.append("       处理：启动代理客户端，或用系统设置关掉「使用代理服务器」。")
+        else:
+            lines.append(f"  [i] {detail}（走代理；若代理本身不通，请先修代理）")
+    else:
+        lines.append("httpx 实际会用的代理：（无）—— 直连")
+    state = registry_proxy_state()
+    if state:
+        lines.append(
+            "Windows 系统代理：" + "，".join(f"{k}={v}" for k, v in state.items())
+            + ("（ProxyEnable=0 → 未启用）" if not state.get("ProxyEnable") else "")
+        )
     return lines
 
 
