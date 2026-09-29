@@ -61,7 +61,18 @@ flowchart TB
 
 ## 快速开始
 
-### 方式 A —— 直接用现成的可执行文件（不需要 Python）
+### 方式 A —— Windows 桌面安装包（不需要 Python）
+
+发布后可在本仓库 **Releases** 页面下载 `HexHound-Setup-Full-Offline-x64.exe`。
+安装后从开始菜单打开 **HexHound**，在设置页面填写自己的提供商、模型和 API Key。
+
+完整安装包包含 Python 依赖、WebView2、Chromium 和独立的 `HexHound-Tools` WSL 环境。
+WSL 需要开启 CPU 虚拟化，首次配置可能需要管理员权限和重启。
+离线安装不等于云模型可以离线调用。详见[安装说明](packaging/installer-readme.txt)。
+
+### 可选：命令行版本
+
+桌面版可执行文件用于打开窗口；以下命令使用 `HexHound.spec` 单独构建的 CLI 版本：
 
 ```
 hexhound.exe providers      # 列出 12 个提供商预设，以及去哪拿 key
@@ -75,7 +86,8 @@ hexhound.exe audit --target http://127.0.0.1:5000 --mode blackbox --verbose
 ### 方式 B —— 从源码运行
 
 ```bash
-git clone <your-repo-url> && cd hexhound
+git clone https://github.com/lexson246/HexHound.git
+cd HexHound
 pip install -e ".[lab]"
 cp .env.example .env      # Windows: copy .env.example .env
 # 编辑 .env：选一个 LLM_PROVIDER 并粘贴 key（或运行 hexhound setup）

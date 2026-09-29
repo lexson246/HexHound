@@ -72,7 +72,21 @@ recon (crawl/discover/enumerate/read_urls) → probe (fuzz/creds/IDOR)
 
 ## Quick start
 
-### Option A — use the prebuilt executable (no Python needed)
+### Option A — Windows desktop installer (no Python needed)
+
+When available, download `HexHound-Setup-Full-Offline-x64.exe` from this repository's
+**Releases** page and install it. Launch **HexHound** from the Start menu, then enter
+your own provider, model and API key in the settings panel.
+
+The full installer includes Python dependencies, WebView2, Chromium and an independent
+`HexHound-Tools` WSL environment. WSL requires CPU virtualization; first-time setup may
+need administrator rights and a Windows restart. Installation is offline, but cloud
+model calls still require connectivity. See [installer notes](packaging/installer-readme.txt).
+
+### Optional CLI executable
+
+The desktop executable opens a window. The separate CLI build from `HexHound.spec`
+supports these terminal commands:
 
 ```
 hexhound.exe providers      # list the 12 provider presets and where to get a key
@@ -87,7 +101,8 @@ wins if you want the report somewhere specific.
 ### Option B — run from source
 
 ```bash
-git clone <your-repo-url> && cd hexhound
+git clone https://github.com/lexson246/HexHound.git
+cd HexHound
 pip install -e ".[lab]"
 cp .env.example .env      # Windows: copy .env.example .env
 # edit .env: pick LLM_PROVIDER and paste your key (or run `hexhound setup`)

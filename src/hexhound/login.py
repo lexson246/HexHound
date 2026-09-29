@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 
@@ -31,7 +32,9 @@ def capture_login_state(
     """
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(channel="msedge", headless=False)
+        browser = playwright.chromium.launch(
+            channel=os.environ.get("HEXHOUND_BROWSER_CHANNEL", "msedge"), headless=False
+        )
         context = browser.new_context()
         page = context.new_page()
         page.add_init_script(init_script)

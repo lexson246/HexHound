@@ -306,12 +306,16 @@ class Runtime:
 def detect_runtime(prefer: str = "", wsl_distro: str = "") -> Runtime | None:
     """探测可用的执行运行时。
 
-    优先级：显式指定 > Docker > Podman > WSL。
+    优先级：显式指定 > 安装包的 HexHound-Tools > Docker > Podman > WSL。
 
     为什么把 WSL 也算进来：Windows 上 Docker Desktop 经常是"装了但没启动 /
     装坏了 / 当前用户没权限连守护进程"，而这三种情况下 **WSL 里的工具链照样能用**。
     PentAGI / Strix 都要 Docker 才能跑，这里多一条退路。
     """
+    if not prefer and not wsl_distro:
+        wsl = _find_wsl()
+        if wsl and "HexHound-Tools" in _wsl_distros(wsl):
+            return Runtime("wsl", wsl, distro="HexHound-Tools")
     order = [prefer] if prefer else ["docker", "podman", "wsl"]
     for kind in order:
         if kind == "docker":

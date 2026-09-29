@@ -24,6 +24,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   # 测试必须是**完全离线**的：任何一步真去调模型或打目标都应该失败。
   # 这里把 key 清空，让"不小心依赖了真实凭据"的测试立刻暴露。

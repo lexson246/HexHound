@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 
@@ -17,7 +18,9 @@ def dynamic_scan(
     dialogs: list[str] = []
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(channel="msedge", headless=True)
+        browser = playwright.chromium.launch(
+            channel=os.environ.get("HEXHOUND_BROWSER_CHANNEL", "msedge"), headless=True
+        )
         page = browser.new_page()
         page.on(
             "request",

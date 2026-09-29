@@ -17,6 +17,11 @@ HexHound.exe
 # 环境变量 / 密钥（绝不提交）
 .env
 .env.bak
+.env.*
+!.env.example
+!.env.demo
+*.pem
+*.key
 
 # 测试与工具产物
 .tmp/
@@ -43,6 +48,9 @@ vulnlab/app.db
 
 # 本地临时文件
 tmp_*.txt
+tmp/
+# Personal interview notes are not project documentation.
+docs/HexHound项目.txt
 .pytest-tmp/
 .probe/
 

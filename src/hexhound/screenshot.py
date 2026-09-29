@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -15,6 +16,13 @@ _BROWSER_CANDIDATES = [
 
 
 def _find_browser() -> str | None:
+    bundled = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if bundled:
+        for candidate in Path(bundled).glob(
+            "chromium_headless_shell-*/chrome-headless-shell-win64/chrome-headless-shell.exe"
+        ):
+            if candidate.is_file():
+                return str(candidate)
     for name in ("msedge", "msedge.exe", "chrome", "chrome.exe", "chromium"):
         path = shutil.which(name)
         if path:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import socket
 import sys
 import threading
@@ -49,6 +50,10 @@ def _wait_for_server(port: int, timeout: float = 15.0) -> None:
 
 
 def main() -> None:
+    browsers = Path(sys.executable).resolve().parent / "browsers"
+    if getattr(sys, "frozen", False) and browsers.is_dir():
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers)
+        os.environ["HEXHOUND_BROWSER_CHANNEL"] = "chromium"
     mutex = _acquire_single_instance()
     if mutex == 0:
         if sys.platform == "win32":
