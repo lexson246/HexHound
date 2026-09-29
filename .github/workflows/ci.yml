@@ -159,9 +159,13 @@ jobs:
       - name: Install project
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
+          python -m pip install -e ".[dev,lab]"
+      - name: Start the local test lab
+        run: |
+          python vulnlab/app.py --host 127.0.0.1 > "$RUNNER_TEMP/hexhound-lab.log" 2>&1 &
+          curl --fail --retry 20 --retry-connrefused --retry-delay 1 --max-time 2 http://127.0.0.1:5000/ > /dev/null || { cat "$RUNNER_TEMP/hexhound-lab.log"; exit 1; }
       - name: Tool-layer detection self-test
-        # 31 项检测能力检查，**不需要任何 API key**（用内置的确定性响应）。
+        # 31 项检查使用上一步启动的本地靶场，不需要模型 API key。
         run: python examples/tool_selftest.py
       - name: End-to-end orchestration with a scripted LLM
         # SWARM_MOCK=1：走完 规划 → 并发子任务 → 补扫 → 复核 → 报告，
