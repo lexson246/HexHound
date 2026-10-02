@@ -384,10 +384,18 @@ check the proxy first.
     Zero-quota evidence: `/api/order` went from 0 endpoints / 0 attempts to 1 / 1 in a scripted
     run. Tests: `tests/test_enumerate_hygiene.py::DefaultEnumerationTiersTests` (5),
     `tests/test_orchestrator.py::AssignedButUntestedCoverageTests` (8).
-13. ❌ **Dictionary-discovered endpoints carry no parameter knowledge.** `/api/order` is
-    registered without params, so "test it with `order_id`" still depends on the model guessing.
-    A path-vocabulary mapping (`/api/order` → `order_id`) is the obvious next step, but it puts a
-    guess into the fact layer and needs its own field plus disclosure rules.
+13. ✅ **Dictionary-discovered endpoints carry no parameter knowledge.** `/api/order` used to be
+    registered without params, so "test it with `order_id`" depended on the model guessing — and
+    three live runs in a row did not guess. Now `knowledge.suggest_id_params()` derives candidate
+    identifier names from the path noun (`/api/order` → `order_id`/`id`, `/api/users` →
+    `uid`/`id`/`user_id`; action paths like `/login` yield nothing), they are stored in
+    `Endpoint.suggested_params` — **never** mixed into `params` — labelled as guesses in the LLM
+    summary (`推测参数[order_id,id](按路径名词推测，未验证)`), and
+    `orchestrator.idor_sweep_tasks()` dispatches one deterministic `auth` task (`I1`) that must
+    confirm which parameter actually works, then do the A/B id comparison and the anonymous
+    request, with a conclusion required per endpoint.
+    Tests: `tests/test_idor_sweep.py` (18). Measured effect of the fix is still pending a paid
+    live run (run #3 scored 87.5% with `idor-order` as the only miss).
 
 
 ---
@@ -426,8 +434,9 @@ check the proxy first.
    `knowledge.BUSINESS_CRITICAL_PATHS` so the id-addressable entry points are probed no matter
    which tiers a caller picks. Tests: `tests/test_orchestrator.py::AssignedButUntestedCoverageTests`,
    `tests/test_enumerate_hygiene.py::DefaultEnumerationTiersTests`.
-11. ❌ **Path-derived parameter suggestions** (§10.13) so a dictionary-discovered endpoint like
-   `/api/order` arrives with a candidate parameter name instead of none.
+11. ✅ **Path-derived parameter suggestions** (§10.13) so a dictionary-discovered endpoint like
+   `/api/order` arrives with candidate parameter names (`suggested_params`) plus a deterministic
+   IDOR task. Tests: `tests/test_idor_sweep.py`.
 
 When you finish any of these: update `README.md` **and** `README_ZH.md` in the same change, keep the
 "measured, not claimed" tone, and re-run §8.
@@ -549,7 +558,12 @@ and `sanitize.decode_console_output()`.
 | --- | --- | --- | --- | --- | --- |
 | engine | `--tier engine` | 100% (8/8) | 0% (0/3) | ¥0 | 1.2 s |
 | agent / scripted LLM | `--tier agent --llm scripted` | 12.5% (1/8) | 0% (0/4) | ¥0 | 3.4 s |
-| agent / real model | `--tier agent --llm live --allow-live` | 75% (6/8) | 0% (0/4) | ¥0.42 / ¥0.44 | 352 s / 407 s |
+| agent / real model | `--tier agent --llm live --allow-live` | 75% / 75% / **87.5%** | 0% (0/4) | ¥0.42 / ¥0.44 / ¥0.47 | 352 s / 407 s / 411 s |
+
+Three live runs. The injection scenarios are 6/6 every time and nothing quiet was ever flagged;
+the authorization scenarios are what moved: run #1 missed `idor-order` + `unauth-users`,
+run #2 missed `xss-reflect` + `idor-order`, run #3 (after the recording gate) missed only
+`idor-order` — which is now understood end to end and fixed (§10.13, §4.1/§4.3 in `docs/EVAL.md`).
 
 Two live runs, both 6/8 with zero false positives, but **not the same six** — the injection
 scenarios are stable, the authorization ones are not. Both misses were diagnosed from the run
@@ -568,10 +582,15 @@ never reached. Both are now **fixed** (§10.11, §10.12):
   now has the endpoints it named but never touched written as `not_tested`.
 
 Zero-quota evidence: in a scripted run `/api/order` went from **0 endpoints / 0 attempts** to
-**1 / 1**. The live score has **not** been re-measured — that costs another ~¥0.44 and is waiting
-on the user. The first live run also exposed an evaluation bug (memory not isolated → the run
+**1 / 1**, and the deterministic `I1(auth)` IDOR task (candidate params `order_id`/`id`) is
+dispatched. Run #3 (paid, 87.5%) confirmed both the recording gate (xss-reflect turned into a
+detection) and the discovery fix (`/api/order` reached the surface) — but it also showed the last
+missing link, since the dictionary knows the path and not the parameter. That link is the
+`idor_sweep_tasks`/`suggest_id_params` work described above; its effect is **not yet measured
+live**.
+The first live run also exposed an evaluation bug (memory not isolated → the run
 became a regression retest of the developer's own history) which is fixed and pinned by
-`MemoryIsolationTests` — the fix did **not** move the score (both runs are 6/8); it made the
+`MemoryIsolationTests` — the fix did **not** move the score (both early runs are 6/8); it made the
 number comparable across machines.
 
 Scoring was tightened in the same change: a "hit" needs the endpoint path **and** the vulnerability
@@ -588,5 +607,5 @@ must not be able to kill a run. It now retries after trimming the non-ASCII tail
 `looks_like_url()` returns `False` for the same input.
 
 Test/lint state at the end of this round: `python -m pytest tests` →
-**1018 passed, 59 subtests passed, 1 skipped** (run `-q` twice and pytest prints no totals —
+**1037 passed, 71 subtests passed, 1 skipped** (run `-q` twice and pytest prints no totals —
 `addopts` already contains `-q`, so pass no extra `-q`); `ruff check src tests tools` clean.

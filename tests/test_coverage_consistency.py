@@ -166,6 +166,22 @@ class CoverageSignalConsistencyTests(unittest.TestCase):
         })
         self.assertIn("已记录覆盖", out)
 
+    def test_discovery_hits_do_not_gate(self) -> None:
+        """字典枚举把"路径存在（200/403）"记成 signal——那是发现，不是漏洞信号。
+
+        否则每个扫出来的端点写"没问题"都会被拒，闸门退化成噪音
+        （实测：`enumerate_common` 给每个命中都记一条 category=enumerate 的 signal）。
+        """
+        surface = AttackSurface(target="http://127.0.0.1:5000", mode="blackbox")
+        surface.mark_attempt(
+            "http://127.0.0.1:5000/api/order", "enumerate", outcome="signal",
+            detail="200  http://127.0.0.1:5000/api/order",
+        )
+        out = make_registry(surface).execute("record_coverage", {
+            "target": "/api/order", "status": "no_issue_found", "detail": "参数没试中",
+        })
+        self.assertIn("已记录覆盖", out)
+
 
 if __name__ == "__main__":
     unittest.main()

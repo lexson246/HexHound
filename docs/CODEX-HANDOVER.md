@@ -28,7 +28,7 @@ HexHound 是一个 **LLM 驱动的黑盒 Web 安全审计 Agent**：编排者把
 
 | 项 | 状态 | 证据 |
 | --- | --- | --- |
-| 测试 | **1018 passed + 59 subtests passed / 1 skipped** | `python -m pytest tests`（别再补 `-q`：`addopts` 已有 `-q`，双重 `-qq` 会让 pytest 连汇总行都不打印） |
+| 测试 | **1037 passed + 71 subtests passed / 1 skipped** | `python -m pytest tests`（别再补 `-q`：`addopts` 已有 `-q`，双重 `-qq` 会让 pytest 连汇总行都不打印） |
 | 代码风格 | 干净 | `python -m ruff check src tests tools` |
 | 本地 CI 执行器 | **Windows 作业真跑；Linux 作业是 SKIP**（见下） | `python tools/run_ci_locally.py --all` |
 | GitHub CI | **8/8 绿** | `python tools/ci_status.py --sha e6e2431` |
@@ -392,6 +392,21 @@ fuzz / compare / auth / creds / headers 全按"受阻、未完成"处理；
 把它点名却没碰过的端点写成 `not_tested`（`_mark_assigned_but_untested`，每任务 ≤6 条）。
 回归：`tests/test_orchestrator.py::AssignedButUntestedCoverageTests`（8 条）。
 
+### 6.15 字典发现端点时"参数名靠猜"，于是越权面整块漏掉（live 评测发现）
+
+**症状**：第 3 轮 live 评测 87.5%（7/8），唯一漏报 `idor-order`。
+查产物：`/api/order` **已经进攻面**（发现层上一批修好了），但 `params=[]`——
+字典只知道路径。于是"拿 `order_id` 去试"只能靠模型自己想到，三轮都没想到。
+**守卫**：`knowledge.suggest_id_params()`（路径名词 → 候选标识参数名）+
+`Endpoint.suggested_params`（**推测值单独一栏，永不混进 `params`**）+
+`orchestrator.idor_sweep_tasks()`（确定性派 `I1(auth)` 任务）。
+界面与提示词必须能分辨：`参数[...]` 是探到的，`推测参数[...](按路径名词推测，未验证)` 是猜的。
+回归：`tests/test_idor_sweep.py`（18 条）。
+
+**顺带把闸门的边界磨精确**：`enumerate_common` 会把"路径存在（200/403）"也记成
+`outcome=signal`，而那不是漏洞信号——`surface.DISCOVERY_CATEGORIES` 把这些发现类尝试
+排除在"实测信号"之外，否则每个扫出来的端点写"没问题"都会被拒，闸门退化成噪音。
+
 - **目标流量默认直连**（`trust_env=False`）：系统代理会把整轮扫描打成 502。
   要代理就用显式配置；LLM 调用与目标流量是两套。
 - **死代理自动绕开**：`llm._dead_proxy_detail()` 检测到"配了代理但端口连不上"时直连并
@@ -409,7 +424,7 @@ fuzz / compare / auth / creds / headers 全按"受阻、未完成"处理；
 | 0 | ~~**带标准答案的多场景评测**（检出率/误报率/耗时/成本）~~ **已完成** | `tools/eval_scenarios.py` + `evals/scenarios.json`（12 场景，标准答案来自 vulnlab 的已知漏洞）+ 口径测试。引擎层实测 检出 100% / 误报 0%；Agent 层脚本 LLM 12.5%（是管道指标，不是能力指标）；**真实模型那一档已跑两轮**：75% / 误报 0%，¥0.4158 + ¥0.4357，351.8s + 407.2s（`--tier agent --llm live --allow-live`） | 详见 `docs/EVAL.md` §4 |
 | 0b | ~~**覆盖记录与攻面证据自相矛盾**（live 评测发现）~~ **已修** | 攻面记了 3 条 `signal`（未转义回显），覆盖记录却写 `no_issue_found` | 记录层闸门：有 signal 时拒绝写 `no_issue_found`/`ruled_out`，除非带 `dismiss_signals`（理由随覆盖行进报告）。`tests/test_coverage_consistency.py`（13 条） |
 | 0c | ~~**子任务没跑完不留"没测过"的痕**（live 评测发现）~~ **已修** | 真根因更狠：侦察子代理自己挑档位时漏了 `business`，而 `/api/order` 在 business 档第 68/77 位——**端点根本没被发现**；`closing_no_finish` 又算"已收尾"，于是一片空白 | ① `knowledge.BUSINESS_CRITICAL_PATHS`（12 条只读、凭 id 就能读的入口）**无论选哪些档位都探**（`include_critical=false` 可关）；② 没以 `done` 收尾的任务，把它点名却没碰过的端点写成 `not_tested`。零额度验证：`/api/order` 从 0 端点/0 尝试 → 1/1 |
-| 0d | **字典发现的端点没有参数信息**（未修） | `/api/order` 登记时无参数，"该用 `order_id` 测"仍靠模型猜 | 按路径名词猜参数（`/api/order` → `order_id`）要单开字段与披露口径，不能把猜测混进事实层 |
+| 0d | ~~**字典发现的端点没有参数信息**~~ **已修** | `/api/order` 登记时参数为空，"该用 `order_id` 测"只能靠模型猜——三轮 live 评测都没想到（第 3 轮 87.5%，唯一漏报就是它） | ① `knowledge.suggest_id_params()` 按路径名词给候选（`/api/order` → `order_id`/`id`；`/login` 这类动作路径**不给**）；② 存进 `Endpoint.suggested_params`，**永不混进 `params`**，提示词里标成 `推测参数[...](未验证)`；③ `orchestrator.idor_sweep_tasks()` 确定性派 `I1(auth)` 任务（先确认真实参数名，再 A/B 换 id 对比，每端点必须有结论）。`tests/test_idor_sweep.py`（18 条） |
 | 1 | `closing_no_finish` 占比 | 约 10%（模型不主动交总结，系统代写）；已把**最后一步**预留给收尾动作 | 一次真实运行里该终态 < 3%；或证明为什么降不下去 |
 | 2 | 关窗 45 秒上限 | `HEXHOUND_CLOSE_GRACE`；沙箱命令现在可被中断（实测 10 秒内退出） | 已在打包 exe 上验收（10/10）；剩余是把上限调到"不急不躁"的默认值 |
 | 3 | `memory/<host>.json` 无修剪 | 陈旧条目每次 diff 都以 `unknown` 复现 | `tests/test_diff.py` 加"已解决条目不再出现"；`hexhound memory` 报出修剪了什么 |

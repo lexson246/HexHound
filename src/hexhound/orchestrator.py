@@ -1533,6 +1533,51 @@ class Orchestrator:
             for key, value in groups.items()
         }
 
+    def idor_sweep_tasks(self, limit: int = 3, round_index: int = 0) -> list[WorkerTask]:
+        """生成**确定性**的越权（IDOR/BOLA）任务：端点已发现、参数名靠路径推测。
+
+        为什么需要（live 评测三轮实测）：字典枚举知道**路径**、不知道**参数**，
+        于是 `/api/order` 登记后参数为空，"用 order_id 去测越权"只能靠模型自己想到——
+        三轮真实模型评测都漏了这一条。判决式地派一个任务，把
+        「发现端点 → 试对参数 → 换 id 对比 → 下结论」接起来。
+
+        参数名是**按路径名词推测**的（`knowledge.suggest_id_params`），任务里必须
+        标明"推测、未验证"——猜的名字不是证据，任务要求先确认哪个参数真的生效。
+        """
+        picks = self.surface.idor_candidates(limit=limit)
+        if not picks:
+            return []
+        listing = "\n".join(
+            f"  - {url}  候选参数：{'、'.join(params)}" for url, params in picks
+        )
+        return [
+            WorkerTask(
+                id=f"I{round_index + 1}",
+                role="auth",
+                objective=(
+                    "**越权读取排查（IDOR/BOLA）**：下面这些端点指向「某一个对象」，"
+                    "但**没有参数信息**——候选参数名是**按路径名词推测的、未经验证**。\n"
+                    f"{listing}\n"
+                    "步骤：\n"
+                    "1) 先用 http_request 逐个试候选参数名（先不带凭据、再带 A 的凭据），"
+                    "确认**哪个参数真的生效**（响应内容随它变化）。参数名是猜的，"
+                    "试不中不算失败，但要在结论里写清试过哪些名字。\n"
+                    "2) 找到生效参数后做越权判定：**换一个对象标识**（1→2、1001→1002），"
+                    "看服务端是否只凭这个 id 就返回**别人的**数据（用 compare_responses "
+                    "或两次 http_request 对比响应体字段）。\n"
+                    "3) 再测**无凭据访问**：匿名直接请求同一 URL，看是否返回数据。\n"
+                    "判据：响应里出现**不属于当前身份**的字段（他人姓名/手机号/地址/邮箱）"
+                    "即成立——把它写成 record_finding（vuln_type=\"越权访问\"，"
+                    "evidence_ref 指向请求响应原文，verification 写明 A/B 两个 id 的对比）。\n"
+                    "**每个端点都必须有结论**：确认不可利用就 record_coverage(status=\"ruled_out\") "
+                    "写清试过哪些参数、为什么不算；无凭据访问被 401/403 挡住记 ruled_out，"
+                    "访问受阻（超时/限流）记 blocked——但**不能因为参数名没猜中就什么都不写**。"
+                ),
+                url=picks[0][0],
+                steps=max(8, min(3 * len(picks) + 6, 16)),
+            )
+        ]
+
     def business_logic_tasks(self, limit: int = 1) -> list[WorkerTask]:
         """生成**确定性**的业务逻辑测试任务（价格篡改 / 负数数量 / 跳过步骤 / 重复提交）。
 
@@ -1978,6 +2023,20 @@ class Orchestrator:
                     ),
                 )
                 done.extend(self.run_wave(business, wave=2))
+        # 越权面（IDOR/BOLA）：端点已发现但**参数名靠路径推测**的那些，确定性派任务。
+        # 与 S1/B1 同理：能力在提示词里不等于有人负责用——三轮 live 评测都漏了
+        # `/api/order` 越权（字典枚举知道路径、不知道参数）。
+        if self._may_start_wave("越权面任务波"):
+            idor = self.idor_sweep_tasks()
+            if idor:
+                self._event(
+                    kind="idor_sweep",
+                    message=(
+                        "派发越权面任务（端点无参数信息，候选参数名按路径推测）："
+                        + "、".join(f"{t.id}({t.role})" for t in idor)
+                    ),
+                )
+                done.extend(self.run_wave(idor, wave=2))
         # 覆盖率补扫：未测端点/未攻击参数强制补上（这是报告可信度的前提）。
         # 最多两轮，且**只在确实缩小了盲区时**才继续——否则就是一个收敛不了的烧钱循环。
         # 每一波**开始之前**都要过 `_may_start_wave`：允许的时长不是"开始后无限跑"，

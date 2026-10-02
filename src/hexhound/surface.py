@@ -24,6 +24,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
 from .apispec import Operation, SpecImport, build_operation_url  # noqa: F401
+from .knowledge import suggest_id_params
 
 SEVERITIES = ("critical", "high", "medium", "low", "info")
 SEVERITY_RANK = {name: index for index, name in enumerate(SEVERITIES)}
@@ -214,6 +215,10 @@ class Endpoint:
     source: str = ""
     status: int = 0
     note: str = ""
+    #: **推测**的对象标识参数名（按路径名词猜，见 `knowledge.suggest_id_params`）。
+    #: 与 `params` 严格分开：`params` 是"探到的"，这里是"猜的"，报告与提示词
+    #: 必须能分辨——把猜测混进事实层，就是在制造假证据。
+    suggested_params: list[str] = field(default_factory=list)
     first_seen: float = field(default_factory=time.time)
 
     def merge(self, other: Endpoint) -> None:
@@ -223,6 +228,9 @@ class Endpoint:
         for param in other.params:
             if param not in self.params:
                 self.params.append(param)
+        for param in other.suggested_params:
+            if param not in self.suggested_params:
+                self.suggested_params.append(param)
         if other.status and not self.status:
             self.status = other.status
         if other.note and other.note not in self.note:
@@ -245,6 +253,12 @@ class Attempt:
     method: str = "GET"
     account: str = ""  # 身份指纹；不得保存 Cookie/Authorization 明文
     location: str = "query"
+
+
+#: 这些 category 的尝试是**发现**（路径/资源存在），不是漏洞信号。
+#: `enumerate_common` 会把"HTTP 200/403"记成 `outcome="signal"`；判"结论与实测矛盾"
+#: 时必须把它们排除，否则每个字典扫出来的端点都要被要求解释一遍。
+DISCOVERY_CATEGORIES: frozenset[str] = frozenset({"enumerate", "crawl", "read", "restore"})
 
 
 @dataclass
@@ -417,6 +431,10 @@ class AttackSurface:
         用途：拦住"实测有信号，结论却写没问题"的自相矛盾记录（见
         `tools._record_coverage`）。target 里抽不出路径就返回空列表——
         宁可漏拦，也不靠猜去否定模型的结论。
+
+        **发现类尝试不算信号**（`DISCOVERY_CATEGORIES`）：`enumerate_common` 把
+        "路径存在（HTTP 200/403）"也记成 `signal`，那是发现而不是漏洞信号——
+        把它当信号会让每个字典扫出来的端点都被要求解释一遍，闸门变成噪音。
         """
         wanted = target_paths(target)
         if not wanted:
@@ -426,10 +444,48 @@ class AttackSurface:
                 attempt
                 for attempt in self.attempts.values()
                 if attempt.outcome == "signal"
+                and attempt.category not in DISCOVERY_CATEGORIES
                 and normalize_path(attempt.endpoint) in wanted
             ]
         hits.sort(key=lambda item: item.at, reverse=True)
         return hits
+
+    def idor_candidates(self, limit: int = 3) -> list[tuple[str, list[str]]]:
+        """越权（IDOR/BOLA）候选面：路径暗示了对象标识参数、但那个参数从没被试过。
+
+        判据（三条都要满足）：
+        1. 端点**没有探到的参数**，但有 `suggested_params`（按路径名词推测的标识参数名）；
+        2. 那些候选参数名从没出现在任何尝试记录里（枚举时的那次 GET 不算"试过参数"）；
+        3. 该端点还没有 `reported` 结论（已经报过的不用再派）。
+
+        为什么要有这个：live 评测三轮都漏了 `/api/order` 越权——字典枚举**知道路径、
+        不知道参数**，于是"用 order_id 去测"只能靠模型自己想到。这里把它变成确定性输入。
+        """
+        with self._lock:
+            endpoints = list(self.endpoints.values())
+            attempts = list(self.attempts.values())
+            reported = {
+                normalize_path(str(entry.get("target") or ""))
+                for entry in self.coverage.values()
+                if str(entry.get("status") or "") == "reported"
+            }
+        tested: dict[str, set[str]] = {}
+        for attempt in attempts:
+            if attempt.param:
+                tested.setdefault(normalize_path(attempt.endpoint), set()).add(attempt.param.lower())
+        picks: list[tuple[str, list[str]]] = []
+        for endpoint in endpoints:
+            if endpoint.params or not endpoint.suggested_params:
+                continue
+            path = normalize_path(endpoint.url)
+            if path in reported:
+                continue
+            already = tested.get(path, set())
+            pending = [p for p in endpoint.suggested_params if p.lower() not in already]
+            if not pending:
+                continue
+            picks.append((endpoint.url, pending))
+        return picks[:limit]
 
     def add_agent_note(self, worker: str, text: str) -> None:
         """子代理留下的一条结论/线索（跨代理可读，对标 Strix 的 notes 工具）。"""
@@ -471,6 +527,11 @@ class AttackSurface:
             status=int(status or 0),
             note=note,
         )
+        if not entry.params:
+            # 没有探到的参数时，给一组**推测**的标识参数名（只影响越权类任务的输入，
+            # 不写进 `params`）。live 评测实测：字典枚举出的 `/api/order` 登记后
+            # 参数为空，"该用 order_id 去测越权"于是只能靠模型自己想到——三轮都漏了。
+            entry.suggested_params = suggest_id_params(key)
         with self._lock:
             existing = self.endpoints.get(key)
             if existing is None:
@@ -1000,7 +1061,11 @@ class AttackSurface:
             item = by_url[url]
             params = ",".join(item.params[:param_limit]) or "-"
             status = f" HTTP{item.status}" if item.status else ""
-            lines.append(f"  {url}{status} 参数[{params}] 来源[{item.source or '-'}]")
+            extra = ""
+            if not item.params and item.suggested_params:
+                # 推测值必须**明确标注**：`参数[...]` 是探到的，`推测参数[...]` 是猜的。
+                extra = f" 推测参数[{','.join(item.suggested_params[:param_limit])}](按路径名词推测，未验证)"
+            lines.append(f"  {url}{status} 参数[{params}] 来源[{item.source or '-'}]{extra}")
         if len(ranked) > endpoint_limit:
             lines.append(f"  ...（另有 {len(ranked) - endpoint_limit} 个端点）")
         if forms:

@@ -550,6 +550,80 @@ OBJECT_ID_PARAMS: tuple[str, ...] = (
     "record_id", "uuid", "guid", "oid", "sid", "tid",
 )
 
+#: 路径名词 → 该资源最可能的**对象标识参数名**（按优先级）。
+#:
+#: 这是**推测**，不是事实——所以它只进 `Endpoint.suggested_params`，永不混进
+#: `params`（那会让"猜的"看起来像"探到的"）。为什么需要它（live 评测实测）：
+#: 字典枚举只知道路径，`/api/order` 登记后**没有参数信息**，于是那句
+#: "对带 order_id 的接口测越权"只能靠模型自己想到；三轮真实模型评测都漏了这条。
+#: 有了候选名，确定性任务就能把"发现端点 → 试对参数 → 越权判定"接起来。
+PATH_ID_PARAM_HINTS: dict[str, tuple[str, ...]] = {
+    "order": ("order_id", "id"),
+    "orders": ("order_id", "id"),
+    "user": ("uid", "id", "user_id"),
+    "users": ("uid", "id", "user_id"),
+    "profile": ("uid", "id", "user_id"),
+    "account": ("account_id", "uid", "id"),
+    "member": ("member_id", "id"),
+    "customer": ("customer_id", "id"),
+    "invoice": ("invoice_id", "id"),
+    "payment": ("payment_id", "id"),
+    "transaction": ("transaction_id", "id"),
+    "refund": ("refund_id", "id"),
+    "ticket": ("ticket_id", "id"),
+    "message": ("message_id", "id"),
+    "comment": ("comment_id", "id"),
+    "file": ("file_id", "path", "id"),
+    "document": ("doc_id", "document_id", "id"),
+    "record": ("record_id", "id"),
+    "item": ("item_id", "id"),
+    "product": ("product_id", "id"),
+    "coupon": ("coupon_id", "code", "id"),
+    "address": ("address_id", "id"),
+    "card": ("card_id", "id"),
+    "task": ("task_id", "id"),
+    "report": ("report_id", "id"),
+    "export": ("export_id", "id"),
+}
+
+#: 这些路径段是动作/页面，不是资源——出现在路径里不代表"有对象标识参数"。
+NON_RESOURCE_SEGMENTS: frozenset[str] = frozenset({
+    "api", "v1", "v2", "v3", "rest", "graphql", "www", "app", "index", "home",
+    "login", "logout", "signin", "signup", "register", "auth", "oauth", "token",
+    "search", "list", "all", "new", "create", "update", "delete", "edit", "add",
+    "upload", "download", "static", "assets", "public", "health", "status",
+    "ping", "fetch", "proxy", "redirect", "callback", "webhook", "admin",
+    # `detail` / `info` 是修饰词，不是资源名：`/api/v1/invoice/detail` 应该认出
+    # invoice（→ invoice_id），而不是停在 detail 上给出一个泛泛的 id。
+    "detail", "details", "info", "view", "show", "get", "query",
+})
+
+
+def suggest_id_params(url: str, limit: int = 3) -> list[str]:
+    """从路径名词推测对象标识参数名（**猜测**，调用方必须标明来源）。
+
+    只认 `PATH_ID_PARAM_HINTS` 里有的资源名：`/api/order` → `order_id`/`id`，
+    `/api/user?` → `uid`/`id`/`user_id`；`/login`、`/search` 这类动作路径返回空——
+    宁可不猜，也不要给模型一个凭空捏造的参数名。
+    """
+    from urllib.parse import urlparse  # 局部导入：knowledge 不该依赖 surface
+
+    path = urlparse(str(url or "") if "://" in str(url or "") else "//" + str(url or "")).path
+    segments = [
+        segment.strip().lower()
+        for segment in (path or "").split("/")
+        if segment.strip() and not segment.strip().isdigit()
+    ]
+    # 从后往前找：`/api/order/detail` 里更靠近资源的是 detail
+    for segment in reversed(segments):
+        if segment in NON_RESOURCE_SEGMENTS:
+            continue
+        hints = PATH_ID_PARAM_HINTS.get(segment)
+        if hints:
+            return list(hints[:limit])
+    return []
+
+
 
 # ---------------------------------------------------------------------------
 # 3. 响应特征正则（_fuzz_signal 判定用）
