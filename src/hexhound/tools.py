@@ -717,6 +717,9 @@ def _http_request(ctx: ToolRegistry, args: dict[str, Any]) -> str:
         return "请求失败：目标不可达或超时（可用 http_request 重试一次，仍失败请换端点）。"
     note = str(args.get("note") or "").strip()
     exchange_id = _log_exchange(ctx, response, note=note)
+    throttle_reason = _is_throttled(response)
+    if throttle_reason:
+        _note_throttled(ctx, url, throttle_reason)
     with ctx._lock:
         ctx.request_cache[fingerprint] = exchange_id
     body = response.text
@@ -789,6 +792,17 @@ def _compare_responses(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     if baseline is None:
         return "对比失败：基线请求不可达。"
     baseline_id = _log_exchange(ctx, baseline, note="baseline")
+    baseline_gate = _baseline_unusable(ctx, url, baseline)
+    if baseline_gate:
+        # 基线本身被挡住/被限流：这次对比不可能得出有效结论，直接如实返回。
+        ctx.surface.mark_attempt(
+            url, str(args.get("category") or "compare"), param=",".join(inject_params),
+            outcome="blocked", detail=f"基线不可用：{baseline_gate}", **attempt_context,
+        )
+        return (
+            f"对比失败：基线请求不可用（{baseline_gate}，[{baseline_id}]）——"
+            "本次对比未成立，不能据此排除漏洞。"
+        )
     injected = _send(
         ctx, method, url,
         params=merged if location == "query" else None,
@@ -799,13 +813,18 @@ def _compare_responses(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     if injected is None:
         return f"对比失败：注入请求不可达（基线 [{baseline_id}]）。"
     injected_id = _log_exchange(ctx, injected, note=f"inject {inject_params}")
-    if injected.status_code in (401, 403):
+    blocked_reason = _blocked_or_throttled(ctx, url, injected)
+    if blocked_reason:
         ctx.surface.mark_attempt(
             url, str(args.get("category") or "compare"), param=",".join(inject_params),
-            outcome="blocked", detail=f"HTTP {injected.status_code}：注入请求被访问控制阻断",
+            outcome="blocked", detail=f"注入请求被挡住：{blocked_reason}",
             **attempt_context,
         )
-        return f"对比失败：注入请求被 HTTP {injected.status_code} 阻断（{baseline_id}/{injected_id}），不能排除漏洞。"
+        return (
+            f"对比失败：注入请求被挡住（{blocked_reason}，{baseline_id}/{injected_id}），"
+            "不能排除漏洞。"
+        )
+    baseline_blocked = _blocked_or_throttled(ctx, url, baseline)
 
     base_text, inj_text = baseline.text, injected.text
     differences: list[str] = []
@@ -833,13 +852,17 @@ def _compare_responses(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     ctx.surface.mark_attempt(
         url, category or "compare", param=",".join(inject_params) or "",
         payload=json.dumps(inject_params, ensure_ascii=False)[:200],
-        outcome="signal" if differences else "blocked" if baseline.status_code in (401, 403) else "no_signal",
+        outcome=(
+            "signal" if differences
+            else "blocked" if baseline_blocked
+            else "no_signal"
+        ),
         detail="; ".join(differences)[:300],
         **attempt_context,
     )
     if not differences:
-        if baseline.status_code in (401, 403):
-            return f"对比失败：正常请求被 HTTP {baseline.status_code} 阻断，不能排除漏洞。"
+        if baseline_blocked:
+            return f"对比失败：正常请求被挡住（{baseline_blocked}），不能排除漏洞。"
         return (
             f"[{baseline_id} vs {injected_id}] 基线与注入响应无实质差异"
             "（该参数大概率不存在该漏洞，请换参数或换端点）。"
@@ -1127,6 +1150,15 @@ def _enumerate_common(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     words = list(dict.fromkeys(words))
 
     baseline = _send(ctx, "GET", origin + KB.FAKE_404_RANDOM_PATHS[0])
+    # 基线被限流时整轮枚举都不成立（"随便一个路径"拿到 429，后面每个 429 都不代表路径存在）。
+    # 实测风险：429 原先落进 `else` 分支被当成"命中"，于是批量登记**假端点**并把
+    # 攻击面覆盖率抬高，读者会以为扫过了。
+    baseline_gate = _baseline_unusable(ctx, origin, baseline)
+    if baseline_gate:
+        return (
+            f"路径枚举未执行：随机路径基线不可用（{baseline_gate}）。"
+            "限流期间枚举只会产生假命中，本次不做；稍后重试或降低请求频率（RATE_LIMIT）。"
+        )
     baseline_status = baseline.status_code if baseline is not None else 404
     baseline_len = len(baseline.text) if baseline is not None else 0
     fanout = baseline_status == 200
@@ -1145,6 +1177,23 @@ def _enumerate_common(ctx: ToolRegistry, args: dict[str, Any]) -> str:
         response = _send(ctx, "GET", url)
         if response is None:
             continue
+        # 中途被限流：**停止枚举**并如实说明，而不是把 429 记成命中/未命中。
+        throttle_reason = _is_throttled(response)
+        if throttle_reason:
+            _note_throttled(ctx, origin, throttle_reason)
+            lines_stop = (
+                f"[enumerate_common] 目标开始限流（{throttle_reason}），"
+                f"已在第 {words.index(path) + 1}/{len(words)} 个路径处停止。"
+                "**本次枚举不完整**，未覆盖的路径不能当作不存在。"
+            )
+            if hits:
+                lines_stop += "\n限流前已命中：\n" + "\n".join(f"  {text}" for text, _u in hits[:20])
+                paths_hit = [u for _t, u in hits]
+                ctx.surface.add_extra_paths(paths_hit)
+                ctx.surface.add_endpoints(paths_hit, source="enumerate")
+                for text, hit_url in hits:
+                    ctx.surface.mark_attempt(hit_url, "enumerate", outcome="signal", detail=text[:120])
+            return lines_stop
         status = response.status_code
         if status in _REDIRECT_STATUS:
             location = response.headers.get("location", "")
@@ -1350,6 +1399,74 @@ def _dynamic_crawl(ctx: ToolRegistry, args: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
+#: 限流/熔断类响应码：拿到这些码说明**这次测试没有成立**，既不是命中也不是"无信号"。
+THROTTLE_STATUS = frozenset({429, 503})
+
+
+def _is_throttled(response: Any) -> str:
+    """响应该被当作"目标在限流/熔断我们"吗？返回可读原因，空串表示不是。
+
+    为什么单列一类（真实误判链，外部评审指出）：429 原先会落到 `no_signal`，
+    于是同一组合被记成"测过了"，后续重测被去重逻辑跳过；跨运行 diff 又因为
+    `touched_endpoints()` 把该端点当成"本次覆盖过"，把上次报过的问题判成**已修复**。
+    安全报告里最严重的方向就是把"仍然存在"说成"修好了"。
+
+    判据（宽一点没关系，代价只是多试一次）：
+    - 状态码 429 / 503；
+    - 任何 4xx/5xx 且带 `Retry-After`（WAF 常用 403/503 + Retry-After）。
+    """
+    status = int(getattr(response, "status_code", 0) or 0)
+    headers = getattr(response, "headers", {}) or {}
+    retry_after = ""
+    try:
+        retry_after = str(headers.get("retry-after") or "").strip()
+    except Exception:  # noqa: BLE001 头拿不到就当没有
+        retry_after = ""
+    if status in THROTTLE_STATUS:
+        return f"HTTP {status} 限流/熔断" + (f"（Retry-After: {retry_after}）" if retry_after else "")
+    if retry_after and status >= 400:
+        return f"HTTP {status} + Retry-After: {retry_after}（被要求稍后重试）"
+    return ""
+
+
+def _note_throttled(ctx: ToolRegistry, url: str, reason: str) -> None:
+    """把一次限流记进共享攻面：**该端点不再算"本次覆盖过"**，报告里也会披露。
+
+    只记事实，不改任何结论：限流既不能证明漏洞存在，也不能证明它不存在。
+    """
+    try:
+        ctx.surface.mark_throttled(url, reason)
+    except Exception:  # noqa: BLE001 记账失败不该影响工具返回
+        pass
+
+
+def _blocked_or_throttled(ctx: ToolRegistry, url: str, response: Any) -> str:
+    """返回"这次请求被挡住"的原因（鉴权 / 限流），空串表示正常响应。
+
+    401/403 与限流合并成一件事：**这次测试没成立**。区别只在文案与是否记入
+    限流统计。
+    """
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status in (401, 403):
+        return f"HTTP {status}：鉴权或访问控制阻断"
+    reason = _is_throttled(response)
+    if reason:
+        _note_throttled(ctx, url, reason)
+        return f"{reason}——本次测试未成立，稍后重试（不要记成无信号）"
+    return ""
+
+
+def _baseline_unusable(ctx: ToolRegistry, url: str, response: Any) -> str:
+    """基线请求是否**不能用来做对比**（None / 鉴权阻断 / 限流）。空串表示可用。
+
+    限流要单独判：拿一个 429 当基线，"注入后无差异"是必然的，
+    据此得出的"无信号"结论是假的。
+    """
+    if response is None:
+        return "正常请求未成功取得可测试基线"
+    return _blocked_or_throttled(ctx, url, response)
+
+
 def _fuzz_signal(category: str, payload: str, response: httpx.Response) -> str:
     """判定一次注入是否产生可观测的异常信号。"""
     body = response.text
@@ -1505,6 +1622,7 @@ def _fuzz_params(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     tried = 0
     skipped = 0
     incomplete = 0
+    throttled_count = 0
     for name, _sample in list(params.items())[:8]:
         chosen: list[str] = list(categories) if categories else list(
             KB.PARAM_PAYLOAD_HINTS.get(str(name).lower(), ())
@@ -1538,11 +1656,14 @@ def _fuzz_params(ctx: ToolRegistry, args: dict[str, Any]) -> str:
                     )
                     continue
                 _log_exchange(ctx, response, note=f"fuzz {name}={payload[:40]!r} ({category})")
-                if response.status_code in (401, 403):
+                blocked_reason = _blocked_or_throttled(ctx, url, response)
+                if blocked_reason:
                     incomplete += 1
+                    if "限流" in blocked_reason or "Retry-After" in blocked_reason:
+                        throttled_count += 1
                     ctx.surface.mark_attempt(
                         url, category, param=str(name), payload=payload,
-                        outcome="blocked", detail=f"HTTP {response.status_code}：鉴权或访问控制阻断",
+                        outcome="blocked", detail=blocked_reason,
                         **attempt_context,
                     )
                     continue
@@ -1560,12 +1681,12 @@ def _fuzz_params(ctx: ToolRegistry, args: dict[str, Any]) -> str:
                         url, category, param=str(name), payload=payload,
                         outcome="signal", detail=signal, **attempt_context,
                     )
-                elif baseline is None or baseline.status_code in (401, 403):
+                elif _baseline_unusable(ctx, url, baseline):
                     incomplete += 1
                     ctx.surface.mark_attempt(
                         url, category, param=str(name), payload=payload,
-                        outcome="error" if baseline is None else "blocked",
-                        detail="正常请求未成功取得可测试基线", **attempt_context,
+                        outcome="blocked",
+                        detail=_baseline_unusable(ctx, url, baseline), **attempt_context,
                     )
                 else:
                     ctx.surface.mark_attempt(
@@ -1607,11 +1728,12 @@ def _fuzz_params(ctx: ToolRegistry, args: dict[str, Any]) -> str:
                     )
                     continue
                 _log_exchange(ctx, response, note=f"fuzz ssrf {name}={canary}")
-                if response.status_code in (401, 403):
+                blocked_reason = _blocked_or_throttled(ctx, url, response)
+                if blocked_reason:
                     incomplete += 1
                     ctx.surface.mark_attempt(
                         url, "ssrf", param=str(name), payload=canary,
-                        outcome="blocked", detail=f"HTTP {response.status_code}：鉴权或访问控制阻断",
+                        outcome="blocked", detail=blocked_reason,
                         **attempt_context,
                     )
                     continue
@@ -1629,12 +1751,12 @@ def _fuzz_params(ctx: ToolRegistry, args: dict[str, Any]) -> str:
                         url, "ssrf", param=str(name), payload=canary,
                         outcome="signal", detail=signal, **attempt_context,
                     )
-                elif baseline is None or baseline.status_code in (401, 403):
+                elif _baseline_unusable(ctx, url, baseline):
                     incomplete += 1
                     ctx.surface.mark_attempt(
                         url, "ssrf", param=str(name), payload=canary,
-                        outcome="error" if baseline is None else "blocked",
-                        detail="正常请求未成功取得可测试基线", **attempt_context,
+                        outcome="blocked",
+                        detail=_baseline_unusable(ctx, url, baseline), **attempt_context,
                     )
                 else:
                     ctx.surface.mark_attempt(
@@ -1653,6 +1775,11 @@ def _fuzz_params(ctx: ToolRegistry, args: dict[str, Any]) -> str:
         header += f"（其中 {len(already_hit)} 个是共享攻面里已存在的命中）"
     if incomplete:
         header += f"；{incomplete} 个测试被阻断或请求失败，尚未形成结论（不能据此排除漏洞）"
+    if throttled_count:
+        header += (
+            f"；其中 **{throttled_count} 次是目标限流/熔断**——这些端点不算已测过，"
+            "稍后会重试（降低 RATE_LIMIT 或稍后再跑）"
+        )
         if not hits and not already_hit:
             return "fuzz 未完成：" + header
     if not hits and not already_hit:
@@ -1680,6 +1807,17 @@ def _check_security_headers(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     if response is None:
         return "请求失败：页面不可达。"
     exchange_id = _log_exchange(ctx, response, note="security_headers")
+    # 限流/阻断下拿到的响应头不具代表性：可能是网关页而不是目标页。
+    # 原先会把这种情况记成"no_signal（通过）"——把没测成说成没问题。
+    gate = _blocked_or_throttled(ctx, url, response)
+    if gate:
+        ctx.surface.mark_attempt(
+            url, "security_headers", outcome="blocked", detail=f"响应被挡住：{gate}"
+        )
+        return (
+            f"安全头检查未成立：{gate}（HTTP {response.status_code}，证据 [{exchange_id}]）——"
+            "被挡住/被限流时响应头不代表目标配置，不能据此判定通过。"
+        )
     headers = {k.lower(): v for k, v in response.headers.items()}
     issues: list[str] = []
     csp = headers.get("content-security-policy", "")
@@ -1780,12 +1918,29 @@ def _check_default_creds(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     if baseline is None:
         return "请求失败：登录端点不可达，无法建立基线。"
     baseline_id = _log_exchange(ctx, baseline, note="login baseline")
+    # 基线被限流/阻断时，"默认凭据未命中"这个结论是假的（限流下什么都不会命中）。
+    baseline_gate = _baseline_unusable(ctx, url, baseline)
+    if baseline_gate:
+        ctx.surface.mark_attempt(
+            url, "default_creds", outcome="blocked", detail=f"基线不可用：{baseline_gate}"
+        )
+        return (
+            f"默认凭据测试未成立：登录基线不可用（{baseline_gate}，[{baseline_id}]）——"
+            "不能据此说'没有弱口令'。"
+        )
     base_text = baseline.text.lower()
     found: list[str] = []
     registered = ""
+    throttled = 0
     for user, password in DEFAULT_CREDS:
         response = post(user, password)
         if response is None:
+            continue
+        if _is_throttled(response):
+            _note_throttled(ctx, url, _is_throttled(response))
+            throttled += 1
+            if throttled >= 2:
+                break
             continue
         exchange_id = _log_exchange(ctx, response, note=f"login {user}:{password}")
         reason = _login_success_reason(response, baseline, base_text)
@@ -1804,11 +1959,17 @@ def _check_default_creds(ctx: ToolRegistry, args: dict[str, Any]) -> str:
                 if profile:
                     ctx.auth_profiles["C"] = profile
                     registered = "、".join(profile)
-    ctx.surface.mark_attempt(url, "default_creds", outcome="signal" if found else "no_signal")
+    complete = throttled == 0
+    ctx.surface.mark_attempt(
+        url, "default_creds",
+        outcome="signal" if found else ("no_signal" if complete else "blocked"),
+        detail="" if complete else f"中途被限流 {throttled} 次，未测完",
+    )
     if not found:
         return (
             f"未发现常见默认凭据可登录（字段 {user_field}/{pass_field}，已测 {len(DEFAULT_CREDS)} 组，"
             f"基线 [{baseline_id}]）。"
+            + ("" if complete else "注意：中途被限流，**本次未测完**，不能当作'没有弱口令'。")
         )
     lines = [
         f"疑似默认凭据（字段 {user_field}/{pass_field}，基线 [{baseline_id}]）：",
@@ -1890,6 +2051,19 @@ def _auth_test(ctx: ToolRegistry, args: dict[str, Any]) -> str:
         return "越权测试失败：其中一个账号的请求不可达（检查账号是否已配置）。"
     exchange_a = _log_exchange(ctx, response_a, note=f"auth_test {account_a}")
     exchange_b = _log_exchange(ctx, response_b, note=f"auth_test {account_b}")
+    # 限流优先于其它判定：429 下两个身份的"响应无差异"是必然的，据此说
+    # "无越权"是假的；被限流的一侧也不该拿去比差异。
+    throttle_a = _blocked_or_throttled(ctx, url, response_a)
+    throttle_b = _blocked_or_throttled(ctx, url, response_b)
+    if throttle_a or throttle_b:
+        ctx.surface.mark_attempt(
+            url, "auth", param=param_names(url)[0] if param_names(url) else "",
+            outcome="blocked", detail=f"限流/阻断：{throttle_a or throttle_b}", method=method,
+        )
+        return (
+            f"越权测试未成立：请求被挡住（{throttle_a or throttle_b}，"
+            f"{exchange_a}/{exchange_b}）——限流期间的'无差异'不能当作无越权。"
+        )
     if response_a.status_code in (401, 403) and response_b.status_code in (401, 403):
         ctx.surface.mark_attempt(
             url, "auth", param=param_names(url)[0] if param_names(url) else "",

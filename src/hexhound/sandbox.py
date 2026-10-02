@@ -391,6 +391,9 @@ class Sandbox:
         self._lock = threading.Lock()
         self._exec_log: list[dict[str, Any]] = []
         self._host_map_notes: list[str] = []
+        #: 正在执行的宿主子进程（`id(Popen)` → Popen）。`cancel_current()` 用它
+        #: 在"用户按停止/关窗口"时立刻结束正在跑的命令（例如几百秒的 sqlmap）。
+        self._active: dict[int, subprocess.Popen] = {}
         self._staged_scripts: list[Path] = []
         self._gateway: str = ""
         self._gateway_resolved = False
@@ -1467,20 +1470,104 @@ class Sandbox:
         而且无法在 UTF-8 / UTF-16LE 之间做二次判断（`wsl.exe -l -q` 就是后者）。
         这里 `capture_output` 拿原始字节，交给 `sanitize.decode_output` 处理：
         非法字节安全替换，UTF-16LE 嗅探，永不抛异常。
+
+        **可取消**：子进程登记进 `self._active`，`cancel_current()` 能在
+        "用户按停止/关窗口"时立刻结束它（见那里的说明）。
         """
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             args,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=self._host_env(),
+            # POSIX 上开新会话，取消时能整组杀掉；Windows 走 taskkill /T（见 _kill_process）
+            start_new_session=(os.name != "nt"),
         )
+        key = id(proc)
+        with self._lock:
+            self._active[key] = proc
+        try:
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                self._kill_process(proc)
+                stdout, stderr = proc.communicate(timeout=10)
+                raise
+        finally:
+            with self._lock:
+                self._active.pop(key, None)
         return subprocess.CompletedProcess(
-            args=proc.args,
+            args=args,
             returncode=proc.returncode,
-            stdout=decode_output(proc.stdout),
-            stderr=decode_output(proc.stderr),
+            stdout=decode_output(stdout),
+            stderr=decode_output(stderr),
         )
+
+    @staticmethod
+    def _kill_process(proc: subprocess.Popen) -> None:
+        """结束一个宿主子进程**及其整棵进程树**。失败不抛——取消路径要尽量走完。
+
+        为什么必须杀树（实测）：Windows 上 `proc.terminate()` 只结束直接子进程
+        （例如 `cmd.exe`），它启动的 `ping.exe`/`sqlmap` 仍在跑，并且**占着管道**，
+        于是 `communicate()` 一直等不到 EOF——表现就是"取消了但还要等 30 秒"。
+        所以 Windows 用 `taskkill /T /F`，POSIX 用 `killpg`（`Popen` 已开新会话）。
+        """
+        pid = getattr(proc, "pid", 0)
+        if os.name == "nt" and pid:
+            try:
+                subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(pid)],
+                    capture_output=True, check=False,
+                )
+                proc.wait(timeout=5)
+                return
+            except Exception:  # noqa: BLE001 回退到 terminate/kill
+                pass
+        elif pid:
+            try:
+                import signal as _signal
+
+                os.killpg(os.getpgid(pid), _signal.SIGKILL)
+                proc.wait(timeout=5)
+                return
+            except Exception:  # noqa: BLE001 回退到 terminate/kill
+                pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def active_commands(self) -> int:
+        """当前正在执行的沙箱命令数（供 UI/测试观察）。"""
+        with self._lock:
+            return len(self._active)
+
+    def cancel_current(self, reason: str = "") -> int:
+        """取消**正在执行**的沙箱命令，返回被取消的数量。
+
+        为什么需要（外部评审第 4 条）：关窗口/按停止时，用户要等的那一步
+        往往是"某条 sqlmap 正在跑"。只发停止信号没用——工具调用返回之前，
+        子代理不会去看停止标志，于是最多干等到 `HEXHOUND_CLOSE_GRACE` 就退出，
+        报告可能还没写。这里直接把宿主子进程杀掉：
+
+        - WSL 后端：杀掉 `wsl.exe` 会终止该会话里的 Linux 端命令；
+        - Docker 后端：杀掉 `docker exec` 客户端（容器内的进程由容器决定，
+          下一次命令仍能正常执行）；
+        - 取消本身**不写证据**：被取消的执行在 `_execute` 里如实返回失败，
+          由 `exec_log` 记录，不会被当成"跑过了"。
+        """
+        with self._lock:
+            procs = list(self._active.values())
+            if reason:
+                self._host_map_notes.append(f"取消执行：{reason}"[:200])
+        for proc in procs:
+            self._kill_process(proc)
+        return len(procs)
 
     def exec_log(self) -> list[dict[str, Any]]:
         with self._lock:

@@ -1753,6 +1753,26 @@ class Orchestrator:
                     merged_bucket[str(tool)] = merged_bucket.get(str(tool), 0) + int(count)
         if failures:
             failures["total"] = sum(sum(b.values()) for b in failures.values())
+        # 运行级状态必须与子任务状态一致（外部评审实测：注入子任务 failed，
+        # 整轮却记成 `finish`、历史列表显示"已完成"）。规则：
+        #   失败的子任务（failed/skipped）> 提供商故障 > 预算/软上限/用户停止 > finish
+        failed_tasks = [t for t in tasks if t.outcome in ABORTED_OUTCOMES]
+        errored_tasks = [t for t in tasks if t.outcome == "provider_error"]
+        if failed_tasks:
+            stop_reasons.append(
+                "子任务失败：" + "、".join(f"{t.id}({t.role})" for t in failed_tasks[:6])
+            )
+        if errored_tasks:
+            stop_reasons.append(
+                "子任务因模型端点故障中断："
+                + "、".join(f"{t.id}({t.role})" for t in errored_tasks[:6])
+            )
+        if failed_tasks or errored_tasks:
+            final += (
+                f"\n\n注意：本次有 {len(failed_tasks)} 个子任务失败、"
+                f"{len(errored_tasks)} 个子任务因模型端点故障中断——"
+                "它们的覆盖范围**没有测过**，报告不完整。"
+            )
         return AgentResult(
             steps=steps,
             findings=deduped,
@@ -1768,6 +1788,8 @@ class Orchestrator:
                 "cancelled" if user_stopped
                 else "budget" if budget_reasons
                 else "soft_timeout" if self.soft_stopped
+                else "failed" if failed_tasks
+                else "provider_error" if errored_tasks
                 else "finish"
             ),
             surface=self.surface,

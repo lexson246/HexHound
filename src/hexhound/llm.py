@@ -148,6 +148,19 @@ def build_llm_pool(
     `echo` 可传一个 callable（如 click.echo / print）用于打印角色覆盖信息——
     放在这里是为了让 CLI 与 GUI 共用同一套解析逻辑，避免两边行为漂移。
     """
+    if str(getattr(config, "provider", "") or "").strip().lower() in ("scripted", "mock", "offline"):
+        # 离线演示：确定性脚本策略驱动真实编排/工具/报告链路，**不联网、不花额度**。
+        # 用于验收与演示（见 docs/CODEX-HANDOVER.md 的零额度验证一节）。
+        # 结果不是模型跑出来的——报告里的 models 会写成 scripted/scripted-policy。
+        from .mockllm import ScriptedLLM
+
+        scripted = ScriptedLLM()
+        if echo is not None:
+            echo(
+                "注意：当前使用**脚本 LLM（离线演示）**，不调用真实模型；"
+                "结论不能当作真实评估结果。"
+            )
+        return scripted, {"planner": scripted}
     default = LLMClient(
         config.api_key,
         config.base_url,

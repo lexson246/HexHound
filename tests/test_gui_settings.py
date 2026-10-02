@@ -101,18 +101,31 @@ def _decoded_keys(stored_value: str) -> dict:
 
 
 def test_explicit_none_clears_a_field_to_its_default(settings_file: Path) -> None:
-    """`None` 是"显式清空"：密钥要能真的删掉，而不是永远删不掉。"""
+    """`None` 是"显式清空"（普通字段），但**密钥只能走服务端入口删**。
+
+    两条语义都要钉住：
+
+    1. 普通字段：`None` → 回到默认值（设置面板"清空"的语义）；
+    2. 密钥：客户端提交的 `provider_keys`（含 `None`）**一律忽略**——那正是外部评审
+       复现的数据丢失路径（用完整设置对象保存一次就把密钥清空）。要删密钥用
+       服务端入口 `_store_provider_key(provider, "")`。
+    """
     _write_settings(
         settings_file,
         {"provider_keys": json.dumps({"deepseek": "sk-fake-0001"}), "target": "http://x/"},
     )
     gui._save_settings({"provider_keys": None, "target": None})
 
-    assert gui._provider_keys() == {}
+    assert gui._provider_keys() == {"deepseek": "sk-fake-0001"}, "客户端不能清空密钥"
     stored = _read_settings(settings_file)
-    # 清空后落盘的内容解出来必须是空字典（可能带加密外壳）
-    assert _decoded_keys(stored["provider_keys"]) == {}
-    assert stored["target"] == gui.DEFAULTS["target"]
+    assert _decoded_keys(stored["provider_keys"]) == {"deepseek": "sk-fake-0001"}
+    assert stored["target"] == gui.DEFAULTS["target"], "普通字段仍要能清空"
+
+    # 服务端删除入口仍然有效："密钥要能真的删掉"这条不能被削弱
+    ok, why = gui._store_provider_key("deepseek", "")
+    assert ok, why
+    assert gui._provider_keys() == {}
+    assert _decoded_keys(_read_settings(settings_file)["provider_keys"]) == {}
 
 
 def test_keys_are_not_stored_in_plaintext(settings_file: Path) -> None:
@@ -127,7 +140,7 @@ def test_keys_are_not_stored_in_plaintext(settings_file: Path) -> None:
     """
     from hexhound import secretstore
 
-    gui._save_settings({"provider_keys": json.dumps({"deepseek": "sk-fake-0001"})})
+    gui._store_provider_key("deepseek", "sk-fake-0001")
     text = settings_file.read_text(encoding="utf-8")
     available, reason = secretstore.protection_available()
     if available:
@@ -157,7 +170,7 @@ def test_legacy_plaintext_is_migrated_without_losing_keys(settings_file: Path) -
 
 def test_double_save_does_not_double_encrypt(settings_file: Path) -> None:
     """已经是密文就不能再加密一次（否则第二次读就解不开了）。"""
-    gui._save_settings({"provider_keys": json.dumps({"deepseek": "sk-fake-0001"})})
+    gui._store_provider_key("deepseek", "sk-fake-0001")
     first = _read_settings(settings_file)["provider_keys"]
     gui._save_settings({"target": "http://127.0.0.1:5000"})
     second = _read_settings(settings_file)["provider_keys"]
@@ -333,7 +346,7 @@ def _auth(token: str) -> dict:
 
 def test_providers_endpoint_never_returns_plaintext_keys(app, token, client) -> None:
     """`/api/providers` 只回掩码与"是否已保存"，绝不回明文密钥。"""
-    gui._save_settings({"provider_keys": json.dumps({"deepseek": "sk-fake-0001"})})
+    gui._store_provider_key("deepseek", "sk-fake-0001")
     payload = client.get("/api/providers", headers=_auth(token)).get_json()
 
     assert "keys" not in payload
@@ -347,7 +360,7 @@ def test_saving_the_displayed_mask_is_rejected(client, token) -> None:
 
     否则之后每次请求都拿着一个必然失败的假密钥，而界面还显示"已保存"。
     """
-    gui._save_settings({"provider_keys": json.dumps({"deepseek": "sk-fake-0001"})})
+    gui._store_provider_key("deepseek", "sk-fake-0001")
     mask = gui.mask_key("sk-fake-0001")
 
     response = client.post(

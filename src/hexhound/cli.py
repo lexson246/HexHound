@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -408,6 +409,28 @@ def _run_audit(
         click.echo(f"  [{step.get('worker', '?')}] {step.get('action')}: {observation}")
 
     callbacks = SwarmCallbacks(on_step=on_step, on_event=on_event)
+    # Ctrl+C 也要**收尾并落盘**（与桌面停止按钮同一套语义）：
+    # 第一次按下 → 中断正在跑的沙箱命令 + 让编排/子代理收尾；第二次 → 立刻退出。
+    # 早先命令行中断是直接抛 KeyboardInterrupt，报告根本不写——
+    # 用户看到的是"跑了几十分钟，什么都没留下"。
+    stop_flag = {"stopped": False}
+
+    def _on_interrupt(signum: int, frame: object) -> None:
+        if stop_flag["stopped"]:
+            click.echo("\n再次中断：立即退出（已完成的成果可能未写入报告）。")
+            raise KeyboardInterrupt
+        stop_flag["stopped"] = True
+        if sandbox is not None:
+            cancelled = sandbox.cancel_current("命令行中断")
+            if cancelled:
+                click.echo(f"已中断 {cancelled} 条正在执行的沙箱命令。")
+        click.echo("\n收到中断信号：正在收尾并把已完成的成果写进报告（再按一次 Ctrl+C 立即退出）…")
+
+    try:
+        signal.signal(signal.SIGINT, _on_interrupt)
+    except (ValueError, OSError):  # 非主线程/不支持信号时忽略
+        pass
+    callbacks.should_stop = lambda: stop_flag["stopped"]
     llm_label = _llm_label(llm)
     click.echo(
         f"开始审计：{target}（模式 {mode}，模型 {llm_label}，"
@@ -485,6 +508,13 @@ def _run_audit(
             tools=sandbox_setup.tools if sandbox_setup else (),
         )
         artifacts.save_surface(surface)
+
+    if stop_flag["stopped"]:
+        # 与桌面"停止"完全相同的语义：报告写明"被中断、不完整"。
+        from .report import mark_partial
+
+        result = mark_partial(result)
+        click.echo(f"{MARK_WARN} 本次运行被中断：报告会标注「不完整」。")
 
     output_path = Path(output)
     if not output_path.is_absolute():

@@ -361,8 +361,9 @@ HTML = r"""<!doctype html>
       <label>模型（可直接输入，或从下拉选）</label>
       <input name="model" id="modelInput" list="modelOptions" value="{{ settings.model }}" placeholder="模型名">
       <datalist id="modelOptions"></datalist>
-      <label>API 密钥 <span class="muted" id="keyState"></span></label>
-      <input name="api_key" id="apiKeyInput" type="password" value="{{ settings.api_key }}" autocomplete="off" placeholder="sk-...">
+      <label>API 密钥 <span class="muted" id="keyState">{% if key_saved %}已保存{% if key_masked %}：{{ key_masked }}{% endif %}（留空 = 不修改）{% elif key_from_env %}已从 .env 读取（留空 = 沿用；保存在这里会覆盖它）{% else %}未保存{% endif %}</span></label>
+      <input name="api_key" id="apiKeyInput" type="password" value="" autocomplete="off"
+             placeholder="{% if key_saved %}已保存，留空表示不修改；要换密钥请粘贴完整密钥{% else %}sk-...{% endif %}">
       <label>模型 URL（base_url）</label>
       <input name="base_url" id="baseUrlInput" value="{{ settings.base_url }}" placeholder="https://api.example.com/v1">
       <label for="reasoningEffort">推理强度</label>
@@ -1079,7 +1080,7 @@ def _load_settings() -> dict:
 _SETTINGS_LOCK = threading.RLock()
 
 
-def _save_settings(data: dict) -> None:
+def _save_settings(data: dict, *, provider_keys: str | None = None) -> None:
     """保存设置：白名单字段 + 按角色模型字段（`role_model_<角色>`）。
 
     三条硬化（都是实测问题驱动的）：
@@ -1092,6 +1093,10 @@ def _save_settings(data: dict) -> None:
        JSON；配置文件写坏等于密钥与白名单一起丢。
     3. **加锁**：并发保存（多个标签页、`/api/save` 与 `/api/provider_key` 同时
        到达）串行化，避免后写覆盖先写。
+
+    `provider_keys` 是**服务端独占字段**：只接受这里的显式参数（由
+    `_store_provider_key()` 传入），客户端 payload 里出现的同名键一律忽略——
+    否则"用完整设置对象保存一次"就会把已保存的所有密钥清空。
     """
     with _SETTINGS_LOCK:
         SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1103,6 +1108,12 @@ def _save_settings(data: dict) -> None:
         for key in DEFAULTS:
             if key not in data:
                 continue  # 未提交 → 保留基底（磁盘值或默认值）
+            if key == "provider_keys":
+                # **服务端独占字段**：密钥只允许经 `_store_provider_key()` 写入。
+                # 客户端提交的 `provider_keys`（哪怕只是 DEFAULTS 里的 "{}"）一律忽略——
+                # 否则"用完整设置对象保存一次"就会把已保存的所有密钥清空，
+                # 正是外部评审复现的那类数据丢失。
+                continue
             value = data.get(key)
             # 显式 None = 清空回默认值；显式空串 = 就存空串
             cleaned[key] = DEFAULTS.get(key, "") if value is None else str(value).strip()
@@ -1112,10 +1123,44 @@ def _save_settings(data: dict) -> None:
                 cleaned[field] = str(data.get(field, "") or "").strip()
         # 密钥字段落盘前加密（Windows DPAPI）。旧文件里的明文 JSON 在这里被
         # 自动迁移成密文——读的时候两种格式都认，因此**不会丢密钥**。
+        if provider_keys is not None:
+            cleaned["provider_keys"] = provider_keys
         cleaned["provider_keys"] = _protect_provider_keys(cleaned.get("provider_keys", ""))
+        # 遗留的明文 `api_key` 一律迁进 `provider_keys[当前提供商]` 并清空：
+        # 它曾经被明文写盘、还被原样回填进页面（外部评审指出）。迁移是幂等的，
+        # 且只在"确实有明文 key"时发生。
+        legacy_key = str(cleaned.get("api_key") or "").strip()
+        if legacy_key:
+            provider = resolve_provider(cleaned.get("provider") or os.getenv("LLM_PROVIDER", ""))
+            if provider:
+                migrated = _merge_provider_key(cleaned.get("provider_keys", ""), provider, legacy_key)
+                if migrated:
+                    cleaned["provider_keys"] = _protect_provider_keys(migrated)
+            cleaned["api_key"] = ""
         _atomic_write_text(
             SETTINGS_PATH, json.dumps(cleaned, ensure_ascii=False, indent=2)
         )
+
+
+def _merge_provider_key(protected: str, provider: str, api_key: str) -> str:
+    """把一把密钥并进（可能已加密的）`provider_keys` 字符串，返回**明文 JSON**。
+
+    解不开密文时返回空串——调用方据此放弃迁移，绝不覆盖读不出来的旧值。
+    """
+    raw = str(protected or "") or "{}"
+    if secretstore.is_protected(raw):
+        decrypted, error = secretstore.unprotect(raw)
+        if error:
+            return ""
+        raw = decrypted
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data[str(provider)] = str(api_key)
+    return json.dumps(data, ensure_ascii=False)
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -1159,6 +1204,37 @@ def _provider_keys() -> dict[str, str]:
     if not isinstance(data, dict):
         return {}
     return {str(k): str(v) for k, v in data.items() if str(v).strip()}
+
+
+def _store_provider_key(provider: str, api_key: str) -> tuple[bool, str]:
+    """把某个提供商的密钥并进 `provider_keys` 并落盘。返回 `(成功, 说明)`。
+
+    为什么必须**先解密再合并**（外部评审复现的真实数据丢失）：
+    `/api/provider_key` 原先直接 `json.loads(stored["provider_keys"])`，
+    而这个字段落盘时是 **DPAPI 密文**——解析必然失败 → 退化成空字典 →
+    只写进新 provider 的那一把 → **其它提供商的密钥全被清掉**
+    （实测：保存 Qwen 之后 DeepSeek 的 key 没了）。
+    读侧必须走 `_provider_keys()`（它负责解密）。
+
+    解不开密文时**拒绝保存**：宁可这次没存上，也不能把读不出来的旧密钥覆盖掉。
+
+    `api_key` 传空串 = **删除**该提供商的密钥（这是服务端唯一的删除入口；
+    客户端提交 `provider_keys` 会被忽略，见 `_save_settings`）。
+    """
+    keys = _provider_keys()
+    if _KEYSTORE_NOTE:
+        return False, (
+            f"读不出已保存的密钥（{_KEYSTORE_NOTE}），为避免覆盖旧密钥，本次未保存。"
+            "请在设置面板里重新粘贴需要的密钥。"
+        )
+    if str(api_key or "").strip():
+        keys[str(provider)] = str(api_key)
+    else:
+        keys.pop(str(provider), None)
+    stored = _load_settings()
+    stored.pop("api_key", None)
+    _save_settings(stored, provider_keys=json.dumps(keys, ensure_ascii=False))
+    return True, ""
 
 
 #: 最近一次读取密钥时的说明（解密失败等），供界面显示。
@@ -1328,14 +1404,29 @@ def _request_hostname() -> str:
 
 
 def _settings_payload() -> dict:
-    """给模板的完整设置（含 provider 相关字段、角色模型与数值字段定义）。"""
+    """给模板的完整设置（含 provider 相关字段、角色模型与数值字段定义）。
+
+    **密钥不进页面**：`api_key` 从模板里被抹掉，只留一个"是否已保存"的标记
+    （`key_saved`）。早先它被原样回填进 `<input value="sk-…">`——等于把明文密钥
+    写进 HTML 与浏览器内存，共用设备/截图/前端脚本都能读到。界面现在显示
+    掩码占位："已保存，留空表示不修改"。
+    """
     stored = _load_settings()
     merged = {**DEFAULTS, **stored}
     specs = field_specs()
     # 每行两个字段：与既有版式一致，且不依赖模板里的循环算术。
     groups = [specs[index : index + 2] for index in range(0, len(specs), 2)]
+    saved_keys = _provider_keys()
+    active = _active_provider(merged)
+    saved_key = saved_keys.get(active, "")
+    env_key = (
+        os.getenv(env_key_name(active), "").strip() or os.getenv("LLM_API_KEY", "").strip()
+    )
     return {
-        "settings": {**merged, "role_models": _role_models(stored)},
+        "settings": {**merged, "api_key": "", "role_models": _role_models(stored)},
+        "key_saved": bool(saved_key),
+        "key_masked": mask_key(saved_key) if saved_key else "",
+        "key_from_env": bool(not saved_key and env_key),
         "role_labels": ROLE_LABEL,
         "field_groups": groups,
         "run_history": history.list_runs(limit=10),
@@ -1382,6 +1473,9 @@ class RunState:
         self._token = 0
         self._cancel_event = threading.Event()
         self._running = False
+        #: 本次运行的真工具沙箱（`_run_audit` 就位后写入）。停止时要能**中断**
+        #: 正在跑的命令，而不只是置一个标志等它自己返回。
+        self.sandbox = None  # type: ignore[var-annotated] 真工具沙箱（见下）
         self.status = STATUS_IDLE
         self.steps: list[dict] = []
         self.events: list[dict] = []
@@ -1546,11 +1640,30 @@ class RunState:
 
         **不清空已完成的成果**（早先把 summary/error 清成空串，
         于是"跑到一半停下"看起来像"什么都没发生"）。
+
+        同时**中断正在跑的沙箱命令**：只置停止标志的话，子代理要等当前工具调用
+        返回才会看到它——而那条命令可能是几百秒的 sqlmap。外部评审第 4 条就是
+        这个场景：关窗口后只能干等 `HEXHOUND_CLOSE_GRACE`，报告可能没写完就退出。
         """
         with self._lock:
             self._cancel_event.set()
             if self.status == STATUS_RUNNING:
                 self.status = STATUS_STOPPING
+            sandbox = self.sandbox
+        if sandbox is not None:
+            try:
+                cancelled = sandbox.cancel_current("用户停止")
+            except Exception:  # noqa: BLE001 取消失败不影响停止语义
+                cancelled = 0
+            if cancelled:
+                # 在锁内直接追加：`add_event` 需要 token，而停止本身就是"当前运行"的动作
+                with self._lock:
+                    self.events.append(
+                        {
+                            "kind": "notice", "task": "沙箱", "level": "warn",
+                            "message": f"已中断 {cancelled} 条正在执行的沙箱命令（用户停止）。",
+                        }
+                    )
 
     def is_stopped(self, token: int) -> bool:
         with self._lock:
@@ -1740,40 +1853,14 @@ def _archive_report(artifacts: RunArtifacts, report_path: Path) -> None:
 
 
 def _mark_partial(result, settings: dict):
-    """给"被中断"的结果打上不完整标记（**不得让未测区域看起来像安全**）。
+    """给"被中断"的结果打上不完整标记（实现见 `report.mark_partial`）。
 
-    做法很克制、也很重要：
-
-    1. 在总结最前面加一段醒目的中断说明；
-    2. 让报告渲染出"本次运行未完成"；
-    3. **绝不**把未完成的端点/参数写成 `no_issue_found`——那会把"没测"
-       说成"测过没问题"。这里不新增、也不修改任何 coverage/finding。
-
-    与项目最重要的那条不变量一致：没测到 ≠ 已修复 / 已安全。
+    保留这个薄包装是为了既有调用点与测试；**CLI 的 Ctrl+C 走的是同一个实现**
+    （早先只有桌面会标"不完整"，命令行中断写出的报告看起来像正常完成）。
     """
-    from .agent import AgentResult
+    from .report import mark_partial
 
-    previous_summary = str(getattr(result, "final_summary", "") or "")
-    note = (
-        "【本次运行被中断，报告不完整】\n"
-        "用户在该审计结束前停止了运行。已经完成的步骤、发现、覆盖记录与用量"
-        "都**如实保存在本报告中**；但**尚未测试的端点与参数没有被测过**，"
-        "它们既不代表安全，也不代表已修复。请把它当作一次未完成的评估，"
-        "需要完整结论时请重新运行。\n"
-    )
-    if isinstance(result, AgentResult):
-        result.final_summary = note + ("\n" + previous_summary if previous_summary else "")
-        result.finish_reason = "cancelled"
-        return result
-
-    # 兜底：极少数情况下 result 不是 AgentResult（例如单代理分支返回别的类型），
-    # 就地补两个属性，report 渲染器读的就是它们。
-    try:
-        result.final_summary = note + ("\n" + previous_summary if previous_summary else "")
-        result.finish_reason = "cancelled"
-    except Exception:  # noqa: BLE001 标注失败也不能让收尾崩掉
-        pass
-    return result
+    return mark_partial(result)
 
 
 def _run_audit(settings: dict, token: int) -> None:
@@ -1900,6 +1987,8 @@ def _run_audit(settings: dict, token: int) -> None:
             )
             sandbox = sandbox_setup.sandbox
             runtime_sandbox = sandbox
+            # 让"停止/关窗口"能中断正在跑的沙箱命令（例如几百秒的 sqlmap）
+            STATE.sandbox = sandbox
             message = sandbox_setup.message()
             if not sandbox_setup.ok and sandbox_setup.hint:
                 message = f"{message}｜{sandbox_setup.hint}"
@@ -2019,6 +2108,7 @@ def _run_audit(settings: dict, token: int) -> None:
                 runtime_sandbox.stop()
             except Exception:  # noqa: BLE001 清理失败不能覆盖审计成果
                 pass
+        STATE.sandbox = None
 
 def create_app() -> Flask:
     app = Flask(__name__)
@@ -2103,16 +2193,9 @@ def create_app() -> Flask:
                 ),
                 400,
             )
-        stored = _load_settings()
-        try:
-            keys = json.loads(stored.get("provider_keys") or "{}")
-        except json.JSONDecodeError:
-            keys = {}
-        if not isinstance(keys, dict):
-            keys = {}
-        keys[provider] = api_key
-        stored["provider_keys"] = json.dumps(keys, ensure_ascii=False)
-        _save_settings(stored)
+        ok, why = _store_provider_key(provider, api_key)
+        if not ok:
+            return jsonify({"error": why}), 409
         return jsonify({"ok": True, "provider": provider, "masked": mask_key(api_key)})
 
     @app.route("/api/provider_test", methods=["POST"])

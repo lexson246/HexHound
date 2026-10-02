@@ -269,6 +269,10 @@ class AttackSurface:
         self.api_specs: list[dict[str, Any]] = []
         self.api_spec_endpoints: set[str] = set()
         self.api_spec_params: list[tuple[str, str]] = []
+        # 限流记录：端点 → 原因。被限流的端点**不算"本次覆盖过"**（见 touched_endpoints），
+        # 因此跨运行 diff 不会把"上次报过、这次被 429 挡住"说成已修复。
+        self.throttled: dict[str, str] = {}
+        self.throttle_count = 0
         self.started_at = time.time()
 
     # ---------- 覆盖率 / 笔记 ----------
@@ -750,7 +754,37 @@ class AttackSurface:
                 match = re.search(r"https?://\S+", str(entry.get("target") or ""))
                 if match:
                     touched.add(normalize_endpoint(match.group(0)))
+            # **被限流过的端点一律不算覆盖**（哪怕中途有一次正常响应，或模型记了
+            # "no_issue_found"）：外部评审指出的误判链就是"429 → no_signal → touched →
+            # diff 判 fixed"。宁可说"无法判定"，也不能说"已修复"。
+            throttled = {normalize_endpoint(url) for url in self.throttled}
+            touched -= throttled
         return {url for url in touched if url}
+
+    def mark_throttled(self, endpoint: str, reason: str = "") -> None:
+        """记录一次限流（端点级）。只记事实，不改任何结论。"""
+        normalized = normalize_endpoint(endpoint)
+        if not normalized:
+            return
+        with self._lock:
+            self.throttle_count += 1
+            if reason:
+                self.throttled[normalized] = reason[:200]
+            else:
+                self.throttled.setdefault(normalized, "")
+            if self.throttle_count in (1, 10, 50, 200):
+                self.add_note(
+                    f"目标出现限流/熔断：{normalized} → {reason or '未知原因'}"
+                    "（被限流的端点**不算已覆盖**，相关结论可能不完整）"
+                )
+
+    def throttle_summary(self) -> dict[str, Any]:
+        """限流概况（写进 run.json / 报告）。"""
+        with self._lock:
+            return {
+                "count": self.throttle_count,
+                "endpoints": sorted(self.throttled)[:20],
+            }
 
     def reported_endpoints(self) -> set[str]:
         """覆盖记录里标了 `reported` 的端点——**本轮在这里观察到过问题**。
@@ -917,6 +951,8 @@ class AttackSurface:
                 "findings": len(self.findings),
                 "coverage": len(self.coverage),
                 "notes": len(self.agent_notes),
+                # 目标限流/熔断次数：>0 时报告必须写明"覆盖不完整"
+                "throttled": self.throttle_count,
             }
 
     def covered_owasp(self) -> dict[str, int]:

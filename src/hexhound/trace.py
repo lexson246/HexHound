@@ -208,7 +208,13 @@ class TraceRecorder:
         self._append(header)
 
     def record(self, kind: str, *, task: str = "", role: str = "", **data: Any) -> dict[str, Any]:
-        """追加一条事件，返回写入的字典（也保留在内存里供报告使用）。"""
+        """追加一条事件，返回写入的字典（也保留在内存里供报告使用）。
+
+        **写盘必须在锁内**（实测踩到，全量测试里偶发）：早先只把"构造事件"放进锁，
+        `_append` 在锁外执行——并发的两个子代理各自打开同一个文件追加，
+        行与行会互相穿插，`trace.jsonl` 里出现半行 JSON。
+        读取端只能把它标成 `trace_corrupt_line`，于是**离线审计/报告重建会缺事件**。
+        """
         with self._lock:
             self._seq += 1
             event = TraceEvent(
@@ -220,7 +226,7 @@ class TraceRecorder:
                 role=str(role or ""),
                 data=data,
             ).to_dict()
-        self._append(event)
+            self._append(event)
         return event
 
     def record_step(self, step: dict[str, Any], *, task: str = "", role: str = "") -> dict[str, Any]:

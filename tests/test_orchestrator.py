@@ -95,6 +95,78 @@ class PlanParsingTests(unittest.TestCase):
         self.assertTrue(_looks_like_auth(surface))
 
 
+class RunStatusMatchesTaskStatusTests(unittest.TestCase):
+    """运行级状态必须和子任务状态一致。
+
+    外部评审实测：**注入子任务 `failed`，整轮却记成 `finish`，历史列表显示"已完成"**。
+    报告读者会据此以为这一轮跑完了——而实际上有一块覆盖范围根本没测。
+    规则（本类逐条钉住）：
+
+    - 有失败子任务 → 运行级 `failed`（历史判定为"未完成"）；
+    - 全是模型端点故障 → 运行级 `provider_error`；
+    - 只有"未收尾"（closing_no_finish 等）→ 仍算 `finish`（产出已固化，报告另有披露）。
+    """
+
+    def make(self, **overrides) -> Orchestrator:
+        settings = {
+            "target": TARGET,
+            "goal": "状态一致性",
+            "mode": "blackbox",
+            "base_dir": Path("."),
+            "allowed_hosts": ALLOWED,
+            "timeout": 1,
+            "max_tasks": 3,
+            "task_steps": 3,
+            "parallel": 1,
+            "budget": Budget(BudgetLimits(max_tool_calls=50)),
+        }
+        settings.update(overrides)
+        return Orchestrator(ScriptedLLM(), **settings)
+
+    @staticmethod
+    def task(task_id: str, outcome: str, finish_reason: str | None = None) -> WorkerTask:
+        from hexhound.agent import AgentResult
+
+        task = WorkerTask(id=task_id, role="injection", objective="测 id 参数", steps=3)
+        task.outcome = outcome
+        task.result = AgentResult(
+            finish_reason=finish_reason or outcome, final_summary=f"{task_id} 结束"
+        )
+        return task
+
+    def test_failed_subtask_makes_the_run_failed(self) -> None:
+        tasks = [self.task("T1", "done", "finish"), self.task("T2", "failed")]
+        result = self.make()._aggregate(tasks)
+        self.assertEqual(result.finish_reason, "failed")
+        self.assertIn("子任务失败", result.final_summary)
+        self.assertIn("报告不完整", result.final_summary)
+
+    def test_provider_error_only_run_is_marked_as_such(self) -> None:
+        result = self.make()._aggregate([self.task("T1", "provider_error")])
+        self.assertEqual(result.finish_reason, "provider_error")
+        self.assertIn("模型端点故障", result.final_summary)
+
+    def test_incomplete_but_not_failed_run_is_still_finish(self) -> None:
+        tasks = [
+            self.task("T1", "done", "finish"),
+            self.task("T2", "closing_no_finish", "closing_no_finish"),
+        ]
+        result = self.make()._aggregate(tasks)
+        self.assertEqual(result.finish_reason, "finish")
+        self.assertNotIn("报告不完整", result.final_summary)
+
+    def test_user_stop_still_wins_over_task_failure(self) -> None:
+        orchestrator = self.make(callbacks=SwarmCallbacks(should_stop=lambda: True))
+        result = orchestrator._aggregate([self.task("T1", "failed")])
+        self.assertEqual(result.finish_reason, "cancelled")
+
+    def test_history_shows_failed_run_as_unfinished(self) -> None:
+        from hexhound import history
+
+        for reason in ("failed", "provider_error"):
+            self.assertIn(reason, history.PARTIAL_FINISH_REASONS)
+
+
 class SoftTimeLimitTests(unittest.TestCase):
     """墙钟**软上限**：默认必须存在，且只在波次边界生效。
 

@@ -55,6 +55,26 @@ def _wait_for_server(port: int, timeout: float = 15.0) -> None:
 CLOSE_GRACE_SECONDS = 45.0
 
 
+def log_line(message: str) -> None:
+    """把启动/关闭里程碑写进 `HEXHOUND_DESKTOP_LOG` 指定的文件（可选）。
+
+    为什么需要：桌面版是 **windowed** 构建，没有控制台——一旦启动阶段出问题
+    （例如单实例互斥、WebView2 缺失、某个 import 炸了），用户看到的只是
+    "双击没反应"，排查时没有任何线索（实测踩过：验收脚本报"进程活着但没监听"，
+    完全不知道卡在哪一步）。设了这个环境变量就能拿到逐行日志。
+
+    只写里程碑，不写密钥；写失败静默忽略（日志不该影响主流程）。
+    """
+    path = os.getenv("HEXHOUND_DESKTOP_LOG", "").strip()
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(f"{time.strftime('%H:%M:%S')} pid={os.getpid()} {message}\n")
+    except OSError:
+        pass
+
+
 def close_grace_seconds() -> float:
     raw = os.getenv("HEXHOUND_CLOSE_GRACE", "").strip()
     if not raw:
@@ -108,48 +128,43 @@ def stop_running_audit(state: Any, *, timeout: float) -> str:
     return "saved" if wait_for_run_end(state, timeout=timeout) else "timeout"
 
 
-def _notify_saving(window: Any) -> None:
-    """在页面上提示"正在保存不完整报告"（窗口此时还没销毁）。"""
-    script = (
-        "(() => { const box = document.querySelector('#runStatus') || document.body;"
-        " if (box) { box.textContent = '正在保存不完整报告（最多 45 秒）…'; } })()"
-    )
-    try:
-        window.evaluate_js(script)
-    except Exception:  # noqa: BLE001 页面已经关了就算了
-        pass
-
-
 def install_close_guard(window: Any, state: Any, *, timeout: float | None = None) -> None:
-    """拦截第一次关窗：先让运行收尾落盘，再自己销毁窗口。
+    """关窗时的收尾：**立刻请求停止并中断沙箱命令，然后放行关闭**。
 
-    第二次关窗不再拦截（否则用户会觉得"关不掉"）。任何 API 差异都吞掉——
-    真正的兜底在 `main()` 的 finally（`stop_running_audit`），不依赖事件能不能挂上。
+    报告由 `main()` 的 finally（`stop_running_audit`）等出来——在那里等是**可行**的，
+    而在关窗回调里"先取消关闭、收尾完再自己 destroy"是**不可行**的（真机验收推翻）：
+    pywebview 的窗口方法必须由 GUI 主线程调用，工作线程里 `window.destroy()`
+    既不生效也不报错（异常被吞），结果是窗口永远关不掉、进程一直活着。
+
+    同样**不能**在回调里调 `evaluate_js`：`closing` 事件是同步回调
+    （`Event(window, True)` → 在 UI 线程里直接执行），而 `evaluate_js` 会等 UI 线程，
+    于是自锁——窗口关不掉、进程不退出，日志停在"关窗护栏已挂上"。
+    这一条只有打包 exe 的专项验收能发现（单元测试的替身不会死锁）。
+
+    现在的语义（简单且可靠）：
+
+    1. 有运行在跑 → 置停止标志 + 中断正在执行的沙箱命令（几百秒的 sqlmap 会被杀掉）；
+    2. **一律放行关闭**（用户想关就能关，不存在"关不掉"）；
+    3. `main()` 的 finally 里等报告落盘（上限 `HEXHOUND_CLOSE_GRACE`），再退出进程。
     """
     grace = close_grace_seconds() if timeout is None else timeout
-    state_box = {"close_requested": False}
+    state_box = {"close_requested": False, "grace": grace}
 
     def on_closing() -> bool:
         if state_box["close_requested"]:
             return True
+        state_box["close_requested"] = True
         try:
             running = bool(state.snapshot().get("running"))
         except Exception:  # noqa: BLE001
             running = False
-        if not running:
-            return True
-        state_box["close_requested"] = True
-        _notify_saving(window)
-
-        def finish() -> None:
-            stop_running_audit(state, timeout=grace)
+        if running:
             try:
-                window.destroy()
-            except Exception:  # noqa: BLE001 窗口可能已经被用户关掉
+                # 停止标志 + 中断沙箱命令（这是"报告能在宽限期内写完"的关键）
+                state.stop_current()
+            except Exception:  # noqa: BLE001 通知失败也要放行关闭
                 pass
-
-        threading.Thread(target=finish, name="hexhound-close-guard", daemon=True).start()
-        return False  # 取消这次关闭，等收尾完成后再销毁
+        return True
 
     try:
         window.events.closing += on_closing
@@ -164,6 +179,7 @@ def main() -> None:
         os.environ["HEXHOUND_BROWSER_CHANNEL"] = "chromium"
     mutex = _acquire_single_instance()
     if mutex == 0:
+        log_line("已有实例在运行，退出")
         if sys.platform == "win32":
             import ctypes
 
@@ -173,6 +189,7 @@ def main() -> None:
         else:
             print("HexHound 已经在运行，请勿重复启动。")
         return
+    log_line("单实例互斥已获取")
     try:
         try:
             import webview
@@ -180,6 +197,7 @@ def main() -> None:
             raise RuntimeError(
                 "桌面版依赖未安装，请先运行：pip install -e \".[desktop]\""
             ) from exc
+        log_line("webview 已导入")
 
         try:
             from dotenv import load_dotenv
@@ -198,6 +216,7 @@ def main() -> None:
 
         app = create_app()
         port = _free_port()
+        log_line(f"app 已创建，准备在 127.0.0.1:{port} 监听")
         server_thread = threading.Thread(
             target=app.run,
             kwargs={
@@ -211,6 +230,7 @@ def main() -> None:
         )
         server_thread.start()
         _wait_for_server(port)
+        log_line(f"本地服务已就绪：http://127.0.0.1:{port}")
 
         window = webview.create_window(
             "HexHound",
@@ -226,12 +246,17 @@ def main() -> None:
 
         if window is not None:
             install_close_guard(window, gui_module.STATE)
+            log_line("关窗护栏已挂上")
+        else:
+            log_line("警告：拿不到窗口对象，关窗护栏未挂上")
         try:
             webview.start(gui="edgechromium")
+            log_line("webview.start 返回（窗口已关闭）")
         finally:
             # 兜底（事件没挂上 / 用户用其它方式关掉窗口）：这里再等一次，
             # 让审计线程把标注"不完整"的报告写完。
             outcome = stop_running_audit(gui_module.STATE, timeout=close_grace_seconds())
+            log_line(f"收尾等待结果：{outcome}")
             if outcome == "timeout":
                 print(
                     "窗口已关闭；审计仍在收尾，未能等到报告写完"
@@ -239,6 +264,7 @@ def main() -> None:
                     file=sys.stderr,
                 )
     finally:
+        log_line("main() 退出")
         if mutex:
             import ctypes
 

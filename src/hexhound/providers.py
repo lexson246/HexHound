@@ -51,6 +51,21 @@ class ProviderPreset:
 
 PRESETS: tuple[ProviderPreset, ...] = (
     ProviderPreset(
+        key="scripted",
+        label="脚本 LLM（离线演示，不调用真实模型）",
+        base_url="",
+        default_model="scripted-policy",
+        models=(),
+        key_style="",
+        note=(
+            "不联网、不花额度：用确定性的脚本策略驱动真实的编排/工具/报告链路，"
+            "用于验收与演示。**结果不是模型跑出来的**，报告里的模型名会写成 "
+            "scripted/scripted-policy，请勿把它当成真实评估结论。"
+        ),
+        pricing=(0.0, 0.0, 0.0),
+        aliases=("mock", "offline"),
+    ),
+    ProviderPreset(
         key="deepseek",
         label="DeepSeek（默认，性价比高）",
         base_url="https://api.deepseek.com",
@@ -186,8 +201,8 @@ for _preset in PRESETS:
     for _alias in _preset.aliases:
         _BY_KEY[_alias.lower()] = _preset
 
-#: 需要 API key 的预设（本地/自定义不强制）。
-OPTIONAL_KEY_PROVIDERS = {"ollama", "vllm", "custom"}
+#: 需要 API key 的预设（本地/自定义/离线脚本不强制）。
+OPTIONAL_KEY_PROVIDERS = {"ollama", "vllm", "custom", "scripted"}
 
 
 def provider_keys() -> list[str]:

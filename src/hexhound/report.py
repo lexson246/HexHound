@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from .agent import AgentResult
@@ -452,6 +453,63 @@ def _tool_failure_lines(failures: object) -> list[str]:
     return lines
 
 
+def mark_partial(result: Any, *, note: str = "") -> Any:
+    """给"被中断/未跑完"的结果打上不完整标记（**不得让未测区域看起来像安全**）。
+
+    做法很克制、也很重要：
+
+    1. 在总结最前面加一段醒目的中断说明；
+    2. 让报告渲染出"本次运行未完成"；
+    3. **绝不**把未完成的端点/参数写成 `no_issue_found`——那会把"没测"
+       说成"测过没问题"。这里不新增、也不修改任何 coverage/finding。
+
+    与项目最重要的那条不变量一致：没测到 ≠ 已修复 / 已安全。
+
+    放在 `report.py` 而不是界面层：**CLI 的 Ctrl+C 与桌面的停止按钮走同一段逻辑**
+    （早先只有桌面会标"不完整"，命令行中断写出的报告看起来像正常完成）。
+    """
+    previous_summary = str(getattr(result, "final_summary", "") or "")
+    text = note or (
+        "【本次运行被中断，报告不完整】\n"
+        "用户在该审计结束前停止了运行。已经完成的步骤、发现、覆盖记录与用量"
+        "都**如实保存在本报告中**；但**尚未测试的端点与参数没有被测过**，"
+        "它们既不代表安全，也不代表已修复。请把它当作一次未完成的评估，"
+        "需要完整结论时请重新运行。\n"
+    )
+    try:
+        result.final_summary = text + ("\n" + previous_summary if previous_summary else "")
+        result.finish_reason = "cancelled"
+    except Exception:  # noqa: BLE001 标注失败也不能让收尾崩掉
+        pass
+    return result
+
+
+def _throttle_lines(surface: Any) -> list[str]:
+    """目标限流/熔断的披露（有就必须出现，且说明它影响哪些结论）。
+
+    为什么必须写进报告（外部评审指出的误判链）：429/503 原先会被记成"无信号"，
+    于是同一组合被跳过、跨运行 diff 还会把上次报过的问题判成**已修复**。
+    现在限流被单独记账，被限流的端点**不算本次覆盖过**——报告读者要能一眼看到
+    "这次目标在对我们限流，因此覆盖结论偏弱"。
+    """
+    if surface is None:
+        return []
+    try:
+        summary = surface.throttle_summary()
+    except Exception:  # noqa: BLE001 老快照可能没有这个方法
+        return []
+    count = int(summary.get("count") or 0)
+    if not count:
+        return []
+    endpoints = list(summary.get("endpoints") or [])
+    lines = [
+        f"- ⚠️ 目标限流/熔断：**{count} 次**"
+        + (f"（涉及 {len(endpoints)} 个端点，例如 {', '.join(endpoints[:3])}）" if endpoints else "")
+        + "——被限流的端点**不算本次覆盖过**，相关'未复现/已修复'结论不成立"
+    ]
+    return lines
+
+
 def _scope_line(result: AgentResult) -> str:
     """报告头里的范围说明（来自快照/结果里的 allowed_hosts）。"""
     allowed = getattr(result, "allowed_hosts", None)
@@ -546,6 +604,7 @@ def to_markdown(result: AgentResult, goal: str) -> str:
         if sandbox.get("hint"):
             lines.append(f"  - 恢复方式：{sandbox['hint']}")
     lines += _tool_failure_lines(result.tool_failures)
+    lines += _throttle_lines(surface)
     lines.append("")
 
     # 跨运行对比：放在台账之前——"这次比上次好了还是坏了"是读者最先要看的结论之一

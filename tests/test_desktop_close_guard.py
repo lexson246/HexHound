@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -89,33 +90,44 @@ class FakeWindow:
 
 
 class CloseGuardTests(unittest.TestCase):
-    def test_idle_state_is_not_blocked(self) -> None:
+    """关窗语义：**一律放行关闭**，但在放行前立刻请求停止 + 中断沙箱命令。
+
+    真机（打包 exe）验收推翻过一版设计：早先"取消第一次关闭 → 收尾完再由工作线程
+    `window.destroy()`"在真机上**关不掉**——pywebview 的窗口方法必须由 GUI 主线程
+    调用，工作线程里调用既不生效也不报错（异常被吞），于是窗口永远关不掉、进程一直活着。
+    单元测试当时给了假信心，因为替身的 `destroy()` 无条件"成功"。
+
+    现在的契约（`main()` 的 finally 负责等报告）：
+
+    1. 没在跑 → 放行，什么都不做；
+    2. 在跑 → 放行 **且** 已在放行前请求停止（含中断沙箱命令）；
+    3. 状态读不到 / 沙箱炸了 → 仍然放行（用户想关就能关）。
+    """
+
+    def test_idle_state_is_allowed_without_side_effects(self) -> None:
         window, state = FakeWindow(), FakeState(running=False)
         desktop.install_close_guard(window, state, timeout=0.5)
-        self.assertTrue(window.fire_closing(), "没在跑就不该拦着用户关窗口")
+        self.assertTrue(window.fire_closing(), "没在跑就直接放行")
         self.assertEqual(state.stop_calls, 0)
         self.assertEqual(window.destroyed, 0)
 
-    def test_running_audit_is_stopped_and_reported_before_exit(self) -> None:
-        window, state = FakeWindow(), FakeState(running=True, stop_delay=0.4)
+    def test_running_audit_is_allowed_but_stop_is_requested_first(self) -> None:
+        window, state = FakeWindow(), FakeState(running=True, stop_delay=0.2)
         desktop.install_close_guard(window, state, timeout=5.0)
-        self.assertFalse(window.fire_closing(), "运行中必须取消这次关闭，先落盘")
-        self.assertEqual(state.stop_calls, 1)
-        deadline = time.time() + 5
-        while window.destroyed == 0 and time.time() < deadline:
-            time.sleep(0.05)
-        self.assertEqual(window.destroyed, 1, "收尾完成后应当自己销毁窗口，避免关不掉")
-        self.assertTrue(window.js, "页面上要提示正在保存不完整报告")
+        self.assertTrue(window.fire_closing(), "关窗必须被放行（不能出现关不掉）")
+        self.assertEqual(state.stop_calls, 1, "放行前必须先请求停止")
+        # 回调里**不能**碰页面：closing 是 UI 线程上的同步回调，evaluate_js 会自锁
+        self.assertEqual(window.js, [], "关窗回调里不得调用 evaluate_js（真机上会自锁）")
 
-    def test_second_close_is_not_blocked(self) -> None:
+    def test_second_close_is_a_noop(self) -> None:
         window, state = FakeWindow(), FakeState(running=True, stop_delay=0.05)
         desktop.install_close_guard(window, state, timeout=2.0)
         window.fire_closing()
-        self.assertTrue(window.fire_closing(), "第二次关闭不能再拦（否则窗口关不掉）")
-        self.assertEqual(state.stop_calls, 1)
+        self.assertTrue(window.fire_closing())
+        self.assertEqual(state.stop_calls, 1, "重复关窗不该重复请求停止")
 
     def test_timeout_still_exits(self) -> None:
-        """审计卡在长工具调用里时不能把窗口钉死：超时就照常退出。"""
+        """`main()` 的 finally 等待是有上限的：审计卡死也不能把进程钉住。"""
         state = FakeState(running=True, stop_delay=5.0)
         started = time.monotonic()
         outcome = desktop.stop_running_audit(state, timeout=0.3)
@@ -147,7 +159,7 @@ class CloseGuardTests(unittest.TestCase):
 
         window = FakeWindow()
         desktop.install_close_guard(window, Broken(), timeout=0.3)
-        self.assertTrue(window.fire_closing(), "状态读不到时不能把窗口卡住")
+        self.assertTrue(window.fire_closing(), "状态读不到时也不能把窗口卡住")
 
     def test_event_registration_failure_is_swallowed(self) -> None:
         class NoEvents:
@@ -159,6 +171,16 @@ class CloseGuardTests(unittest.TestCase):
                 raise AssertionError("不该被调用")
 
         desktop.install_close_guard(NoEvents(), FakeState(running=True), timeout=0.2)
+
+    def test_startup_logging_is_optional_and_safe(self) -> None:
+        """windowed 构建没有控制台：`HEXHOUND_DESKTOP_LOG` 是唯一的排查线索。"""
+        with patch.dict("os.environ", {"HEXHOUND_DESKTOP_LOG": ""}):
+            desktop.log_line("不该写任何东西")  # 未设置 → 静默
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "desktop.log"
+            with patch.dict("os.environ", {"HEXHOUND_DESKTOP_LOG": str(target)}):
+                desktop.log_line("启动里程碑")
+            self.assertIn("启动里程碑", target.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

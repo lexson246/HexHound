@@ -363,9 +363,13 @@ class GuiProviderPanelTests(EnvIsolation):
             settings = Path(tmp) / "settings.json"
             saved: dict = {}
 
-            def fake_save(data: dict) -> None:
-                saved.update(data)
-                settings.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            def fake_save(data: dict, *, provider_keys: str | None = None) -> None:
+                # 与真实 `_save_settings` 同签名：`provider_keys` 是服务端独占参数
+                payload = dict(data)
+                if provider_keys is not None:
+                    payload["provider_keys"] = provider_keys
+                saved.update(payload)
+                settings.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
             with (
                 patch.object(self.gui, "_load_settings", lambda: dict(saved)),

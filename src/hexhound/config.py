@@ -457,6 +457,7 @@ class Config:
             )
         preset = get_preset(self.provider)
         key_optional = self.provider in OPTIONAL_KEY_PROVIDERS
+        offline = self.provider in ("scripted", "mock", "offline")
         if not key_optional and not self.api_key:
             where = (
                 f"请在 .env 里设置 {env_key_name(self.provider)}"
@@ -467,7 +468,7 @@ class Config:
                 f"缺少 {self.provider} 的 API 密钥：{where}{hint}。"
                 "也可以在 GUI 的「模型提供商」面板里选择预设并填入 key。"
             )
-        if not self.base_url:
+        if not self.base_url and not offline:
             raise ValueError(
                 f"提供商 {self.provider!r} 没有 base_url：自定义提供商必须填 LLM_BASE_URL"
                 "（例如 https://your-gateway/v1）。"
