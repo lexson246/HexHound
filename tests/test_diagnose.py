@@ -11,6 +11,7 @@ SDK 的摘要把底层原因（DNS 失败 / 连接被拒 / 证书被替换 / 代
 from __future__ import annotations
 
 import json
+import os
 import socket
 import sys
 import threading
@@ -475,6 +476,66 @@ class EffectiveProxyTests(unittest.TestCase):
         with patch.object(diagnose, "proxy_health", side_effect=RuntimeError("boom")):
             client2 = LLMClient("sk-fake", "https://api.deepseek.com", "deepseek-flash", provider="deepseek")
         self.assertEqual(client2.network_note, "", "诊断异常时保守：不动 SDK 默认行为")
+
+
+class BrokenNoProxyTests(unittest.TestCase):
+    """坏掉的 `NO_PROXY` 不能把客户端构造搞崩（Round4 实测事故）。
+
+    真实环境：代理工具把 `NO_PROXY=localhost,127.0.0.1,::1,[::1]` 写进环境变量，
+    httpx 解析 `[::1]` 这个条目时抛 `InvalidURL: Invalid port: ':1]'`——
+    **请求还没发出去**，诊断和 LLM 客户端构造就一起失败了，
+    用户看到的是一句与网络状况毫无关系的报错。
+    """
+
+    POISONED = "localhost,127.0.0.1,*.local,::1,[::1]"
+
+    def test_host_matcher_tolerates_unparseable_entries(self) -> None:
+        from hexhound.llm import _host_in_no_proxy
+
+        with patch.dict(os.environ, {"NO_PROXY": self.POISONED, "no_proxy": self.POISONED}):
+            self.assertTrue(_host_in_no_proxy("127.0.0.1"))
+            self.assertTrue(_host_in_no_proxy("::1"))
+            self.assertTrue(_host_in_no_proxy("api.internal.local"))
+            self.assertFalse(_host_in_no_proxy("api.deepseek.com"))
+
+    def test_diagnostic_client_works_with_a_poisoned_no_proxy(self) -> None:
+        from hexhound.diagnose import diagnostic_client
+
+        with patch.dict(os.environ, {"NO_PROXY": self.POISONED, "no_proxy": self.POISONED}):
+            client = diagnostic_client("http://127.0.0.1:5000", timeout=2)
+            try:
+                # 关键点：**构造成功**（坏 NO_PROXY 下 httpx 自己构造会抛 InvalidURL）
+                self.assertEqual(client.timeout.read, 2)
+            finally:
+                client.close()
+
+    def test_loopback_targets_never_use_the_proxy(self) -> None:
+        """诊断本机服务却经过代理毫无意义（而且代理多半连不上回环地址）。"""
+        from hexhound.llm import _proxy_for_target
+
+        with patch.dict(os.environ, {
+            "HTTP_PROXY": "http://127.0.0.1:7892", "ALL_PROXY": "http://127.0.0.1:7892",
+        }):
+            self.assertEqual(_proxy_for_target("http://127.0.0.1:5000"), "")
+            self.assertEqual(_proxy_for_target("http://localhost:5000"), "")
+
+    def test_remote_target_uses_the_configured_proxy(self) -> None:
+        from hexhound.llm import _proxy_for_target
+
+        with patch.dict(os.environ, {
+            "HTTP_PROXY": "http://127.0.0.1:7892", "ALL_PROXY": "http://127.0.0.1:7892",
+            "NO_PROXY": "", "no_proxy": "",
+        }), patch.object(diagnose, "effective_proxy", lambda: {"http": "http://127.0.0.1:7892"}):
+            self.assertEqual(_proxy_for_target("https://api.deepseek.com"), "http://127.0.0.1:7892")
+
+    def test_llm_client_can_be_constructed_under_a_poisoned_no_proxy(self) -> None:
+        """最关键的一条：这种环境下客户端必须**能构造出来**（否则整个应用起不来）。"""
+        from hexhound.llm import LLMClient
+
+        with patch.dict(os.environ, {"NO_PROXY": self.POISONED, "no_proxy": self.POISONED}), \
+             patch.object(diagnose, "proxy_health", lambda proxies=None, timeout=1.5: (False, "代理可连")):
+            client = LLMClient("sk-fake", "https://api.deepseek.com", "deepseek-flash", provider="deepseek")
+        self.assertEqual(client.network_note, "", "代理正常时不该改动行为、也不该多嘴")
 
 
 if __name__ == "__main__":

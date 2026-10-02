@@ -263,11 +263,164 @@ class LoopbackMappingTests(unittest.TestCase):
         self.assertEqual(gateway, "host.docker.internal")
 
 
+class PrepareSandboxTests(unittest.TestCase):
+    """共享的"准备执行环境"逻辑：可用时给出工具集，不可用时给出**具体原因**。
+
+    为什么这些用例值得单独写：CLI 与桌面端曾各写一份准备逻辑，降级条件与文案
+    都不一致；而真工具没接上的后果不是报错，是 sqlmap/nuclei/脚本工具**从工具集
+    里静默消失**——用户在运行记录里只看得到模型报"未知工具"。所以这里逐条锁定
+    "哪一步没成"必须写进 reason/hint，而不是给一句万能话术。
+    """
+
+    class FakeSandbox:
+        """最小可用的沙箱替身（只实现 prepare_sandbox 会碰到的接口）。"""
+
+        def __init__(self, kind: str = "wsl") -> None:
+            self.allowed_hosts: frozenset[str] = frozenset()
+            self.exec_timeout: int | None = None
+            self.runtime_kind = kind
+            self.probe_result: dict[str, Any] = {"ok": True, "runtime": "WSL (Ubuntu-24.04)"}
+            self.tools: dict[str, bool] = {"nmap": True, "sqlmap": True, "ffuf": False}
+            self.local_images: list[str] = ["fixture-image"]
+            self.picked_image = "fixture-image"
+            self.started: list[bool] = []
+
+        def probe(self) -> dict[str, Any]:
+            return dict(self.probe_result, tools=dict(self.tools))
+
+        def tool_status(self) -> dict[str, bool]:
+            return dict(self.tools)
+
+        def images(self) -> list[str]:
+            return list(self.local_images)
+
+        def pick_image(self) -> str:
+            return self.picked_image
+
+        def start(self, *, pull: bool = True) -> str:
+            self.started.append(pull)
+            return "started"
+
+    def prepare(self, fake: PrepareSandboxTests.FakeSandbox, **kwargs: Any):
+        from hexhound.sandbox import prepare_sandbox
+
+        def factory(**ctor_kwargs: Any) -> Any:
+            # 记录调用方真正传下来的约束，替身自身保持可断言
+            fake.allowed_hosts = frozenset(ctor_kwargs.get("allowed_hosts") or ())
+            fake.exec_timeout = ctor_kwargs.get("exec_timeout")
+            return fake
+
+        with patch("hexhound.sandbox.Sandbox", side_effect=factory):
+            return prepare_sandbox(["target.com"], **kwargs)
+
+    def test_ready_environment_reports_tools_and_runtime(self) -> None:
+        fake = self.FakeSandbox()
+        setup = self.prepare(fake, exec_timeout=42, map_loopback=False)
+        self.assertTrue(setup.ok)
+        self.assertIs(setup.sandbox, fake)
+        self.assertEqual(setup.tools, ["nmap", "sqlmap"])  # 只列真正装了且可用的
+        self.assertIn("WSL", setup.message())
+        self.assertIn("sqlmap", setup.message())
+        # allowed_hosts / 超时按调用方意图传下去（超时有下限保护）
+        self.assertEqual(fake.allowed_hosts, frozenset({"target.com"}))
+        self.assertGreaterEqual(fake.exec_timeout, 120)
+
+    def test_unavailable_environment_carries_the_specific_reason(self) -> None:
+        fake = self.FakeSandbox()
+        fake.probe_result = {"ok": False, "reason": "未找到可用的执行环境", "hint": "装 WSL"}
+        setup = self.prepare(fake)
+        self.assertFalse(setup.ok)
+        self.assertIsNone(setup.sandbox)
+        self.assertEqual(setup.reason, "未找到可用的执行环境")
+        self.assertEqual(setup.hint, "装 WSL")
+        message = setup.message()
+        self.assertIn("未找到可用的执行环境", message)
+        self.assertIn("降级", message)
+
+    def test_environment_without_tools_is_not_reported_as_ready(self) -> None:
+        """发行版在、工具不在：不能算就绪（否则模型会去调不存在的工具）。"""
+        fake = self.FakeSandbox()
+        fake.tools = {"nmap": False, "sqlmap": False}
+        setup = self.prepare(fake)
+        self.assertFalse(setup.ok)
+        self.assertIn("没有可用工具", setup.reason)
+        self.assertIn("sandbox install", setup.hint)
+
+    def test_desktop_mode_refuses_to_pull_and_requires_a_local_image(self) -> None:
+        fake = self.FakeSandbox(kind="docker")
+        fake.local_images = []
+        setup = self.prepare(fake, local_image_only=True)
+        self.assertFalse(setup.ok)
+        self.assertIn("镜像", setup.reason)
+        self.assertEqual(fake.started, [])
+
+        ready = self.FakeSandbox(kind="docker")
+        setup = self.prepare(ready, local_image_only=True)
+        self.assertTrue(setup.ok)
+        self.assertEqual(ready.started, [False], "桌面端只能启动本地镜像，不得拉取")
+
+    def test_ready_docker_without_desktop_mode_is_not_started_eagerly(self) -> None:
+        """CLI 路径沿用旧行为：准备阶段不启动容器（真正执行时才起）。"""
+        fake = self.FakeSandbox(kind="docker")
+        setup = self.prepare(fake)
+        self.assertTrue(setup.ok)
+        self.assertEqual(fake.started, [])
+
+    def test_environment_failure_never_raises(self) -> None:
+        from hexhound.sandbox import prepare_sandbox
+
+        with patch("hexhound.sandbox.Sandbox", side_effect=OSError("docker 崩了")):
+            setup = prepare_sandbox(["target.com"])
+        self.assertFalse(setup.ok)
+        self.assertIn("OSError", setup.reason)
+        self.assertIn("docker 崩了", setup.reason)
+
+
 class ReportTests(unittest.TestCase):
     def test_report_without_sandbox(self) -> None:
         report = sandbox_report(None)
         self.assertFalse(report["enabled"])
         self.assertIn("reason", report)
+
+    def test_report_without_sandbox_keeps_the_preparation_reason(self) -> None:
+        """未启用时必须写清"哪一步没成"——否则事后只能从"未知工具"反推。"""
+        report = sandbox_report(
+            None, reason="WSL 发行版里没有可用的渗透工具", hint="hexhound sandbox install",
+            tools=["nmap", "sqlmap"],
+        )
+        self.assertFalse(report["enabled"])
+        self.assertEqual(report["reason"], "WSL 发行版里没有可用的渗透工具")
+        self.assertEqual(report["hint"], "hexhound sandbox install")
+        self.assertEqual(report["tools_expected"], ["nmap", "sqlmap"])
+
+    def test_report_reason_reaches_the_markdown(self) -> None:
+        """报告里必须能读到原因：这是"到底有没有用上真工具"的唯一事后凭据。"""
+        from hexhound.agent import AgentResult
+        from hexhound.report import to_markdown
+
+        result = AgentResult(
+            sandbox=sandbox_report(None, reason="执行环境不可用（fixture）")
+        )
+        text = to_markdown(result, "测试")
+        self.assertIn("真工具沙箱", text)
+        self.assertIn("执行环境不可用（fixture）", text)
+
+    def test_orchestrator_run_summary_keeps_the_preparation_reason(self) -> None:
+        """编排器的运行记录（run.json）里也要有原因，而不只是界面提示。"""
+        from hexhound.orchestrator import Orchestrator
+        from hexhound.sandbox import SandboxSetup
+
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.sandbox = None
+        orchestrator.sandbox_note = SandboxSetup(reason="探测失败（fixture）", hint="提示")
+        described = orchestrator.describe_sandbox()
+        self.assertFalse(described["enabled"])
+        self.assertEqual(described["reason"], "探测失败（fixture）")
+        self.assertEqual(described["hint"], "提示")
+
+        # 调用方没做探测时保持旧文案（不能因为没传就变成空原因）
+        orchestrator.sandbox_note = None
+        self.assertIn("reason", orchestrator.describe_sandbox())
 
     def test_report_for_unavailable_sandbox(self) -> None:
         sandbox = make_sandbox()

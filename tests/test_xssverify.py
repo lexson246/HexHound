@@ -641,6 +641,21 @@ class DialogAttributionTests(unittest.TestCase):
             f"应当说明该弹窗与载荷无关：{verdict.notes}",
         )
 
+    def test_query_injection_replaces_all_original_values_and_preserves_fragment(self) -> None:
+        visited: list[str] = []
+
+        def page(url: str) -> PageObservation:
+            visited.append(url)
+            return PageObservation(url=url, status=200)
+
+        self.verifier_with(page).verify_xss(
+            "http://127.0.0.1/reflect?name=old&keep=&name=second#form",
+            param="name", payload="new payload", baseline=False,
+        )
+        parsed = urlsplit(visited[0])
+        self.assertEqual(parse_qs(parsed.query, keep_blank_values=True), {"name": ["new payload"], "keep": [""]})
+        self.assertEqual(parsed.fragment, "form")
+
     def test_dialog_carrying_the_payload_is_evidence(self) -> None:
         """页面把注入的参数送进了 dialog（`alert(参数)`）→ 可归因，算执行证据。"""
 
@@ -769,10 +784,41 @@ class _LocalPageLab:
 
     @classmethod
     def start(cls) -> tuple[Any, str]:
-        from flask import Flask, request
+        from flask import Flask, redirect, request
         from werkzeug.serving import make_server
 
         app = Flask("hexhound-xss-regression")
+        received: list[dict[str, Any]] = []
+
+        @app.route("/auth-echo", methods=["GET", "POST"])
+        def auth_echo():
+            if request.headers.get("Authorization") != "Bearer local-test" or request.cookies.get("session") != "local-test":
+                return "authentication required", 401
+            fields = request.form if request.method == "POST" else request.args
+            return "<html><body><div>" + fields.get("name", "") + "</div></body></html>"
+
+        @app.route("/storage")
+        def storage():
+            return (
+                "<html><body><script>"
+                "if (localStorage.getItem('local-auth') === 'local-test' && "
+                "sessionStorage.getItem('session-auth') === 'local-test') "
+                "document.body.setAttribute('data-auth-ready', 'yes');"
+                "</script></body></html>"
+            )
+
+        @app.route("/redirect-localhost")
+        def redirect_localhost():
+            return redirect(request.host_url.replace("127.0.0.1", "localhost") + "receiver")
+
+        @app.route("/redirect-other-port")
+        def redirect_other_port():
+            return redirect("http://127.0.0.1:" + request.args["port"] + "/receiver")
+
+        @app.route("/receiver")
+        def receiver():
+            received.append({"authorized": bool(request.headers.get("Authorization")), "cookie": bool(request.cookies.get("session"))})
+            return "receiver"
 
         @app.route("/dialog-textarea")
         def dialog_textarea():
@@ -816,7 +862,8 @@ class _LocalPageLab:
             """只接受 GET：POST 到它会得到 405，用来证明"POST 确实发出去了"。"""
             return "<html><body>GET only</body></html>", 200
 
-        server = make_server("127.0.0.1", 0, app)
+        server = make_server("127.0.0.1", 0, app, threaded=True)
+        server.test_received = received
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         return server, f"http://127.0.0.1:{server.server_port}"
@@ -977,6 +1024,128 @@ class PostFormXssBrowserTests(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             self.verifier().verify_xss(f"{self.base}/form-echo", method="POST")
         self.assertIn("param", str(ctx.exception))
+
+
+class BrowserAuthenticationTests(unittest.TestCase):
+    """登录态回归仅使用本机临时页面和测试凭据。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        ready, reason = playwright_available()
+        if not ready:
+            _skip_or_fail(reason)
+        cls.channel = _pick_channel()
+        cls.server, cls.base = _LocalPageLab.start()
+        cls.other_server, cls.other_base = _LocalPageLab.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.other_server.shutdown()
+
+    def setUp(self) -> None:
+        self.server.test_received.clear()
+        self.other_server.test_received.clear()
+
+    def verifier(self, **kwargs: Any) -> BrowserVerifier:
+        return BrowserVerifier(
+            allowed_hosts=ALLOWED, channel=self.channel, timeout_ms=3000, wait_ms=50,
+            auth_headers={"Authorization": "Bearer local-test", "Cookie": "session=local-test"},
+            **kwargs,
+        )
+
+    def test_authenticated_get_and_post_xss_preserve_account_and_nonce(self) -> None:
+        for method in ("GET", "POST"):
+            with self.subTest(method=method):
+                verdict = self.verifier().verify_xss(
+                    self.base + "/auth-echo?name=old", param="name", method=method,
+                )
+                self.assertEqual(verdict.observation["status"], 200)
+                self.assertTrue(verdict.confirmed, verdict.statement())
+
+    def test_browser_imports_only_target_origin_storage(self) -> None:
+        observation = self.verifier(
+            storage_state={"cookies": [], "origins": [
+                {"origin": self.base, "localStorage": [{"name": "local-auth", "value": "local-test"}]},
+                {"origin": self.other_base, "localStorage": [{"name": "foreign", "value": "excluded"}]},
+            ]},
+            session_storage={"session-auth": "local-test"},
+        ).observe(self.base + "/storage")
+        self.assertIn('data-auth-ready="yes"', observation.rendered_html)
+
+    def test_auth_headers_and_cookies_are_not_sent_to_another_allowed_host(self) -> None:
+        self.verifier().observe(self.base + "/redirect-localhost")
+        self.assertEqual(self.server.test_received, [{"authorized": False, "cookie": False}])
+
+    def test_cookie_auth_does_not_cross_ports_on_the_same_host(self) -> None:
+        self.verifier().observe(
+            self.base + "/redirect-other-port?port=" + str(self.other_server.server_port)
+        )
+        self.assertEqual(self.other_server.test_received, [])
+
+    def test_out_of_scope_redirect_is_blocked_before_request(self) -> None:
+        verifier = self.verifier()
+        verifier.allowed_hosts = frozenset({"127.0.0.1"})
+        try:
+            verifier.observe(self.base + "/redirect-localhost")
+        except ScopeRefused:
+            pass
+        self.assertEqual(self.server.test_received, [])
+
+    def test_dynamic_scan_uses_the_same_authenticated_context(self) -> None:
+        from unittest.mock import patch
+
+        from hexhound.browser import dynamic_scan
+
+        with patch.dict(os.environ, {"HEXHOUND_BROWSER_CHANNEL": self.channel}):
+            result = dynamic_scan(
+                self.base + "/auth-echo?name=authenticated", wait_ms=0,
+                allowed_hosts=ALLOWED,
+                auth_headers={"Authorization": "Bearer local-test", "Cookie": "session=local-test"},
+            )
+        self.assertIn("authenticated", result["html"])
+
+
+class RedirectPolicyTests(unittest.TestCase):
+    """重定向策略（纯函数，不需要浏览器即可验证）。
+
+    为什么单独测：浏览器跟随重定向时**不会再经过路由拦截器**（Round4 实测：
+    route 回调只被调用一次），所以"越界目标收到请求"和"cookie 被交给同一主机的
+    另一个端口"这两件事只能靠**在响应里摘掉 Location** 来阻止。
+    """
+
+    def allowed(self, request_url: str, location: str, hosts=None, target_host="127.0.0.1"):
+        from hexhound.browser import _redirect_target_allowed
+
+        return _redirect_target_allowed(
+            request_url, location,
+            allowed_hosts=frozenset(hosts or {"127.0.0.1", "localhost"}), target_host=target_host,
+        )
+
+    def test_out_of_scope_redirect_is_refused(self) -> None:
+        ok, reason = self.allowed("http://127.0.0.1:1/a", "https://evil.example.com/b")
+        self.assertFalse(ok)
+        self.assertIn("授权范围外", reason)
+
+    def test_same_host_other_port_is_refused(self) -> None:
+        """cookie 按主机发送：跟随它等于把登录态交给该主机的另一个端口。"""
+        ok, reason = self.allowed("http://127.0.0.1:1/a", "http://127.0.0.1:2/b")
+        self.assertFalse(ok)
+        self.assertIn("另一个源", reason)
+
+    def test_non_http_scheme_is_refused(self) -> None:
+        for location in ("file:///etc/passwd", "javascript:alert(1)", "data:text/html,x"):
+            with self.subTest(location=location):
+                ok, _ = self.allowed("http://127.0.0.1:1/a", location)
+                self.assertFalse(ok)
+
+    def test_other_allowed_host_and_same_origin_are_followed(self) -> None:
+        ok, reason = self.allowed("http://127.0.0.1:1/a", "http://localhost:1/b")
+        self.assertTrue(ok, reason)
+        ok, reason = self.allowed("http://127.0.0.1:1/a", "/b")
+        self.assertTrue(ok, reason)
+        ok, reason = self.allowed("http://127.0.0.1:1/a", "")
+        self.assertTrue(ok, reason)
 
 
 if __name__ == "__main__":

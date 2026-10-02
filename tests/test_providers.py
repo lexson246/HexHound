@@ -34,7 +34,7 @@ from hexhound.providers import (  # noqa: E402
 )
 
 ENV_KEYS = (
-    "LLM_PROVIDER", "LLM_MODEL", "LLM_BASE_URL", "LLM_API_KEY", "ALLOWED_HOSTS",
+    "LLM_PROVIDER", "LLM_MODEL", "LLM_BASE_URL", "LLM_API_KEY", "ALLOWED_HOSTS", "LLM_REASONING_EFFORT",
     "PROVIDER_DEEPSEEK_API_KEY", "PROVIDER_OPENAI_API_KEY",
 ) + tuple(f"LLM_{suffix}_MODEL" for suffix in ROLE_ENV_SUFFIX.values()) + tuple(
     f"LLM_{suffix}_PROVIDER" for suffix in ROLE_ENV_SUFFIX.values()
@@ -134,7 +134,7 @@ class ConfigProviderTests(EnvIsolation):
         config = Config.from_env()
         self.assertEqual(config.provider, "deepseek")
         self.assertEqual(config.base_url, "https://api.deepseek.com")
-        self.assertEqual(config.model, "deepseek-v4-flash")
+        self.assertEqual(config.model, "deepseek-flash")
 
     def test_explicit_env_overrides_preset(self) -> None:
         os.environ.update(

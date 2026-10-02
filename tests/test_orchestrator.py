@@ -9,6 +9,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
@@ -46,8 +47,17 @@ class PlanParsingTests(unittest.TestCase):
         self.assertEqual([task.role for task in tasks], ["recon", "injection"])
         self.assertEqual(tasks[0].id, "T1")
         self.assertEqual(tasks[1].id, "T2")
-        # 步数被夹在 4..20
-        self.assertEqual(tasks[1].steps, 20)
+        # 没有显式配置时遵守默认的 10 步上限。
+        self.assertEqual(tasks[1].steps, 10)
+
+    def test_plan_respects_configured_steps_and_uses_them_by_default(self) -> None:
+        text = '{"tasks":[{"role":"recon","objective":"x"},{"role":"injection","objective":"y","steps":99}]}'
+        surface = AttackSurface(target=TARGET)
+        for limit in (4, 7, 30):
+            tasks = _parse_plan(text, TARGET, surface, 6, task_steps=limit)
+            self.assertEqual([task.steps for task in tasks], [limit, limit])
+            fallback = _parse_plan("bad json", TARGET, surface, 6, task_steps=limit)
+            self.assertTrue(all(task.steps == limit for task in fallback))
 
     def test_invalid_role_and_empty_objective_dropped(self) -> None:
         text = (
@@ -107,6 +117,51 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual([task.role for task in tasks], ["recon", "auth"])
         events = [event for event in orchestrator.events if event["kind"] == "plan"]
         self.assertEqual(len(events), 1)
+
+    def test_generated_worker_respects_task_step_limit(self) -> None:
+        from hexhound.agent import AgentResult
+
+        orchestrator = self.make(task_steps=5)
+        worker = Mock()
+        worker.run.return_value = AgentResult(finish_reason="finish")
+        worker.task_usage.llm_calls = 0
+        worker.task_usage.tool_calls = 0
+        worker.task_usage.total_tokens = 0
+        worker.task_usage.estimated_cost = 0.0
+        for role in ("recon", "injection", "verify"):
+            task = WorkerTask(id=role, role=role, objective="generated", steps=18)
+            with patch("hexhound.orchestrator.TaskWorker", return_value=worker) as factory:
+                orchestrator.run_wave([task])
+            self.assertEqual(factory.call_args.kwargs["task"].steps, 5)
+            self.assertEqual(task.steps, 5)
+
+    def test_planner_records_effective_request_configuration(self) -> None:
+        orchestrator = self.make()
+        orchestrator.llm.request_config = lambda: {"reasoning_effort": "max", "model": "fixture"}
+        orchestrator.trace = Mock()
+        orchestrator.plan()
+        self.assertIn(
+            (("llm_config",), {"role": "planner", "reasoning_effort": "max", "model": "fixture"}),
+            orchestrator.trace.record.call_args_list,
+        )
+
+    def test_planner_discards_empty_or_incomplete_responses_but_keeps_usage(self) -> None:
+        from hexhound.llm import LLMUsage
+
+        plan = '{"tasks":[{"role":"auth","objective":"unsafe partial plan"}]}'
+        for content, finish in (("", "stop"), (plan, "length"), (plan, "content_filter")):
+            with self.subTest(finish=finish):
+                orchestrator = self.make()
+                orchestrator.llm = Mock()
+                orchestrator.llm.request_config.return_value = {}
+                orchestrator.llm.complete.return_value = (
+                    content, LLMUsage(3, 6, 9, finish_reason=finish),
+                )
+                tasks = orchestrator.plan()
+                self.assertEqual(tasks[0].role, "recon")
+                self.assertFalse(any(task.objective == "unsafe partial plan" for task in tasks))
+                self.assertEqual(orchestrator.budget.usage.total_tokens, 9)
+                self.assertTrue(any(event["kind"] == "plan_error" for event in orchestrator.events))
 
     def test_plan_falls_back_when_llm_raises(self) -> None:
         class BrokenLLM:
@@ -264,6 +319,20 @@ class ParamCoverageTests(unittest.TestCase):
         self.assertTrue(all(task.role == "injection" for task in tasks))
         self.assertIn("参数[name]", tasks[0].objective)
         self.assertIn("record_coverage", tasks[0].objective)
+
+    def test_endpoint_sweep_role_has_required_tools_without_expanding_recon(self) -> None:
+        from hexhound.tools import ROLE_TOOLS
+
+        orchestrator = self.make()
+        orchestrator.surface.add_endpoint(TARGET + "/search?q=fixture", source="crawl")
+        task = orchestrator.coverage_sweep_tasks()[0]
+        self.assertEqual(task.role, "injection")
+        required = {"http_request", "fuzz_params", "sqlmap_scan", "record_finding", "record_coverage"}
+        self.assertTrue(required.issubset(ROLE_TOOLS[task.role]))
+        self.assertNotIn("record_finding", ROLE_TOOLS["recon"])
+        self.assertIn("401/403/429", task.objective)
+        self.assertIn("记 blocked", task.objective)
+        self.assertIn("记 not_tested", task.objective)
 
     def test_no_unattacked_params_no_sweep(self) -> None:
         orchestrator = self.make()

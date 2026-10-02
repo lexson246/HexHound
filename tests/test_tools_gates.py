@@ -8,6 +8,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
@@ -493,6 +494,243 @@ class SharedSessionCaptureTests(unittest.TestCase):
         message = _use_account(registry, {"account": "C"})
         self.assertEqual(registry.active_account, "C")
         self.assertIn("Cookie", message)
+
+
+class RealToolVerdictTests(unittest.TestCase):
+    """真工具结论解析：**"没测出注入"绝不能被读成"测出注入"**。
+
+    外部代码评审点名的 P5：`sqlmap_scan` 的结论判定曾经是子串匹配，
+    sqlmap 的否定句（"all tested parameters do not appear to be injectable"、
+    "does not seem to be injectable"）里同样含有 "injectable" 字样，
+    于是"没注入"被判成"注入成立"，直接把误报写进报告。
+
+    这里用替身沙箱喂真实 sqlmap 输出，验证正/负两类输出分别落到哪个结论。
+    """
+
+    class FakeSandbox:
+        def __init__(self, output: str) -> None:
+            self.output = output
+            self.calls: list[str] = []
+
+        def available(self) -> bool:
+            return True
+
+        def probe(self) -> dict:
+            return {"ok": True, "runtime": "fixture"}
+
+        def tool_status(self) -> dict:
+            return {"sqlmap": True, "nmap": True, "nuclei": True, "python3": True}
+
+        def sqlmap(self, url, **kwargs):
+            from hexhound.sandbox import ExecResult
+
+            self.calls.append(url)
+            return ExecResult(
+                ok=True, command=f"sqlmap -u {url}", exit_code=0,
+                stdout=self.output, stderr="", duration=1.0,
+            )
+
+    NEGATIVE_OUTPUTS = (
+        "[INFO] testing connection to the target URL\n"
+        "[WARNING] the web server responded with an HTTP error code (500)\n"
+        "[CRITICAL] all tested parameters do not appear to be injectable. "
+        "Try to increase --level/--risk values\n"
+        "[WARNING] HTTP error codes detected during run: 500 (1)\n",
+        "[INFO] testing if GET parameter 'id' is dynamic\n"
+        "[WARNING] GET parameter 'id' does not seem to be injectable\n"
+        "[CRITICAL] all tested parameters do not appear to be injectable.\n",
+    )
+
+    POSITIVE_OUTPUTS = (
+        "[INFO] GET parameter 'id' is 'MySQL >= 5.0 AND error-based' injectable\n"
+        "sqlmap identified the following injection point(s) with a total of 46 HTTP(s) requests:\n"
+        "---\nParameter: id (GET)\n    Type: boolean-based blind\n    Payload: id=1 AND 1=1\n---\n",
+        "sqlmap identified the following injection point(s) with a total of 12 HTTP(s) requests:\n"
+        "Parameter: q (GET)\n    Type: time-based blind\n    Title: MySQL >= 5.0.12 AND time-based blind\n",
+    )
+
+    def run_scan(self, output: str) -> str:
+        sandbox = self.FakeSandbox(output)
+        registry = ToolRegistry(
+            base_dir=Path("."),
+            allowed_hosts=frozenset({"127.0.0.1", "localhost"}),
+            timeout=5,
+            mode="blackbox",
+            surface=AttackSurface(target="http://127.0.0.1:5000", mode="blackbox"),
+            role="injection",
+            worker_id="W-sqlmap",
+            # 沙箱必须在**构造时**就位：注册表会在构造期按环境能力裁剪工具集
+            sandbox=sandbox,
+        )
+        return registry.execute(
+            "sqlmap_scan", {"url": "http://127.0.0.1:5000/item?id=1", "timeout": 30}
+        )
+
+    def test_sqlmap_tool_is_actually_available_in_this_fixture(self) -> None:
+        """前置校验：夹具本身必须真的下发了 sqlmap_scan，否则下面的断言毫无意义。"""
+        text = self.run_scan("\n".join(self.POSITIVE_OUTPUTS))
+        self.assertNotIn("未知工具", text)
+
+    def test_negative_output_is_not_reported_as_injectable(self) -> None:
+        for output in self.NEGATIVE_OUTPUTS:
+            with self.subTest(output=output.splitlines()[-2][:40]):
+                text = self.run_scan(output)
+                self.assertIn("未确认注入", text)
+                self.assertNotIn("注入成立", text)
+
+    def test_positive_output_is_reported_as_injectable(self) -> None:
+        for output in self.POSITIVE_OUTPUTS:
+            with self.subTest(output=output.splitlines()[0][:40]):
+                text = self.run_scan(output)
+                self.assertIn("注入成立", text)
+
+
+class CandidateReviewFlowTests(unittest.TestCase):
+    """候选 → 复核 → 提升 的闭环（用户点名的验收项之一）。
+
+    子代理在没有证据时只登记**候选**；复核角色必须能看见它，
+    并且只有带证据引用 + 复现说明才能提升为正式结论。
+    """
+
+    def setUp(self) -> None:
+        self.surface = AttackSurface(
+            target="http://127.0.0.1:5000", mode="blackbox",
+            path=Path(".") / "surface.json",
+        )
+
+    def registry(self, role: str) -> ToolRegistry:
+        return ToolRegistry(
+            base_dir=Path("."),
+            allowed_hosts=frozenset({"127.0.0.1"}),
+            timeout=5,
+            mode="blackbox",
+            surface=self.surface,
+            role=role,
+            worker_id=f"W-{role}",
+        )
+
+    @staticmethod
+    def finding(**overrides) -> dict:
+        base = {
+            "title": "/item 的 id 参数存在布尔盲注", "severity": "high",
+            "vuln_type": "sqli", "url": "http://127.0.0.1:5000/item", "param": "id",
+            "evidence": "布尔差异稳定", "description": "疑似注入",
+            "confidence": "medium", "remediation": "参数化查询",
+        }
+        base.update(overrides)
+        return base
+
+    def test_candidate_is_visible_to_the_review_role_and_can_be_promoted(self) -> None:
+        injection = self.registry("injection")
+        registered = injection.execute("record_finding", self.finding())
+        self.assertIn("候选", registered, registered)
+        self.assertEqual(len(self.surface.pending_candidates()), 1)
+        self.assertEqual(len(self.surface.findings), 0, "没有证据时不得直接入库")
+
+        verify = self.registry("verify")
+        listed = verify.execute("review_candidates", {})
+        self.assertIn("布尔盲注", listed)
+        self.assertIn("id", listed)
+
+        promoted = verify.execute("record_finding", self.finding(
+            verified=True, evidence_ref=[], verification="重放两次对比",
+        ))
+        # 没有真实证据编号 → 仍不得提升（复核门优先于模型的自述）
+        self.assertEqual(len(self.surface.findings), 0, promoted)
+
+    def test_verified_with_real_evidence_is_promoted(self) -> None:
+        verify = self.registry("verify")
+        # 证据编号必须是**真实存在过的**：这里手工登记一条 HTTP 交换，
+        # 模拟"复核角色先重放了证据请求，再引用它提升候选"。
+        exchange_id = verify.new_evidence_id("R")
+        verify.http_log.append({"id": exchange_id, "url": "http://127.0.0.1:5000/item?id=1"})
+        promoted = verify.execute("record_finding", self.finding(
+            verified=True, evidence_ref=[exchange_id], verification="重放对比",
+        ))
+        self.assertEqual(len(self.surface.findings), 1, promoted)
+        finding = self.surface.findings[0]
+        self.assertEqual(getattr(finding, "severity", ""), "high")
+        self.assertNotEqual(getattr(finding, "status", ""), "candidate")
+
+
+class ToolFailureStatsTests(unittest.TestCase):
+    """工具失败统计：报告要能回答"这一轮为什么没测出东西"。
+
+    四类必须分开（外部评审 P7 的要求）：`unknown` = 环境缺工具（提示词/模型想调但没下发），
+    `crashed` = 我们自己的 bug，`returned` = 工具正常返回错误（多为 scope 拒绝），
+    `budget` = 预算用尽。混成一个"失败 N 次"，读者无法据此行动。
+    """
+
+    def registry(self, role: str = "injection") -> ToolRegistry:
+        return ToolRegistry(
+            base_dir=Path("."),
+            allowed_hosts=frozenset({"127.0.0.1"}),
+            timeout=5,
+            mode="blackbox",
+            surface=AttackSurface(target="http://127.0.0.1:5000", mode="blackbox"),
+            role=role,
+            worker_id="W-stats",
+        )
+
+    def test_unknown_tool_is_counted_by_name(self) -> None:
+        registry = self.registry()
+        registry.execute("sandbox_script", {})
+        registry.execute("port_scan", {})
+        registry.execute("port_scan", {})
+        stats = registry.tool_failure_stats()
+        self.assertEqual(stats["unknown"], {"sandbox_script": 1, "port_scan": 2})
+        self.assertEqual(stats["total"], 3)
+        self.assertGreater(stats["tools_available"], 0)
+
+    def test_crash_and_returned_error_are_separate_buckets(self) -> None:
+        registry = self.registry()
+        # 工具内部抛异常 → crashed
+        from hexhound.tools import Tool
+
+        broken = Tool(
+            name="http_request",
+            description="test",
+            func=lambda args: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        with patch.dict(registry._tools, {"http_request": broken}):
+            registry.execute("http_request", {"url": "http://127.0.0.1:5000/"})
+        # 参数校验失败 → returned（工具正常返回了一句错误）
+        registry.execute("record_finding", {})
+        stats = registry.tool_failure_stats()
+        self.assertEqual(stats["crashed"], {"http_request": 1})
+        self.assertEqual(stats["returned"], {"record_finding": 1})
+        self.assertFalse(stats.get("unknown"))
+
+    def test_budget_refusal_is_counted(self) -> None:
+        from hexhound.budget import BudgetLimits
+
+        registry = self.registry()
+        registry.budget = Budget(BudgetLimits(max_tool_calls=1))
+        registry.execute("http_request", {"url": "http://127.0.0.1:5000/"})
+        registry.execute("http_request", {"url": "http://127.0.0.1:5000/"})
+        self.assertEqual(registry.tool_failure_stats()["budget"], {"http_request": 1})
+
+    def test_clean_run_reports_zero(self) -> None:
+        registry = self.registry()
+        stats = registry.tool_failure_stats()
+        self.assertEqual(stats["total"], 0)
+        self.assertFalse(stats.get("unknown"))
+
+    def test_run_summary_carries_the_stats(self) -> None:
+        """统计必须落到 run.json / 报告里，而不是只活在内存里。"""
+        from hexhound.report import _tool_failure_lines
+
+        lines = _tool_failure_lines({
+            "unknown": {"sandbox_script": 2}, "returned": {"sqlmap_scan": 1},
+            "total": 3, "tools_available": 10,
+        })
+        text = "\n".join(lines)
+        self.assertIn("3 次", text)
+        self.assertIn("sandbox_script×2", text)
+        self.assertIn("sqlmap_scan×1", text)
+        self.assertIn("环境缺少对应能力", text)
+        self.assertEqual(_tool_failure_lines({}), [])
+        self.assertEqual(_tool_failure_lines({"total": 0}), [])
 
 
 if __name__ == "__main__":

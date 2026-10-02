@@ -6,10 +6,15 @@
 """
 from __future__ import annotations
 
+import json
+import os
 import sys
+import tempfile
 import types
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
@@ -168,6 +173,188 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(state.snapshot()["phases"], [])
         state.add_event({"kind": "wave", "wave": 1, "count": 1}, new)
         self.assertNotEqual(state.snapshot()["phases"], [])
+
+
+class DesktopExecutionTests(unittest.TestCase):
+    """驱动真实桌面入口，所有执行环境、模型请求和文件写入均用替身。"""
+
+    def run_audit(self, setup, *, swarm: bool):
+        from hexhound import cli
+        from hexhound.memory import RunArtifacts
+
+        settings = {
+            **gui.DEFAULTS,
+            "provider": "custom", "model": "fixture", "base_url": "https://fixture.invalid/v1",
+            "target": "http://fixture.invalid", "allowed_hosts": "fixture.invalid",
+            "swarm": "1" if swarm else "0", "max_steps": "27", "task_steps": "7",
+        }
+        state = gui.RunState()
+        token = state.start()
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+            stack.enter_context(patch.object(gui, "STATE", state))
+            # 环境准备走**共享**的 prepare_sandbox（CLI 与桌面同一条路径）：
+            # 这里替换它，正是为了验证"探测结果有没有真的下发到执行侧"。
+            prepare = stack.enter_context(
+                patch.object(gui, "prepare_sandbox", return_value=setup)
+            )
+            stack.enter_context(patch.object(cli, "_build_llm_pool", return_value=(Mock(), {})))
+            stack.enter_context(patch.object(gui, "_provider_keys", return_value={}))
+            stack.enter_context(patch.object(gui, "RunArtifacts", side_effect=lambda target: RunArtifacts(target, home=Path(tmp), enabled=False)))
+            stack.enter_context(patch.object(gui, "HostMemory", return_value=None))
+            stack.enter_context(patch.object(gui, "write_report", return_value=Path(tmp) / "report.md"))
+            stack.enter_context(patch.object(gui, "write_butian_package", return_value=None))
+            stack.enter_context(patch.object(gui, "_archive_report"))
+            orchestrator = stack.enter_context(patch.object(gui, "Orchestrator"))
+            orchestrator.return_value.run.return_value = _FakeResult()
+            # 注册表用"真实构造 + 记录"的替身：既要能看传参，也要能拿到真对象
+            # 去查它到底下发了哪些工具（P1 的判据就是工具集，不是传参）。
+            created: list = []
+            real_registry = gui.ToolRegistry
+
+            def spy_registry(*args, **kwargs):
+                obj = real_registry(*args, **kwargs)
+                created.append(obj)
+                return obj
+
+            registry = stack.enter_context(
+                patch.object(gui, "ToolRegistry", side_effect=spy_registry)
+            )
+            registry.created = created
+            agent = stack.enter_context(patch.object(gui, "ReActAgent"))
+            agent.return_value.run.return_value = _FakeResult()
+            gui._run_audit(settings, token)
+            snapshot = state.snapshot()
+            self.assertEqual(snapshot["status"], "done", snapshot["error"])
+            factory = orchestrator if swarm else registry
+            return factory.call_args.kwargs, agent.call_args, snapshot, prepare.call_args, registry
+
+    @staticmethod
+    def ready_sandbox(kind: str = "wsl") -> Mock:
+        sandbox = Mock()
+        sandbox.runtime_kind = kind
+        sandbox.probe.return_value = {"ok": True, "runtime": "fixture-tools"}
+        sandbox.tool_status.return_value = {"sqlmap": True, "python3": True, "nuclei": True}
+        sandbox.available.return_value = True
+        sandbox.pick_image.return_value = "fixture-image"
+        sandbox.images.return_value = ["fixture-image"]
+        # `sandbox_report()` 会遍历它写进运行记录，替身必须提供真实类型，
+        # 否则替身自身的不真实会伪装成产品代码的失败。
+        sandbox.allowed_hosts = frozenset({"fixture.invalid"})
+        sandbox.exec_log.return_value = []
+        sandbox._host_map_notes = []
+        sandbox._container = ""
+        sandbox.host_gateway.return_value = ""
+        return sandbox
+
+    @staticmethod
+    def ready_setup(kind: str = "wsl"):
+        from hexhound.sandbox import SandboxSetup
+
+        sandbox = DesktopExecutionTests.ready_sandbox(kind)
+        return SandboxSetup(
+            sandbox=sandbox, runtime="fixture-tools", tools=["nuclei", "python3", "sqlmap"]
+        )
+
+    def test_desktop_passes_available_sandbox_to_both_execution_paths(self) -> None:
+        for swarm in (True, False):
+            with self.subTest(swarm=swarm):
+                setup = self.ready_setup()
+                sandbox = setup.sandbox
+                kwargs, agent_call, snapshot, prepare_call, _ = self.run_audit(setup, swarm=swarm)
+                self.assertIs(kwargs["sandbox"], sandbox)
+                self.assertEqual(kwargs["allowed_hosts"], frozenset({"fixture.invalid"}))
+                if swarm:
+                    self.assertEqual(kwargs["task_steps"], 7)
+                    self.assertIn("各波次累计", "\n".join(snapshot["phases"]))
+                else:
+                    self.assertEqual(agent_call.kwargs["max_steps"], 27)
+                sandbox.start.assert_not_called()
+                sandbox.stop.assert_called_once_with()
+                # 桌面端与 CLI 必须是同一份准备逻辑（只使用本地镜像，不自动下载）
+                self.assertTrue(prepare_call.kwargs["local_image_only"])
+                self.assertIn("sqlmap", "\n".join(snapshot["phases"]))
+
+    def test_desktop_hands_real_tools_to_the_injection_role(self) -> None:
+        """P1 回归：桌面跑出来的执行侧必须**真的有** sqlmap/nuclei/脚本工具。
+
+        这条是用户报的原始故障（"桌面跑起来模型一直报未知工具"）的判据：
+        只要探测成功却没把 sandbox 传进 ToolRegistry，注入角色就会静默退化成
+        纯 HTTP 探测——所以这里不看"传参了没有"，而是直接问注册表要工具。
+        """
+        setup = self.ready_setup()
+        _, _, _, _, registry = self.run_audit(setup, swarm=False)
+        self.assertIs(registry.call_args.kwargs["sandbox"], setup.sandbox)
+        # 桌面路径真正构造出来的那个注册表
+        built = registry.created[-1]
+        for tool in ("sqlmap_scan", "template_scan", "sandbox_script"):
+            self.assertTrue(built.has(tool), f"桌面路径下 {tool} 必须可用")
+
+        # 注入角色（波次/补扫任务用的就是这个角色）同样必须拿到真工具
+        from hexhound.tools import ToolRegistry
+
+        injection = ToolRegistry(
+            base_dir=Path.cwd(), allowed_hosts=frozenset({"fixture.invalid"}), timeout=5,
+            mode="blackbox", role="injection", sandbox=setup.sandbox,
+        )
+        names = set(injection.tool_names())
+        for tool in ("sqlmap_scan", "template_scan", "sandbox_script"):
+            self.assertIn(tool, names, f"注入角色缺少 {tool}——正是「未知工具」故障的来源")
+
+    def test_unavailable_sandbox_is_reported_and_builtin_audit_still_runs(self) -> None:
+        from hexhound.sandbox import SandboxSetup
+
+        setup = SandboxSetup(reason="fixture unavailable", hint="先准备工具环境")
+        kwargs, _, snapshot, _, _ = self.run_audit(setup, swarm=True)
+        self.assertIsNone(kwargs["sandbox"])
+        phases = "\n".join(snapshot["phases"])
+        self.assertIn("fixture unavailable", phases)
+        self.assertIn("先准备工具环境", phases)
+        # 原因必须随运行一起落到执行侧：否则事后只能看到一堆"未知工具 xxx"
+        self.assertIs(kwargs["sandbox_note"], setup)
+
+    def test_docker_sandbox_reaches_execution_without_pulling(self) -> None:
+        """桌面端只使用本地镜像：准备阶段已保证不拉取，运行期不得再 start。"""
+        setup = self.ready_setup("docker")
+        kwargs, _, _, _, _ = self.run_audit(setup, swarm=True)
+        self.assertIs(kwargs["sandbox"], setup.sandbox)
+        setup.sandbox.start.assert_not_called()
+        setup.sandbox.stop.assert_called_once_with()
+
+    def test_reasoning_setting_preserves_explicit_default_and_validates_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Path(tmp) / "settings.json"
+            with patch.object(gui, "SETTINGS_PATH", settings), patch.dict(os.environ, {"LLM_REASONING_EFFORT": "max"}):
+                self.assertEqual(gui._load_settings()["reasoning_effort"], "max")
+                settings.write_text(json.dumps({"reasoning_effort": ""}), encoding="utf-8")
+                self.assertEqual(gui._load_settings()["reasoning_effort"], "")
+                gui._save_settings({"reasoning_effort": "high"})
+                self.assertEqual(gui._load_settings()["reasoning_effort"], "high")
+        with self.assertRaisesRegex(ValueError, "推理强度"):
+            gui._validate_run_settings({**gui.DEFAULTS, "reasoning_effort": "unsupported"})
+
+    def test_reasoning_setting_is_forwarded_in_connection_and_env_endpoints(self) -> None:
+        if getattr(sys.modules["flask"], STUB_MARKER, False):
+            self.skipTest("requires real Flask")
+        app = gui.create_app()
+        client = app.test_client()
+        headers = {gui.TOKEN_HEADER: app.config["HEXHOUND_LOCAL_TOKEN"]}
+        payload = {"provider": "custom", "model": "fixture", "base_url": "https://fixture.invalid/v1", "reasoning_effort": "max"}
+        with patch.object(gui, "_load_settings", return_value={}), patch.object(gui, "_provider_keys", return_value={}):
+            with patch.object(gui, "LLMClient") as model:
+                model.return_value.test_connection.return_value.to_dict.return_value = {"ok": True}
+                response = client.post("/api/provider_test", json=payload, headers=headers)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(model.call_args.kwargs["reasoning_effort"], "max")
+            with patch.object(gui, "write_env_file", return_value=(Path("fixture.env"), [])) as write_env:
+                response = client.post("/api/write_env", json=payload, headers=headers)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(write_env.call_args.args[0]["LLM_REASONING_EFFORT"], "max")
+                response = client.post("/api/write_env", json={**payload, "reasoning_effort": "unsupported"}, headers=headers)
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(write_env.call_count, 1)
+            with patch.object(gui, "LLMClient", side_effect=ValueError("invalid effort")):
+                response = client.post("/api/provider_test", json=payload, headers=headers)
+                self.assertEqual(response.status_code, 400)
 
 
 if __name__ == "__main__":
