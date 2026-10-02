@@ -78,6 +78,39 @@ def test_list_is_empty_without_any_runs(tmp_path: Path) -> None:
     assert history.list_runs(home=tmp_path) == []
 
 
+def test_interrupted_run_is_not_reported_as_done(tmp_path: Path) -> None:
+    """被中断的运行必须显示"未完成"——哪怕 snapshot.json 已经写出来了。
+
+    第四轮实测：用户在界面上按停止（或直接关窗口）时，编排器只是跳出波次循环、
+    然后照常收尾，所以 `snapshot.json` 照样会生成；只看"有没有快照"会把一次
+    被中断的运行说成"已完成"，而报告正文明明写着"不完整"。
+    """
+    run_dir = _make_run(tmp_path, "stopped-by-user")
+    (run_dir / "report.md").write_text(
+        "## 总结\n\n【本次运行被中断，报告不完整】\n", encoding="utf-8"
+    )
+    runs = history.list_runs(home=tmp_path)
+    assert runs[0]["status"] == history.STATUS_PARTIAL
+    assert history.STATUS_LABEL[runs[0]["status"]] != history.STATUS_LABEL[history.STATUS_DONE]
+
+
+def test_recorded_finish_reason_decides_without_report_marker(tmp_path: Path) -> None:
+    """报告正文没有标记时也要能判：看记录下来的收尾原因。"""
+    run_dir = _make_run(tmp_path, "cancelled-reason", report=None)
+    (run_dir / "snapshot.json").write_text(
+        json.dumps({"schema_version": 2, "result": {"finish_reason": "cancelled"}}),
+        encoding="utf-8",
+    )
+    done_dir = _make_run(tmp_path, "normal-finish", report=None)
+    (done_dir / "snapshot.json").write_text(
+        json.dumps({"schema_version": 2, "result": {"finish_reason": "finish"}}),
+        encoding="utf-8",
+    )
+    statuses = {entry["id"]: entry["status"] for entry in history.list_runs(home=tmp_path)}
+    assert statuses["cancelled-reason"] == history.STATUS_PARTIAL
+    assert statuses["normal-finish"] == history.STATUS_DONE
+
+
 def test_list_can_filter_by_target(tmp_path: Path) -> None:
     _make_run(tmp_path, "a", target="http://127.0.0.1:5000")
     _make_run(tmp_path, "b", target="http://localhost:8080")

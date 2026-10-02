@@ -94,6 +94,54 @@ class PlanParsingTests(unittest.TestCase):
         self.assertTrue(_looks_like_auth(surface))
 
 
+class UserStopSemanticsTests(unittest.TestCase):
+    """用户停止运行时的记录必须**说实话**（第四轮实测踩到的边界）。
+
+    现象：界面按停止 / 直接关窗口时，编排器只是跳出波次循环、然后照常收尾——
+    于是运行记录写 `finish_reason="finish"`，而 `snapshot.json` 照样生成，
+    历史里这次运行被判成"已完成"。报告正文虽然有"不完整"标记，记录却说跑完了。
+
+    这里钉住：用户主动停止 → `finish_reason="cancelled"`，总结里写明"报告不完整"。
+    """
+
+    def make(self, **overrides) -> Orchestrator:
+        settings = {
+            "target": TARGET,
+            "goal": "测试编排",
+            "mode": "blackbox",
+            "base_dir": Path("."),
+            "allowed_hosts": ALLOWED,
+            "timeout": 1,
+            "max_tasks": 2,
+            "task_steps": 4,
+            "parallel": 1,
+            "budget": Budget(BudgetLimits(max_tool_calls=50)),
+        }
+        settings.update(overrides)
+        return Orchestrator(ScriptedLLM(), **settings)
+
+    def test_user_stop_is_recorded_as_cancelled(self) -> None:
+        orchestrator = self.make(callbacks=SwarmCallbacks(should_stop=lambda: True))
+        result = orchestrator.run()
+        self.assertEqual(result.finish_reason, "cancelled")
+        self.assertIn("报告不完整", result.final_summary)
+        self.assertIn("没有被测过", result.final_summary)
+
+    def test_normal_run_is_not_marked_cancelled(self) -> None:
+        orchestrator = self.make(callbacks=SwarmCallbacks(should_stop=lambda: False))
+        result = orchestrator.run()
+        self.assertNotEqual(result.finish_reason, "cancelled")
+        self.assertNotIn("报告不完整", result.final_summary)
+
+    def test_broken_stop_callback_does_not_crash(self) -> None:
+        def boom() -> bool:
+            raise RuntimeError("callback 坏了")
+
+        orchestrator = self.make(callbacks=SwarmCallbacks(should_stop=boom))
+        result = orchestrator.run()  # 不该抛异常
+        self.assertNotEqual(result.finish_reason, "cancelled")
+
+
 class OrchestratorTests(unittest.TestCase):
     def make(self, **overrides) -> Orchestrator:
         settings = {

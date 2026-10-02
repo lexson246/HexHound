@@ -51,13 +51,45 @@ def _iso(mtime: float) -> str:
         return ""
 
 
+#: 这些收尾原因说明"这次没跑完"，历史里必须显示为未完成。
+PARTIAL_FINISH_REASONS = frozenset({
+    "cancelled", "stopped", "budget", "supervisor_abort", "provider_error",
+    "failed", "closing_no_finish",
+})
+
+#: 报告里的中断标记（用户主动停止时写入正文，见 gui._mark_partial）。
+INTERRUPTED_MARKERS = ("本次运行被中断", "报告不完整")
+
+
 def _status_of(run_dir: Path) -> str:
     """判断这次运行是否完整收尾。
 
-    判据：有 `snapshot.json` 且没有"未收尾标记"。中断/异常时收尾路径仍会写
-    报告，但 `snapshot.json` 只在编排器正常收口时写（见 orchestrator 尾部），
-    因此缺它就是没跑完。状态宁可说"未完成"，也不要把半份结果说成完整审计。
+    三条判据（按可靠性排序）：
+
+    1. **报告正文里的中断标记**——最直接：报告说"不完整"就是不完整；
+    2. **记录下来的收尾原因**（`snapshot.json` 的 `result.finish_reason` 或
+       `run.json` 的 `finish_reason`）落在 `PARTIAL_FINISH_REASONS` 里；
+    3. 没有 `snapshot.json`（中断/异常时编排器可能来不及写）。
+
+    为什么要看前两条：编排器在用户按停止时只是跳出波次循环、然后照常收尾，
+    于是 `snapshot.json` 照样会写出来——只看"有没有快照"会把一次被中断的运行
+    说成"已完成"（第四轮实测踩到）。宁可说"未完成"，也不能把半份结果说成完整审计。
     """
+    if not (run_dir / "run.json").exists() and not (run_dir / "snapshot.json").exists():
+        return STATUS_UNKNOWN
+    report = run_dir / "report.md"
+    try:
+        head = report.read_text(encoding="utf-8", errors="replace")[:4000] if report.exists() else ""
+    except OSError:
+        head = ""
+    if any(marker in head for marker in INTERRUPTED_MARKERS):
+        return STATUS_PARTIAL
+    snapshot = _load_json(run_dir / "snapshot.json")
+    recorded = str((snapshot.get("result") or {}).get("finish_reason") or "")
+    if not recorded:
+        recorded = str(_load_json(run_dir / "run.json").get("finish_reason") or "")
+    if recorded in PARTIAL_FINISH_REASONS:
+        return STATUS_PARTIAL
     if not (run_dir / "snapshot.json").exists():
         return STATUS_PARTIAL if (run_dir / "run.json").exists() else STATUS_UNKNOWN
     return STATUS_DONE

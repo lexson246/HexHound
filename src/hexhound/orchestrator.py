@@ -736,9 +736,27 @@ class Orchestrator:
             self.trace.record(f"orchestrator_{kind}", task=task, **data)
 
     def _stopped(self) -> bool:
-        if self.callbacks.should_stop is not None and self.callbacks.should_stop():
+        if self._user_stopped():
             return True
         return not self.budget.can_spend()
+
+    def _user_stopped(self) -> bool:
+        """是否**用户主动停止**（区别于预算/闸门导致的收尾）。
+
+        为什么要单独判断（第四轮实测）：用户在界面上按停止、或直接关窗口时，
+        编排器只是跳出波次循环、然后照常走收尾路径——于是运行记录写的是
+        `finish_reason="finish"`，`snapshot.json` 也照写，历史里这次运行
+        会被判成"完整收尾"。报告正文虽然有"不完整"标记，运行记录却说跑完了，
+        这正是本项目最不能接受的那类不一致。
+
+        回调坏了按"没停"处理：一个坏掉的停止回调不该把整轮运行打成异常。
+        """
+        if self.callbacks.should_stop is None:
+            return False
+        try:
+            return bool(self.callbacks.should_stop())
+        except Exception:  # noqa: BLE001
+            return False
 
     def _time_left(self) -> float | None:
         """剩余墙钟时间（秒）；未设 `MAX_SECONDS` 时返回 None。"""
@@ -1656,7 +1674,14 @@ class Orchestrator:
         budget_reasons = self.budget.stop_reasons()
         if budget_reasons:
             stop_reasons.extend(budget_reasons)
+        user_stopped = self._user_stopped()
         final = "\n".join(summaries)
+        if user_stopped:
+            final = (
+                "【本次运行被中断，报告不完整】用户在该审计结束前停止了运行；"
+                "已完成的步骤与发现如实保留，但**尚未测试的端点与参数没有被测过**。\n\n"
+                + final
+            )
         if stop_reasons:
             final += "\n\n停止原因：" + "；".join(dict.fromkeys(stop_reasons))
         # 报告附录用 **T 编号证据**（各子任务的 registry.sandbox_log 合并去重）：
@@ -1697,7 +1722,7 @@ class Orchestrator:
             estimated_cost=cost,
             total_tokens=total,
             steps_used=len(steps),
-            finish_reason="budget" if budget_reasons else "finish",
+            finish_reason="cancelled" if user_stopped else "budget" if budget_reasons else "finish",
             surface=self.surface,
             tasks=[task.to_dict() for task in tasks],
             artifacts_dir=str(self.artifacts.dir) if self.artifacts.enabled else "",

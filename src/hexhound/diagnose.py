@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import locale
 import os
 import socket
 import ssl
@@ -484,20 +485,51 @@ def parse_adapter_names(ipconfig_text: str) -> list[str]:
     return names
 
 
+def _decode_console(raw: bytes | str) -> str:
+    """控制台命令输出的解码：Windows 上 `route`/`ipconfig` 按**ANSI 代码页**输出。
+
+    实测事故（中文 Windows + 本地 CI 执行器）：`subprocess.run(..., text=True)`
+    会按 UTF-8 去解 GBK 字节，读取线程里抛 `UnicodeDecodeError`——输出被截断，
+    而调用方只看到一条 `PytestUnhandledThreadExceptionWarning`，
+    排查时完全看不出是"本机命令输出不是 UTF-8"。
+
+    顺序：UTF-8 → 系统首选编码（中文 Windows 即 cp936）→ GBK → 兜底替换解码。
+    传入已经是 `str` 时原样返回（调用方可能自己解过码）。
+    """
+    if isinstance(raw, str):
+        return raw
+    for name in ("utf-8", locale.getpreferredencoding(False), "gbk", "cp1252"):
+        if not name:
+            continue
+        try:
+            return raw.decode(name)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    from .sanitize import decode_output
+
+    return decode_output(raw)
+
+
+def _run_console(command: list[str], *, timeout: float = 10.0) -> str:
+    """跑一条只读的本机命令并解码输出（绝不抛异常，失败返回空串）。"""
+    import subprocess
+
+    try:
+        proc = subprocess.run(command, capture_output=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return _decode_console(proc.stdout or b"")
+
+
 def local_network_facts() -> list[str]:
     """本机网络事实（默认路由 / 隧道适配器 / DNS）——用于解释"为什么只有挂 VPN 才行"。
 
     只读本机命令输出，不联网。任何一步失败都不影响结论（返回已获得的部分）。
     """
-    import subprocess
-
     facts: list[str] = []
     is_windows = os.name == "nt"
-    try:
-        route_out = subprocess.run(
-            ["route", "print", "-4"] if is_windows else ["ip", "route"],
-            capture_output=True, text=True, timeout=10, check=False,
-        ).stdout
+    route_out = _run_console(["route", "print", "-4"] if is_windows else ["ip", "route"])
+    if route_out:
         routes = parse_default_routes(route_out)
         if routes:
             described = "；".join(f"网关 {gw}" + (f"（接口 {iface}）" if iface else "") for gw, iface in routes)
@@ -509,14 +541,11 @@ def local_network_facts() -> list[str]:
                 )
         else:
             facts.append("默认路由：未解析到（可能全部走 VPN 隧道，或命令输出格式不同）")
-    except (OSError, subprocess.SubprocessError) as exc:
-        facts.append(f"默认路由：读取失败（{type(exc).__name__}: {exc}）")
+    else:
+        facts.append("默认路由：读取失败（命令不可用或超时）")
 
-    try:
-        cfg_out = subprocess.run(
-            ["ipconfig", "/all"] if is_windows else ["ip", "-br", "link"],
-            capture_output=True, text=True, timeout=10, check=False,
-        ).stdout
+    cfg_out = _run_console(["ipconfig", "/all"] if is_windows else ["ip", "-br", "link"])
+    if cfg_out:
         adapters = parse_adapter_names(cfg_out)
         tunnels = [name for name in adapters if any(h in name.lower() for h in TUNNEL_HINTS)]
         if tunnels:
@@ -525,6 +554,6 @@ def local_network_facts() -> list[str]:
                 "  [i] 若这些适配器在 VPN 关闭后仍处于启用状态，先禁用/重启它们再试——"
                 "半初始化状态（例如 Tailscale 报 starting）会拖慢或阻断解析。"
             )
-    except (OSError, subprocess.SubprocessError) as exc:
-        facts.append(f"适配器：读取失败（{type(exc).__name__}: {exc}）")
+    else:
+        facts.append("适配器：读取失败（命令不可用或超时）")
     return facts

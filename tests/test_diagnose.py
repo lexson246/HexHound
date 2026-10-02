@@ -538,5 +538,46 @@ class BrokenNoProxyTests(unittest.TestCase):
         self.assertEqual(client.network_note, "", "代理正常时不该改动行为、也不该多嘴")
 
 
+class ConsoleDecodingTests(unittest.TestCase):
+    """本机命令输出不一定是 UTF-8（中文 Windows 是 GBK）。
+
+    实测事故：`subprocess.run(..., text=True)` 按 UTF-8 解 `route`/`ipconfig` 的
+    GBK 输出，读取线程里抛 `UnicodeDecodeError`，输出被截断；调用方只看到一条
+    `PytestUnhandledThreadExceptionWarning`，根本看不出是编码问题。
+    """
+
+    GBK_TEXT = (
+        "接口列表\r\n"
+        "  1...aa bb cc dd ......Realtek PCIe GbE Family Controller\r\n"
+        "   默认网关. . . . . . . . . . . . . : 192.168.1.1\r\n"
+    )
+
+    def test_gbk_bytes_decode_without_exception(self) -> None:
+        from hexhound.diagnose import _decode_console
+
+        decoded = _decode_console(self.GBK_TEXT.encode("gbk"))
+        self.assertIn("接口列表", decoded)
+        self.assertIn("Default".replace("Default", "网关"), decoded)
+
+    def test_utf8_and_empty_still_work(self) -> None:
+        from hexhound.diagnose import _decode_console
+
+        self.assertEqual(_decode_console("接口列表".encode()), "接口列表")
+        self.assertEqual(_decode_console(b""), "")
+        # 既不是 UTF-8 也不是系统编码的字节：宁可乱码也不能抛
+        self.assertIsInstance(_decode_console(b"\xff\xfe\x00\xd2\xbb"), str)
+
+    def test_network_facts_never_raise_on_gbk_output(self) -> None:
+        from unittest.mock import patch
+
+        class _Proc:
+            stdout = ConsoleDecodingTests.GBK_TEXT.encode("gbk")
+
+        with patch("subprocess.run", return_value=_Proc()):
+            facts = diagnose.local_network_facts()
+        self.assertTrue(facts)
+        self.assertTrue(any("默认路由" in item or "适配器" in item for item in facts))
+
+
 if __name__ == "__main__":
     unittest.main()
