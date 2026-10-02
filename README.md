@@ -670,6 +670,22 @@ hexhound audit --target URL --provider custom \
   --base-url https://your-gateway/v1 --model your-model
 ```
 
+### Reasoning effort (DeepSeek only, explicit)
+
+```ini
+LLM_REASONING_EFFORT=      # blank = do not send the parameter (server default), or low / high / max
+TEMPERATURE=0.2            # ignored by DeepSeek thinking mode
+```
+
+DeepSeek's thinking mode is **enabled by default** with effort `high` (see
+[the API docs](https://api-docs.deepseek.com/guides/thinking_mode/)); `max` is a separate, higher
+level. HexHound does not guess: with the setting blank it sends **no** `reasoning_effort` field and
+lets the server decide, and it only ever sends it for DeepSeek — other providers take different
+parameters (not mapped yet, so nothing is sent for them). The desktop app exposes the same setting,
+and every model call records the **effective request config**
+(`provider / model / temperature / reasoning_effort`, with `server_default` when unset) as an
+`llm_config` event in `trace.jsonl`, so "what did we actually send?" is answerable after the fact.
+
 ### When a model call fails, find out *why*
 
 `APIConnectionError: Connection error.` is the OpenAI SDK's **summary**, and it covers everything
@@ -918,11 +934,21 @@ MAX_COST=0.5          # CNY; crossing it ends the run and records the reason in 
 MAX_TOKENS=200000     # total token cap
 MAX_LLM_CALLS=60      # model call cap
 MAX_TOOL_CALLS=300    # total request cap
-MAX_SECONDS=900       # wall-clock cap
+MAX_SECONDS=900       # hard wall-clock cap
+HEXHOUND_SOFT_SECONDS=1800   # soft wall-clock cap: no *new* wave after this (0 = off)
 RATE_LIMIT=0.3        # minimum gap between requests
 MAX_TASKS=6           # sub-task cap
 PARALLEL=3            # concurrent sub-agents
 ```
+
+**Two wall-clock caps, deliberately different in kind.** `MAX_SECONDS` is the hard budget
+(crossing it ends the run). `HEXHOUND_SOFT_SECONDS` (default **1800 s**) only decides whether a
+**new wave** may start: waves already running are never interrupted, because half-killing a wave
+loses the conclusions the sub-agents were about to write. It exists because with `MAX_SECONDS=0`
+(the default) nothing bounded "should we start another wave" at all — a measured run reached
+20 minutes / 1.25M tokens. When it fires, an event is emitted, the run records
+`finish_reason=soft_timeout`, and the report says which waves were skipped; set it to `0` to
+disable.
 
 **All five budget dimensions share one definition between the CLI and the desktop app**
 (`runparams.FIELDS`): the form inputs, the backend parser and the `Config`/`Budget`
@@ -950,6 +976,32 @@ Sub-task states are reported honestly: `finished` / `unfinished (step cap)` /
 `unfinished (budget)` / `unfinished (repeated actions)` / `failed`. **Unfinished ≠ no output** — its
 tool results still count toward the attack surface and evidence, but the report says the job was not
 completed instead of pretending it was.
+
+**The last step of every sub-task is reserved for writing conclusions.** From that step on, only
+`record_finding` / `record_coverage` / `leave_note` / `finish_task` are accepted (probing calls are
+refused and never executed), and the same restriction applies to the two closing rounds that follow.
+The reason is measured, not theoretical: after the closing rounds landed, `max_steps` endings fell to
+zero, but ~10% of sub-tasks still ended in `closing_no_finish` — the model spent its final step
+probing and the system had to write the summary for it. Reserving the step costs nothing (the step
+budget is unchanged) and gives the model a chance to hand in its own summary. Budgets below 3 steps
+are exempt, since locking down the only step would mean the task never probes at all.
+
+### Tool-failure statistics
+
+Every run counts tool failures in four separate buckets, because the right response differs for each:
+
+| bucket | meaning | what to do |
+| --- | --- | --- |
+| `unknown` | the model asked for a tool this run **did not have** | the environment is missing that capability (sandbox not attached, component not installed) |
+| `crashed` | the tool raised — our bug | fix the tool |
+| `returned` | the tool ran and returned an error (often a scope refusal) | check the scope/targets |
+| `budget` | not executed because a budget was exhausted | raise the budget |
+
+They land in `run.json` and in the report (`工具调用失败：N 次｜…`), so "why did this run find
+nothing" has a checkable answer instead of a guess. A run whose environment lacks a capability says
+so **before** the numbers: when the real-tool sandbox is unavailable, the report states the concrete
+reason (probe failed / no tools installed / no local image) rather than a generic sentence, and the
+same reason is written into `run.json`.
 
 ## Artifacts and memory
 
@@ -985,9 +1037,23 @@ Two hard rules are enforced by tests:
 * the report shown is **the one written at the time** (`report.md`); only when that file is gone is
   it rebuilt offline from `snapshot.json`, and the rebuilt version says so in its header.
 
-Statuses stay honest: a run counts as `done` only when `snapshot.json` exists; a directory with just
-`run.json` is `unfinished (interrupted or failed)`. **An incomplete run is never displayed as a
-complete audit.**
+Statuses stay honest, by three rules in order: a report whose body carries the interruption marker is
+`unfinished`; otherwise a recorded `finish_reason` of
+`cancelled / budget / soft_timeout / supervisor_abort / provider_error / failed / closing_no_finish`
+is `unfinished`; otherwise a missing `snapshot.json` is `unfinished`. (The middle rule matters: when
+you stop a run, the orchestrator still finishes its tail, so `snapshot.json` *does* get written —
+judging by "snapshot exists" alone would label an interrupted run as complete. That was a real bug.)
+**An incomplete run is never displayed as a complete audit.**
+
+### Closing the desktop window no longer throws the run away
+
+Closing the window used to kill the audit thread outright — no partial report at all — while the
+"Stop" button in the UI wrote one. Now the first close request stops the run and waits up to
+`HEXHOUND_CLOSE_GRACE` seconds (default 45) for the partial report, showing "saving an incomplete
+report…" in the page, and then closes itself; a **second** close is never blocked, so the window can
+always be closed. If the wait times out (a single `sqlmap` call may run for hundreds of seconds) the
+app exits and says so on stderr. Verified end to end with zero model quota by
+`tools/verify_close_guard.py`.
 
 ### Report workspace (filters, detail, export, cross-run compare)
 

@@ -331,47 +331,59 @@ check the proxy first.
 
 ## 10. Known gaps and tech debt (ranked)
 
-1. **No version control.** Fix first.
-2. **ANSI/encoding garbage** in sandbox output (`whatweb` mojibake, sqlmap escape codes). Cheap,
-   self-contained, immediately improves report quality and model comprehension.
-3. **Special tasks frequently hit their step cap** and thus never call `finish_task` (findings still
-   land). Give S1/K1 a slightly larger budget or an explicit "record then finish" micro-protocol.
-4. **Run length is unbounded** when sweeps keep making progress: two rounds × (endpoint + parameter
-   sweep) can reach 20 minutes. Add a wall-clock guard for sweeps (there is already `MAX_SECONDS`).
-5. **Memory noise**: `memory/<host>.json` grows monotonically, and stale entries reappear as
-   `unknown` in every diff. `hexhound memory --before/--forget/--reset` exists, but nothing prunes
-   automatically or marks entries as resolved.
-6. **Business logic has no lab target.** The lab covers races and crypto/auth, not pure state-machine
-   abuse (price tampering, step skipping, negative quantities). Adding `/shop`-style endpoints would
-   make that playbook testable.
-7. **GUI is unverified** in this session (`gui.py`, 1226 lines, plus `desktop.py`); no automated
-   coverage. Assume it may be broken and do not claim otherwise.
-8. **No CI**: no workflow runs the tests; PyInstaller builds are manual.
-9. **XSS stops at string reflection** — a real browser in the sandbox is the only way to change that.
-10. **`reports/` is gitignored** but contains the evidence used in this handover; copy anything you
-    need into `docs/` if it must survive.
+> **Status as of round 4 (2026-10-02)** — each line is marked so nobody re-does finished work:
+> ✅ DONE · 🔶 PARTIAL · ❌ OPEN.
+
+1. ✅ **No version control.** Done: git history exists and CI runs on push.
+2. ✅ **ANSI/encoding garbage** in sandbox output — `sanitize.py` (`strip_ansi`,
+   `decode_output`, `normalize_newlines`) plus `sanitize_terminal_text` on the evidence path.
+   Round 4 also unified **console** decoding (`decode_console_output`) for `route`/`ipconfig`/
+   `docker`/headless-Edge output, which used to crash reader threads on Chinese Windows.
+3. 🔶 **Special tasks hitting their step cap** — closing rounds (`MAX_CLOSING_ROUNDS=2`) removed
+   `max_steps` endings entirely (by-date check: 09-18…09-20 had 74; from 09-21 on, zero). What is
+   left is `closing_no_finish` (~10%): the model does not hand in its own summary. Round 4 reserves
+   the **last step** for closing actions so it has one; **the resulting drop is not yet measured on
+   a real run**.
+4. 🔶 **Run length** — `_may_start_wave` now has two gates: the hard `MAX_SECONDS` budget and a
+   **soft** cap (`HEXHOUND_SOFT_SECONDS`, default 1800 s) that only refuses *new* waves and records
+   `finish_reason=soft_timeout`. Still no cap on a single wave (by design).
+5. ❌ **Memory noise**: `memory/<host>.json` grows monotonically; nothing prunes automatically or
+   marks entries resolved. `hexhound memory --before/--forget/--reset` is manual.
+6. ✅ **Business logic lab targets** exist now (`/cart`, `/order/prepare`, `/order/confirm`,
+   client-supplied price, skippable step) — see `tools/verify_lab_business_logic.sh`.
+7. ✅ **GUI verification** — GUI/desktop tests plus `tools/verify_desktop_exe.py` (21 checks) and
+   `tools/verify_close_guard.py` (12 checks).
+8. ✅ **CI** — `.github/workflows/ci.yml` runs on push; the failing step now writes its pytest tail
+   into `$GITHUB_STEP_SUMMARY` so failures are readable without a token.
+9. 🔶 **XSS stops at string reflection** unless playwright + Edge/Chrome are present; the report
+   states the weaker conclusion when they are not.
+10. ❌ **`reports/` is gitignored**; copy anything that must survive into `docs/`.
+
 
 ---
 
 ## 11. Suggested next tasks (each with an acceptance test)
 
-1. **`git init` + baseline commit** (after confirming `.env` is ignored). Acceptance:
-   `git log --oneline` shows one commit; `git status` clean; `.env` untracked.
-2. **Sanitise sandbox output**: strip ANSI, decode UTF-8 with replacement in
-   `sandbox._clip` / `ExecResult`. Acceptance: a new unit test feeds an ANSI-laden byte string and
-   asserts no `\x1b[` survives; a live lab run shows readable `whatweb`/sqlmap output in the report.
-3. **Make special tasks converge**: raise their step budget and/or require a closing `finish_task`.
-   Acceptance: in a lab run, `S1`/`K1` end with outcome `done` (not `max_steps`) in the ledger while
-   still producing their findings.
-4. **Bound sweep runtime** with a wall-clock check between rounds. Acceptance: a test drives the
-   gate with a stub clock and asserts no third round starts past the cap; a live run with
-   `--max-seconds 300` finishes within ~1.2×.
-5. **Lab business-logic endpoints** (`/cart`, `/order/confirm` with client-supplied price and a
-   skippable step). Acceptance: extend `tools/verify_lab_new_vulns.sh` to reproduce each one by hand
-   (no HexHound in the loop), then a live run finds at least one of them.
-6. **Auto-prune/annotate memory** so stale entries stop polluting the diff. Acceptance:
+> Status markers match §10: ✅ DONE · 🔶 PARTIAL · ❌ OPEN.
+
+1. ✅ **`git init` + baseline commit** — done long ago; CI runs on push.
+2. ✅ **Sanitise sandbox output** — done (`sanitize.py`); round 4 extended it to **console**
+   decoding for `route`/`ipconfig`/`docker`/headless-Edge output.
+3. 🔶 **Make special tasks converge** — half done: `max_steps` endings are gone; `closing_no_finish`
+   (~10%) remains. Round 4 reserves the **last step** for closing actions. Remaining acceptance: on a
+   real run, `closing_no_finish` drops below ~3% of sub-tasks.
+4. ✅ **Bound sweep runtime** — `_may_start_wave` + `HEXHOUND_SOFT_SECONDS` (default 1800 s, 0 = off).
+   Acceptance test: `tests/test_orchestrator.py::SoftTimeLimitTests`.
+5. ✅ **Lab business-logic endpoints** — `/cart`, `/order/prepare`, `/order/confirm` exist and are
+   reproduced by hand in `tools/verify_lab_business_logic.sh`.
+6. ❌ **Auto-prune/annotate memory** so stale entries stop polluting the diff. Acceptance:
    `tests/test_diff.py` gains a case where a resolved entry no longer appears; `hexhound memory`
    reports what was pruned.
+7. ❌ **Map reasoning-effort parameters for non-DeepSeek providers** (nothing is sent for them today).
+   Acceptance: a provider-matrix test asserts the exact request body per provider.
+8. ❌ **Migrate the plaintext `api_key` field in `settings.json`** into the DPAPI-protected
+   `provider_keys` map, with a rollback path. Acceptance: opening old settings still works and no
+   plaintext key remains.
 
 When you finish any of these: update `README.md` **and** `README_ZH.md` in the same change, keep the
 "measured, not claimed" tone, and re-run §8.

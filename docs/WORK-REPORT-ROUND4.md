@@ -347,17 +347,90 @@ desktop exe (windows)          success      test (ubuntu-latest / py3.11)    suc
 
 ---
 
-## 11. 仍未做 / 已知边界（如实列出）
+## 11. 更正：一处把历史数据说成了现状
 
-- **首次 GitHub CI 的那个红点没有留下可复核的原因**（Actions 日志需认证）：
-  已加公开摘要机制，同一作业在后续提交上全绿——但"当时为什么红"**未定位**。
+前一版这里写着"子任务经常自己收不了尾：82 次运行里 `max_steps` 74 次（16%）"。
+按**日期**重算之后必须更正：`max_steps` 终态集中在 **2026-09-18 ~ 09-20**
+（收尾回合机制上线之前），此后为 **0**。
+
+| 运行日期 | 子任务数 | 终态分布 |
+| --- | --- | --- |
+| 09-18 | 89 | done 82、max_steps 5、failed 2 |
+| 09-19 | 55 | done 29、max_steps 26 |
+| 09-20 | 67 | done 24、max_steps 43 |
+| 09-21 | 167 | done 125、closing_no_finish 37、supervisor_abort 5 |
+| 09-26 | 40 | done 28、provider_error 5、closing_no_finish 3、stopped 3、skipped 1 |
+| 09-27 | 42 | done 36、closing_no_finish 4、supervisor_abort 2 |
+
+所以真实残留是 **`closing_no_finish` ≈ 10%**（模型不主动交总结，系统代写），
+而不是 16% 的 `max_steps`。09-26 的 5 条 `provider_error` 正是那次"死系统代理"事故
+（已在 §8.2 修掉）。
+
+---
+
+## 12. 第二批修复（同日）：剩余清单里的 1 / 2 / 3 / 13 / 14
+
+### 12.1 控制台解码统一（原清单第 3 条）
+
+`decode_console_output()` 进了 `sanitize.py`（唯一实现），`diagnose._decode_console`
+改为委托它；`screenshot.py` 的无头 Edge 调用改成"捕获字节 + 统一解码"；
+`tools/` 里 `verify_desktop_exe.py` / `verify_poc_selfcheck.py` / `run_ci_locally.py`
+的 `text=True` 全部补上显式编码。
+
+**顺序很关键，而且是我自己先写错再改对的**：第一版按"系统代码页优先"，结果
+UTF-8 的中文 `接口列表` 被 GBK 解成 `鎺ュ彛鍒楄〃`——**一个替换字符都没有**，
+按"噪音"根本判不出来（我做的第一个版本正是这么写的，被自测抓出来）。
+现在的顺序是 **严格 UTF-8 → 系统代码页 → GBK → cp1252 → 兜底替换**：
+GBK 字节（`0xd2 0xbb`）不可能是合法 UTF-8，所以两种都能解对；
+另外 NUL 是合法 UTF-8，`wsl.exe -l -q` 的 UTF-16LE 因此仍交给 `decode_output`
+按噪音择优。用例覆盖 gbk / utf-8 / utf-16le / ascii / 空 / 垃圾字节。
+
+### 12.2 墙钟软上限（原清单第 2 条）
+
+- `Config.soft_seconds`（默认 **1800**，`HEXHOUND_SOFT_SECONDS`，0 = 关闭），
+  `runparams` 加了同名输入框（"只拦「要不要再开一波」，不打断进行中的波次"）。
+- `_may_start_wave()` 现在有两道时间闸门：硬预算（`MAX_SECONDS`）与软上限。
+  触发软上限时写 `soft_time_stop` 事件、运行记录 `finish_reason=soft_timeout`、
+  总结里写明"跳过了哪些波次 + 怎么关掉这个上限"，历史判定也按"未完成"看待。
+- 为什么不是硬杀：半途掐断会让子代理来不及写结论，产出全丢——所以只拦新波次。
+
+### 12.3 最后一步预留给写结论（原清单第 1 条，按更正后的事实重做）
+
+`_ClosingState.restricted()`：步数预算的最后一步（以及其后两轮收尾回合）
+**只接受** `record_finding` / `record_coverage` / `leave_note` / `finish_task`，
+探测动作被拒且不执行。步数 < 3 时不预留（否则唯一一步也锁死，等于一步都不探测）。
+
+代价为零（步数预算不变、请求数不变），目标是让 `closing_no_finish` 变成
+模型自己交的 `finish`。用例钉住三件事：最后一步的探测**没有执行**；
+模型在第 4 步交总结时终态是 `finish` 且 `closing.attempted == 0`；
+小预算（`max_steps=2`）不被锁死。
+真实占比的下降只能由**下一次真实运行**确认，本轮不声称。
+
+### 12.4 文档同步（原清单第 13、14 条）
+
+- `README.md` / `README_ZH.md`：补上软上限与 `HEXHOUND_SOFT_SECONDS`、
+  推理强度（含"默认 thinking=high、留空不发送、只对 DeepSeek"）、
+  最后一步预留、工具失败统计四分类、历史状态三条判据、关窗护栏。
+- `docs/HANDOVER.md` §10 的过期清单：在前四条的标题上直接标注
+  **已完成 / 仍开放**，避免下一个接手的人照着旧清单重复劳动。
+
+---
+
+## 13. 仍未做 / 已知边界（本轮之后的如实状态）
+
+- **首次 GitHub CI 的那个红点仍未定位**（Actions 日志需认证）：已加公开摘要机制，
+  同一作业在后续提交上全绿——但"当时为什么红"**未定位**。
   `ubuntu/py3.11`/`windows/py3.11` 在 GitHub 上已绿；本地 Ubuntu 24.04 里没有
   python3.11 包，本地执行器仍无法复现那一个组合。
 - **关窗口仍有 45 秒上限**：审计卡在长工具调用（sqlmap 可以跑几百秒）时，
   超过 `HEXHOUND_CLOSE_GRACE` 仍会直接退出，只留下"未能等到报告写完"的提示。
-- **推理强度对非 DeepSeek 提供商不发送**：其它提供商的等价参数各不相同，未做映射。
-- **`settings.json` 里仍有一个明文 `api_key` 字段**（`provider_keys` 是 DPAPI 保护的）：
-  已记录、未改动（改它要迁移，风险高于收益）。
+- **`closing_no_finish` 的下降未被真实运行验证**（本轮只做到"机制 + 用例"）。
+- **运行中直接关窗口只在 Flask 层验证过**，打包 exe 上的运行中关窗行为未实测。
+- **`memory/<host>.json` 仍无自动修剪/标记已解决**（原清单第 4 条，未做）。
+- **非 DeepSeek 提供商的推理参数未映射**（原清单第 7 条，未做）。
+- **`settings.json` 里仍有一个明文 `api_key` 字段**（原清单第 8 条，未做）。
 - **浏览器验证依赖系统 Edge/Chrome**：没有 playwright 浏览器时会跳过相关用例，
   报告里对应结论强度只能到"反射"。
+- **`reports/` 被 gitignore**：报告与证据不进仓库，要长期留存得手动搬进 `docs/`。
+
 
