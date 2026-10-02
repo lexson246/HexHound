@@ -89,8 +89,9 @@ jobs:
         # 失败时把尾部摘要写进 `$GITHUB_STEP_SUMMARY`：Actions 的**原始日志需要
         # 认证**，公共仓库上只能读到 check run 的 output.summary——不加这一步，
         # CI 红点对第三方（含下一个接手的 AI）就是"没有解释的红"。
-        # 实测价值：第一次真跑 GitHub CI 时，windows/py3.12 这一步失败但拿不到原因，
-        # 就是靠这个摘要定位的（详见 docs/WORK-REPORT-ROUND4.md §11）。
+        # 实测背景：第一次真跑 GitHub CI 时，windows/py3.12 这一步失败过，而 Actions
+        # 的原始日志需要认证——公共仓库上那个红点**没有可读的解释**（原因至今未定位）。
+        # 有了这个摘要，以后再红就有公开可读的原因（详见 docs/WORK-REPORT-ROUND4.md §10.3）。
         run: python tools/ci_rerun_report.py
 
   gui:

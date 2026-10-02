@@ -427,4 +427,22 @@ Full detail: `docs/WORK-REPORT-ROUND4.md`. Commits `a255248` (fixes) + `6d23f08`
     (loopback and `NO_PROXY` matches go direct).
 - Built artifacts (verified this round): `hexhound.exe` (desktop, 21/21 startup checks via
   `tools/verify_desktop_exe.py`) and `dist\hexhound.exe` (CLI).
+- **Real GitHub CI now runs and is green**: pushes to `origin` (`lexson246/HexHound`) trigger
+  `.github/workflows/ci.yml`; commit `aac9a68` is 8/8 (lint, gui, self-check, desktop, and the
+  four `test` matrix entries). Actions logs need authentication, so the "silently skipped" step
+  now runs `tools/ci_rerun_report.py`, which writes the failure tail into
+  `$GITHUB_STEP_SUMMARY` — readable on public repos through the check-run API without a token.
+- **Closing the desktop window no longer loses the run**: `desktop.install_close_guard()` stops
+  the audit, waits up to `HEXHOUND_CLOSE_GRACE` (default 45 s) for the partial report, then
+  destroys the window; a second close is never blocked. Verified end to end (zero model quota)
+  by `tools/verify_close_guard.py` (12/12).
+- **An interrupted run is no longer recorded as finished**: the orchestrator writes
+  `finish_reason="cancelled"` when the *user* stopped it (as opposed to budget/gate endings), and
+  `history._status_of()` treats `cancelled/budget/supervisor_abort/provider_error/failed/
+  closing_no_finish` (and the report's interruption marker) as `partial`. A broken stop callback
+  no longer aborts a run.
+- Orchestration-level tool check (zero quota): `tools/verify_swarm_with_real_tools.py` runs the
+  real planner→waves→verify flow with a scripted LLM and asserts `run.json` shows the sandbox
+  enabled, `sqlmap` really executed, and no `unknown`/`crashed` tool failures.
+
 

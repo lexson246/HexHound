@@ -257,15 +257,107 @@ CLI `dist\hexhound.exe sandbox status` 正确识别 WSL 与 9 个工具；
 
 ---
 
-## 10. 仍未做 / 已知边界（如实列出）
+## 10. 补充轮（同日）：关窗不丢报告、中断不谎报完成、CI 真跑通了
 
-- **GitHub 上的 CI 仍未真实跑过**：本地执行器（`tools/run_ci_locally.py`）7 个作业全绿，
-  但需要一个真实仓库 + 凭据才能在 GitHub 上确认；`ubuntu/py3.11` 无法在
-  Ubuntu 24.04 上复现（没有 python3.11 包）。
-- **桌面窗口关闭即杀线程**：仍然不会写报告（已知边界，报告里会写明"不完整"，
-  但窗口关闭是硬杀）。要留成果就用界面上的"停止"按钮。
+用户说"继续"之后的四件事，全部先复现再改。
+
+### 10.1 关桌面窗口不再丢成果
+
+**复现/根因**：审计跑到一半直接关窗口 → `webview.start()` 返回、进程退出、
+daemon 线程被直接杀掉，**连"不完整报告"都没有**；而按界面上的"停止"按钮走的
+`STATE.stop_current()` 会正常写出标注"不完整"的报告。同一个动作两种关法结果完全不同。
+
+**修**：`desktop.install_close_guard()` 拦截**第一次**关窗 → 请求停止 → 等报告写完
+（默认 45 秒，`HEXHOUND_CLOSE_GRACE` 可调）→ 自己 `destroy()` 窗口；
+**第二次**关窗不再拦（不能让人关不掉窗口）。`main()` 的 `finally` 里再等一次作为兜底
+（事件挂不上、或用户用别的关法）。窗口还在时页面上提示"正在保存不完整报告"。
+
+**端到端验证**（零模型额度）：`tools/verify_close_guard.py` 用真实 Flask 应用 +
+真实 `/api/run`（脚本 LLM）起一次审计，中途调用关窗护栏，12 项断言全绿：
+
+```
+[OK] 关窗护栏完成收尾 — outcome=saved
+[OK] 状态进入终止态 — cancelled
+[OK] 报告写明被中断/不完整
+[OK] 历史里判定为未完成 — partial
+[OK] 历史里能读回中断报告 — report
+[OK] 快照记录 finish_reason=cancelled — cancelled
+```
+
+### 10.2 被中断的运行在记录里写着"已完成"（自查发现的真问题）
+
+**现象**：上一条查下去发现的——用户按停止时，编排器只是跳出波次循环、然后**照常收尾**，
+于是 `finish_reason="finish"`，`snapshot.json` 也照样生成；`history._status_of()`
+只看"有没有快照"，于是历史里这次运行显示**已完成**，而报告正文写着"不完整"。
+
+**修**：
+
+- `Orchestrator._user_stopped()` 区分"用户停止"与"预算/闸门收尾"，前者
+  `finish_reason="cancelled"`，并在总结开头写明"报告不完整、未测的不代表安全"；
+- `history._status_of()` 改为三条判据：报告正文中断标记 → 记录的收尾原因
+  （`cancelled/budget/supervisor_abort/provider_error/failed/closing_no_finish`）
+  → 缺快照。宁可说"未完成"，也不能把半份结果说成完整审计；
+- 顺带：`_stopped()` 不再让坏掉的停止回调把整轮运行打成异常（新增用例抓到并修掉）。
+
+### 10.3 GitHub CI 真跑通了（第一次）
+
+仓库 `lexson246/HexHound`（origin 已配置、凭据可用）。首次推送 `2d294a0` 后 8 个作业
+**7 绿 1 红**（`test (windows-latest / py3.12)` 的"silently skipped"那一步），
+但 Actions 的**原始日志需要认证**——公共仓库只能读到 check run 的
+`output.summary`，所以那个红点当时**没有可读的解释**。
+
+为此加了 `tools/ci_rerun_report.py`：跑同一条 `pytest -q -rs`、打印完整输出、
+失败时把尾部摘要写进 `$GITHUB_STEP_SUMMARY`（公开可读）。同一作业在下一个提交
+`aac9a68` 上已 **8/8 全绿**：
+
+```
+lint (ruff)                    success      test (windows-latest / py3.12)  success
+gui (frontend + real browser)  success      test (windows-latest / py3.11)  success
+self-check (no API key needed) success      test (ubuntu-latest / py3.12)    success
+desktop exe (windows)          success      test (ubuntu-latest / py3.11)    success
+```
+
+> 首次那个红点没有留下可复核的原因（日志要认证），**不声称它已定位**；
+> 现在能说的是：同一作业在包含本轮全部改动的提交上是绿的，且以后再红会有公开摘要。
+
+真跑同时确认了一件此前只能"本地推测"的事：**push 会自动触发 CI**，而且
+`2d294a0` 之前的那个提交 `34769b9` 在 GitHub 上也是绿的——也就是说，
+第三轮之后的历史提交在真实 runner 上是通过的。
+
+### 10.4 中文 Windows 上的控制台编码（本地 CI 日志里发现的真 bug）
+
+`route print` / `ipconfig /all` 在中文 Windows 上输出 **GBK**，而
+`subprocess.run(..., text=True)` 按 UTF-8 去解 → 读取线程抛 `UnicodeDecodeError`，
+输出被截断，调用方只看到一条 `PytestUnhandledThreadExceptionWarning`。
+改为捕获字节 + `diagnose._decode_console()`（UTF-8 → 系统首选编码 → GBK → 兜底替换），
+并补了 GBK 字节用例。
+
+### 10.5 真工具链路的"编排级"验证（零模型额度）
+
+`tools/verify_swarm_with_real_tools.py`：走**真实编排**（规划 → 并发子代理 → 波次 → 复核
+→ 报告），并让脚本 LLM 的注入角色主动调用真工具。本机实测 15 项全绿：
+
+```
+[OK] run.json 记录沙箱已启用（WSL (Ubuntu-24.04)，9 个工具）
+[OK] sqlmap 真的被执行 — sqlmap -u 'http://127.0.0.1:5000/api/users' --batch … --technique=BE
+[OK] 没有'未下发的工具' / 没有工具内部异常 — {'total': 0, 'tools_available': 23}
+[OK] 报告写明沙箱已启用｜报告含真工具证据附录
+     波次：[(1, 2), (2, 1)]
+```
+
+---
+
+## 11. 仍未做 / 已知边界（如实列出）
+
+- **首次 GitHub CI 的那个红点没有留下可复核的原因**（Actions 日志需认证）：
+  已加公开摘要机制，同一作业在后续提交上全绿——但"当时为什么红"**未定位**。
+  `ubuntu/py3.11`/`windows/py3.11` 在 GitHub 上已绿；本地 Ubuntu 24.04 里没有
+  python3.11 包，本地执行器仍无法复现那一个组合。
+- **关窗口仍有 45 秒上限**：审计卡在长工具调用（sqlmap 可以跑几百秒）时，
+  超过 `HEXHOUND_CLOSE_GRACE` 仍会直接退出，只留下"未能等到报告写完"的提示。
 - **推理强度对非 DeepSeek 提供商不发送**：其它提供商的等价参数各不相同，未做映射。
 - **`settings.json` 里仍有一个明文 `api_key` 字段**（`provider_keys` 是 DPAPI 保护的）：
   已记录、未改动（改它要迁移，风险高于收益）。
 - **浏览器验证依赖系统 Edge/Chrome**：没有 playwright 浏览器时会跳过相关用例，
   报告里对应结论强度只能到"反射"。
+
