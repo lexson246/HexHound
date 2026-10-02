@@ -28,17 +28,25 @@ HexHound 是一个 **LLM 驱动的黑盒 Web 安全审计 Agent**：编排者把
 
 | 项 | 状态 | 证据 |
 | --- | --- | --- |
-| 测试 | **982 passed / 0 failed / 1 skipped** | `python -m pytest tests -q` |
+| 测试 | **1006 passed / 0 failed** | `python -m pytest tests -q` |
 | 代码风格 | 干净 | `python -m ruff check src tests tools` |
-| 本地 CI 执行器 | **5/5 PASS** | `python tools/run_ci_locally.py --all` |
-| GitHub CI | **8/8 绿** | `python tools/ci_status.py --sha 439e02f` |
+| 本地 CI 执行器 | **Windows 作业真跑；Linux 作业是 SKIP**（见下） | `python tools/run_ci_locally.py --all` |
+| GitHub CI | **8/8 绿** | `python tools/ci_status.py --sha e6e2431` |
 | 桌面 exe | 已重建并 21/21 启动验收 | `python tools/verify_desktop_exe.py` |
+| 运行中关窗（打包 exe） | **10/10**（10 秒内退出 + 报告落盘） | `python tools/verify_desktop_close_inflight.py` |
 | CLI exe | `dist\hexhound.exe`，`sandbox status` 识别 WSL + 9 工具 | 手工跑过 |
 | 真工具链路（零额度） | 15/15 | `python tools/verify_real_tool_chain.py` |
 | 真编排 + 真工具（零额度） | 15/15 + 软上限 4/4 | `python tools/verify_swarm_with_real_tools.py` |
-| 关窗护栏（零额度） | 12/12 | `python tools/verify_close_guard.py` |
+| 关窗护栏（Flask 层） | 12/12 | `python tools/verify_close_guard.py` |
 
 > 跳过的那 1 个用例是"playwright 已安装"分支的环境性跳过，不是漏测。
+
+> ⚠️ **本机跑不了 Linux 作业**：`tools/run_ci_locally.py` 会把 `runs-on: ubuntu-*`
+> 的作业标成 **SKIP**（未执行）——**不要**把它当成通过。这一点被写进汇总额正是因为
+> 踩过：早先跳过被印成 `PASS`，于是"没跑 Linux 作业"被当成"Linux 也通过了"，
+> 直到 GitHub 上 ubuntu 红了才发现（那次是 `protection_available()` 的平台差异）。
+> Linux 作业只有两个可信渠道：GitHub CI，或手工在 WSL 里跑。
+
 
 最近六轮的提交（老 → 新）：
 
@@ -153,14 +161,20 @@ wsl -d Ubuntu-24.04 -- bash -lc "pkill -f '/opt/hexhound-lab/app.py'"
 python -m pytest tests -q                     # 全量测试
 python -m pytest tests -q -x -k "sandbox or gui"   # 局部
 python -m ruff check src tests tools          # 风格
-python tools/run_ci_locally.py --all          # 本地跑 .github/workflows/ci.yml 的 5 个作业
-python tools/ci_status.py --sha <sha>         # 读 GitHub CI 结果（只读公共 API，无需 token）
+python tools/run_ci_locally.py --all          # 本地跑 .github/workflows/ci.yml（Linux 作业会 SKIP）
+python tools/ci_status.py --sha <sha> --summaries  # 读 GitHub CI 结果 + 失败原因（无需 token）
 python tools/run_ci_locally.py --list         # 看有哪些作业
 ```
 
-（`tools/ci_status.py` 是 2026-10-03 新增的：它是 `tools/ci_rerun_report.py` 的"读"那一半——
-后者在 CI 失败时把 pytest 尾部写进 `$GITHUB_STEP_SUMMARY`，前者把结果读回来，
-两者合起来才有"CI 红了但知道为什么"。）
+**CI 失败怎么读**（两轮踩出来的）：Actions 的原始日志需要认证，公共仓库只有两条
+公开通道，两个都已接上——
+
+1. **check-run 注解**：`tools/ci_rerun_report.py` 在失败时既写
+   `$GITHUB_STEP_SUMMARY`，也发一条 `::error title=…::<尾部输出>`；
+   实测**只有注解读得到**（step summary 不进 `output.summary`）。
+2. `tools/ci_status.py --summaries` 把注解与摘要都打出来。
+
+失败时先跑它，别去猜。
 
 测试有个**沙箱/临时目录**的坑：某些用例要求 `TEMP`/`TMP` 落在仓库内可写目录。稳妥起见用：
 
@@ -202,7 +216,10 @@ python -m PyInstaller --noconfirm --clean HexHound.spec           # 可选：CLI
 
 ---
 
-## 6. 六个真实事故与它们的守卫（别把它们改回去）
+## 6. 真实事故与它们的守卫（别把它们改回去）
+
+> 每一条都是**复现过的**，并在 `tests/` 或 `tools/verify_*.py` 里有用例守着。
+> 改相关代码前先读对应小节。
 
 ### 6.1 桌面"一直报未知工具"（P1）
 
@@ -281,6 +298,60 @@ NUL 存在时交给 `decode_output` 择优）。**顺序不能反**：先按 cp9
   在 `network_note` 里说明（事故现场：`ProxyEnable=1` + 死端口 → 7.3 秒后
   `APIConnectionError`、0 token；用户观感是"只有挂 VPN 才行"）。
 
+### 6.8 关窗护栏在真机上"关不掉"（打包 exe 专项验收才抓到）
+
+**症状**：Flask 层的关窗用例全绿，但打包 exe 里"运行中关窗"后进程永不退出，
+日志停在"关窗护栏已挂上"。
+
+**根因两条**（都在 pywebview 的线程模型上）：
+
+1. 原设计"取消第一次关闭 → 收尾完由**工作线程** `window.destroy()`"不成立——
+   窗口方法必须由 GUI 主线程调用，工作线程里调用既不生效也不报错（异常被吞）；
+2. 在 `closing` 回调里调 `evaluate_js()` 会**自锁**——该回调同步跑在 UI 线程上
+   （`Event(window, True)`），而 `evaluate_js` 又要等 UI 线程。
+
+**守卫**：关窗**一律放行**，但放行前 `state.stop_current()`（置停止标志 +
+中断正在跑的沙箱命令），报告由 `main()` 的 finally 等出来（`HEXHOUND_CLOSE_GRACE`）。
+回调里**不碰页面**。回归：`tests/test_desktop_close_guard.py`（单元）+
+`tools/verify_desktop_close_inflight.py`（真机 10 项）。
+
+**排查工具**：`HEXHOUND_DESKTOP_LOG=<file>` 会把启动/关闭里程碑写文件——
+windowed 构建没有控制台，这是"双击没反应"唯一的线索。
+
+### 6.9 限流会被误判成"已修复"（外部评审第 1 条）
+
+**误判链**：429 → 记成 `no_signal` → 同组合被去重跳过 → 端点算"本次覆盖过"
+→ 跨运行 diff 判 **fixed**。
+
+**守卫**：`tools._is_throttled()`（429/503，或 4xx/5xx + `Retry-After`）在
+fuzz / compare / auth / creds / headers 全按"受阻、未完成"处理；
+`Surface.mark_throttled()` 让被限流的端点**不算覆盖**（diff 只能给 unknown）；
+报告披露"目标限流 N 次"。回归：`tests/test_rate_limit.py`（8 条）。
+
+### 6.10 密钥保存会清空别的提供商密钥（外部评审第 2 条）
+
+**根因**：`/api/provider_key` 直接 `json.loads(settings["provider_keys"])`，
+而该字段落盘是 DPAPI **密文** → 解析失败退化成 `{}` → 只写新 provider。
+
+**守卫**：唯一的服务端入口 `gui._store_provider_key()`（先解密合并；
+解不开密文**拒绝保存**；空串=删除）；`_save_settings(..., provider_keys=...)`
+是服务端独占参数，**客户端 payload 里的 `provider_keys` 一律忽略**；
+页面不再回填明文密钥（只显示掩码 + "留空=不修改"）。
+回归：`tests/test_provider_key_store.py`（9 条，按平台分别断言）。
+
+### 6.11 运行级状态与子任务状态不一致（外部评审第 3 条）
+
+**症状**：注入子任务 `failed`，整轮记 `finish`，历史显示"已完成"。
+**守卫**：`_aggregate()` 按"失败子任务 > 模型端点故障 > 预算/软上限/用户停止 > finish"
+定运行级 `finish_reason`，并在总结里点名。回归：
+`tests/test_orchestrator.py::RunStatusMatchesTaskStatusTests`（5 条）。
+
+- **目标流量默认直连**（`trust_env=False`）：系统代理会把整轮扫描打成 502。
+  要代理就用显式配置；LLM 调用与目标流量是两套。
+- **死代理自动绕开**：`llm._dead_proxy_detail()` 检测到"配了代理但端口连不上"时直连并
+  在 `network_note` 里说明（事故现场：`ProxyEnable=1` + 死端口 → 7.3 秒后
+  `APIConnectionError`、0 token；用户观感是"只有挂 VPN 才行"）。
+
 ---
 
 ## 7. 还没做的（按优先级，全部有验收标准）
@@ -289,14 +360,13 @@ NUL 存在时交给 `decode_output` 择优）。**顺序不能反**：先按 cp9
 
 | # | 事项 | 现状 | 验收标准 |
 | --- | --- | --- | --- |
+| 0 | **带标准答案的多场景评测**（检出率/误报率/耗时/成本） | 尚未建立：现在只有"能跑通"的验收（`verify_*`），没有"跑得准不准"的量化。靶场已知漏洞与 `tools/verify_lab_*.sh` 可作为标准答案来源 | 固定场景集（每个场景有 ground truth）+ 一次运行输出 检出率/误报率/耗时/成本 四列，可回归对比 |
 | 1 | `closing_no_finish` 占比 | 约 10%（模型不主动交总结，系统代写）；已把**最后一步**预留给收尾动作 | 一次真实运行里该终态 < 3%；或证明为什么降不下去 |
-| 2 | 关窗 45 秒上限 | `HEXHOUND_CLOSE_GRACE`；sqlmap 单次可跑几百秒 | 超时能被中断当前工具调用（而不是直接退出） |
+| 2 | 关窗 45 秒上限 | `HEXHOUND_CLOSE_GRACE`；沙箱命令现在可被中断（实测 10 秒内退出） | 已在打包 exe 上验收（10/10）；剩余是把上限调到"不急不躁"的默认值 |
 | 3 | `memory/<host>.json` 无修剪 | 陈旧条目每次 diff 都以 `unknown` 复现 | `tests/test_diff.py` 加"已解决条目不再出现"；`hexhound memory` 报出修剪了什么 |
 | 4 | 非 DeepSeek 的推理参数 | 只对 DeepSeek 发送 `reasoning_effort` | 按提供商映射 + 矩阵测试断言请求体 |
-| 5 | `settings.json` 明文 `api_key` | `provider_keys` 是 DPAPI 的，历史键是明文 | 迁移 + 回滚路径；旧设置仍能打开、无明文残留 |
-| 6 | 首次 GitHub CI 的红点 | `2d294a0` 的 windows/py3.12 红过一次，**原因未定位**（日志要认证） | 复发时用 `tools/ci_status.py` + check-run 摘要定位 |
-| 7 | 运行中关窗只在 Flask 层验证 | 打包 exe 上的运行中关窗未实测 | 手工：exe 跑一次审计 → 关窗 → 确认 `report.md` 写出 |
-| 8 | `reports/` 被 gitignore | 报告不进仓库 | 需要长期留存时搬进 `docs/` |
+| 5 | 首次 GitHub CI 的红点 | `2d294a0` 的 windows/py3.12 红过一次，**原因未定位** | 复发时用 `tools/ci_status.py --summaries` 读注解 |
+| 6 | `reports/` 被 gitignore | 报告不进仓库 | 需要长期留存时搬进 `docs/` |
 
 ---
 
