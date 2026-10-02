@@ -1147,7 +1147,15 @@ def _enumerate_common(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     words: list[str] = []
     for tier in tiers:
         words.extend(KB.PATH_TIERS[tier][:per_tier])
-    words = list(dict.fromkeys(words))
+    # 业务关键路径**无论选中哪些档位都要探**（只发 GET，不改数据）。
+    # 实测教训：真实模型显式挑档位时漏掉了 business，于是 business 档里的
+    # `/api/order`（越权读订单）两轮评测连一次尝试都没有——见 KB.BUSINESS_CRITICAL_PATHS。
+    critical = (
+        []
+        if args.get("include_critical") is False
+        else list(KB.BUSINESS_CRITICAL_PATHS)
+    )
+    words = list(dict.fromkeys(critical + words))
 
     baseline = _send(ctx, "GET", origin + KB.FAKE_404_RANDOM_PATHS[0])
     # 基线被限流时整轮枚举都不成立（"随便一个路径"拿到 429，后面每个 429 都不代表路径存在）。
@@ -2484,7 +2492,19 @@ def _leave_note(ctx: ToolRegistry, args: dict[str, Any]) -> str:
 
 
 def _record_coverage(ctx: ToolRegistry, args: dict[str, Any]) -> str:
-    """记录覆盖结论（对标 Strix 的 record_coverage），让报告能说清"没发现"的部分。"""
+    """记录覆盖结论（对标 Strix 的 record_coverage），让报告能说清"没发现"的部分。
+
+    这里有一道**一致性闸门**：如果这个对象上攻面已经记录了 `signal`（实测到异常），
+    而模型想写 `no_issue_found`/`ruled_out`（"测过没问题"），那就是一条自相矛盾的记录。
+    实测事故（`docs/EVAL.md` §4.1 第 1 条）：`/reflect` 上已记录 3 条 signal
+    （"payload 原样回显（未转义）"），而覆盖记录写的是 `no_issue_found`，
+    它的 detail 里还写着"两个 payload 均原样落进响应体"——报告于是同时说
+    "测到反射"和"无问题"，读者只会看到后者。
+
+    出路有两条：① 记成 finding/候选（未验证可执行性也要留证据）；
+    ② 确认不成立时，带上 `dismiss_signals` 说明为什么那些信号不算漏洞。
+    没法从 target 里认出端点时**不拦**（宁可漏拦，不靠猜否定结论）。
+    """
     target = str(args.get("target") or "").strip()
     status = str(args.get("status") or "").strip().lower()
     if not target:
@@ -2492,12 +2512,35 @@ def _record_coverage(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     allowed = ("reported", "no_issue_found", "ruled_out", "not_tested", "blocked")
     if status not in allowed:
         return f"错误：status 必须是 {', '.join(allowed)} 之一。"
+    dismissed = str(args.get("dismiss_signals") or "").strip()
+    if status in ("no_issue_found", "ruled_out"):
+        signals = ctx.surface.signals_for_target(target)
+        if signals and not dismissed:
+            listed = "；".join(
+                f"{item.category or '?'} @ {item.endpoint}"
+                + (f"（{item.detail[:60]}）" if item.detail else "")
+                for item in signals[:3]
+            )
+            return (
+                f"错误：{target} 上已有 {len(signals)} 条**实测信号**记录（{listed}），"
+                f"与 status={status}（测过没问题）矛盾，本次未记录。\n"
+                "二选一：\n"
+                "① 用 record_finding/记候选把它写下来（未验证可执行性也要留证据，"
+                "别让信号消失在覆盖记录里）；\n"
+                "② 若确认不是漏洞（例如只是字符串回显、被 CSP/转义挡住、参数不影响行为），"
+                "重发本次调用并带上 dismiss_signals=\"为什么这些信号不成立\"。"
+            )
     ctx.surface.record_coverage(
-        target, status, detail=str(args.get("detail") or ""), owasp=str(args.get("owasp") or "")
+        target,
+        status,
+        detail=str(args.get("detail") or ""),
+        owasp=str(args.get("owasp") or ""),
+        dismissed=dismissed,
     )
     summary = ctx.surface.coverage_summary()
+    suffix = f"（已复核信号后排除：{dismissed[:80]}）" if dismissed else ""
     return (
-        f"已记录覆盖：{target} → {status}。当前覆盖统计："
+        f"已记录覆盖：{target} → {status}{suffix}。当前覆盖统计："
         + "，".join(f"{k}={v}" for k, v in sorted(summary.items()))
     )
 
@@ -3094,8 +3137,11 @@ def _browser_verify_xss(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     else:
         lines.append(
             "\n入库建议：**不要**用 verified=true 报 XSS。"
-            f"当前级别 {verdict.level!r} 最多只能作为候选（verified 留空），"
-            "或改用 record_coverage(status=\"no_issue_found\") 记「未见可执行上下文」。"
+            f"当前级别 {verdict.level!r} 最多只能作为候选（verified 留空）。"
+            "若浏览器层确认没有可执行上下文（转义/CSP/进的是 textarea 之类），"
+            "用 record_coverage(status=\"no_issue_found\") 记「未见可执行上下文」，"
+            "并**必须**带上 dismiss_signals 说明为什么 fuzz 阶段的回显信号不算漏洞"
+            "（该端点上有实测 signal 时，没有这个理由会被拒绝记录）。"
         )
     return "\n".join(lines)
 
@@ -3175,9 +3221,13 @@ _DESC_DISCOVER_ENDPOINTS = (
 _DESC_ENUMERATE_COMMON = (
     "分档探测敏感/常见路径（带随机路径基线过滤假 404）。参数：{\"base_url\": 站点根URL, "
     "\"tiers\": [\"core\",\"leak\",\"admin\",\"framework\",\"api\",\"business\"], "
-    "\"limit_per_tier\": 每档条数(默认40)}。"
+    "\"limit_per_tier\": 每档条数(默认40), \"include_critical\": 是否带上业务关键路径(默认true)}。"
     "默认档位含 **business**（券码/余额/积分/下单/退款/限额/一次性令牌这类**会改状态**的入口）——"
     "竞态与业务逻辑问题只可能出现在这些路径上，别把它关掉。"
+    "此外**无论你选哪些档位**，都会一并探测十来条业务关键路径"
+    "（`/api/order`、`/api/users`、`/api/reset_token`、`/coupon`、`/cart` 等只有凭 id 就能读的入口，"
+    "越权/BOLA 高发区）——这些路径通常没有任何链接指向它们，漏掉就等于把越权面整块丢掉；"
+    "探测**只发 GET，不会改动目标数据**。"
     "返回非 404 命中（含内容特征），并对命中路径自动带出下一步建议。"
 )
 _DESC_READ_URLS = (
@@ -3248,8 +3298,11 @@ _DESC_LEAVE_NOTE = (
 _DESC_RECORD_COVERAGE = (
     "记录覆盖结论（让报告能说清哪些没覆盖）。参数：{\"target\": 被测对象(URL/参数/功能), "
     "\"status\": \"reported\"|\"no_issue_found\"|\"ruled_out\"|\"not_tested\"|\"blocked\", "
-    "\"detail\": 依据, \"owasp\": \"A01\" 等(可选)}。"
+    "\"detail\": 依据, \"owasp\": \"A01\" 等(可选), "
+    "\"dismiss_signals\": 该对象上已有实测信号、却确认不成立时的排除理由(可选)}。"
     "重点：测过没问题也要记（no_issue_found），确认不可利用记 ruled_out，没条件测记 not_tested。"
+    "**注意**：若该对象上已有 signal 记录（实测到异常），写 no_issue_found/ruled_out 会被拒绝——"
+    "要么把信号记成 finding/候选，要么带上 dismiss_signals 说明为什么信号不成立。"
 )
 _DESC_TASK_CREATE = (
     "建立任务清单。参数：{\"items\": [\"任务1\", \"任务2\"]}。把计划显式写下来再逐条推进。"

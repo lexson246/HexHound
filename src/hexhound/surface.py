@@ -66,16 +66,44 @@ def looks_like_url(value: str) -> bool:
         return False
     if _INVALID_IN_URL.search(text):
         return False
-    parsed = urlparse(text if "://" in text else "//" + text)
+    try:
+        parsed = urlparse(text if "://" in text else "//" + text)
+    except ValueError:
+        # netloc 里有 NFKC 会改写的字符（全角冒号/括号）——那一定不是 URL。
+        return False
     path = parsed.path or ""
     # 全角括号只会出现在中文说明里（URL 里要用也会被百分号编码）
     return not any(char in path for char in "（）")
 
 
+#: URL 里不该出现的字符：非 ASCII 可打印字符（全角冒号/括号、中文说明都会出现在这里）。
+_URL_TAIL = re.compile(r"[^\x21-\x7e]")
+
+
+def _url_path(text: str) -> str:
+    """取出 URL 的路径部分；解析不了就砍掉"人话尾巴"再试。
+
+    `urlparse` 在 netloc 含 NFKC 会改写的字符时**直接抛 ValueError**
+    （实测：模型把目标写成人话 `http://host：crawl 首页`，全角冒号进了 netloc，
+    整个 `_finalise_coverage` 因此崩掉——一个取值函数不该能炸掉整轮运行）。
+    这里逐次砍掉第一个非 ASCII 字符后重试，仍不行才认输返回 "/"。
+    """
+    candidate = str(text or "")
+    for _ in range(4):
+        try:
+            parsed = urlparse(candidate if "://" in candidate else "//" + candidate)
+            return parsed.path or "/"
+        except ValueError:
+            match = _URL_TAIL.search(candidate)
+            if match is None:
+                return "/"
+            candidate = candidate[: match.start()]
+    return "/"
+
+
 def normalize_path(url: str) -> str:
     """把 URL 归一成「同一条路径」：去掉 host、数字段折叠为 {n}、去掉末尾斜杠。"""
-    parsed = urlparse(url if "://" in url else "//" + url)
-    path = parsed.path or "/"
+    path = _url_path(url)
     path = _DIGIT.sub("{n}", path)
     if len(path) > 1 and path.endswith("/"):
         path = path.rstrip("/")
@@ -111,6 +139,44 @@ def host_of(url: str) -> str:
 def is_asset(url: str) -> bool:
     """判断是否为静态资源（不入攻面清单）。"""
     return bool(_ASSET_SUFFIX.search(urlparse(url).path or ""))
+
+
+#: 把自由文本切成片段的分隔符（`record_coverage` 的 target 是人话，不是 URL）。
+#: **不要切 `/`**：`/api/order` 会被切成两段，路径就没了。
+_TEXT_SPLIT = re.compile(r"[\s（()），,；;、]+")
+
+
+def _target_path_items(text: str) -> list[str]:
+    """按出现顺序抽出文本里的 URL/路径片段（原样，不归一化）。"""
+    items: list[str] = []
+    for chunk in _TEXT_SPLIT.split(str(text or "")):
+        chunk = chunk.strip().strip("。.!！?？\"'“”*`")
+        if "://" in chunk:
+            found = chunk
+        elif chunk.startswith("/") and len(chunk) > 1:
+            found = chunk
+        else:
+            continue
+        if found not in items:
+            items.append(found)
+    return items
+
+
+def target_paths(text: str) -> set[str]:
+    """从自由文本里抽出**归一化路径**，用于把覆盖记录与攻面里的端点对上。
+
+    `record_coverage` 的 target 是模型写的自然语言：
+    `"http://127.0.0.1:5000/api/order（参数 order_id）"`、`"POST /order/confirm"`、
+    `"认证与未授权访问"`。要判断"这条结论说的是哪个端点"，只能把其中的
+    URL/路径片段抽出来归一化——但**抽不出来就返回空集**，绝不去猜。
+    """
+    paths = {normalize_path(item) for item in _target_path_items(text)}
+    return {item for item in paths if item and item != "/"}
+
+
+def target_path_list(text: str) -> list[str]:
+    """同上，但保留**原始写法**（写进覆盖表时给人看的是 `/api/order`，不是 `/api/{n}`）。"""
+    return [item for item in _target_path_items(text) if normalize_path(item) != "/"]
 
 
 def param_names(url: str, extra: Iterable[str] = ()) -> list[str]:
@@ -284,6 +350,7 @@ class AttackSurface:
         *,
         detail: str = "",
         owasp: str = "",
+        dismissed: str = "",
     ) -> None:
         """记录一处「已测/未测/排除」的覆盖面。
 
@@ -291,6 +358,10 @@ class AttackSurface:
         `reported`（已报漏洞）/ `no_issue_found` / `ruled_out`（确认不可利用）/
         `not_tested` / `blocked`。没有这层记录，报告只能列"发现了什么"，
         说不清"还有哪些没覆盖"。
+
+        `dismissed` 只在"这个对象上**有实测信号**、但结论是没问题"时填写：
+        写明为什么那些信号不成立（例如"仅字符串回显，CSP 拦住内联脚本"）。
+        没有它就不能写 `no_issue_found`/`ruled_out`——见 `tools._record_coverage`。
         """
         target = str(target or "").strip()[:200]
         if not target:
@@ -302,15 +373,19 @@ class AttackSurface:
             key = f"{status}|{target}"
             entry = self.coverage.get(key)
             if entry is None:
-                self.coverage[key] = {
+                entry = {
                     "target": target,
                     "status": status,
                     "detail": str(detail or "")[:300],
                     "owasp": str(owasp or "")[:16],
+                    "dismissed": str(dismissed or "")[:200],
                     "at": time.time(),
                 }
+                self.coverage[key] = entry
             elif detail and detail[:60] not in str(entry.get("detail", "")):
                 entry["detail"] = (str(entry.get("detail", "")) + " | " + str(detail))[:300]
+            if dismissed and str(entry.get("dismissed") or "") != dismissed[:200]:
+                entry["dismissed"] = dismissed[:200]
 
     def coverage_summary(self) -> dict[str, int]:
         with self._lock:
@@ -331,8 +406,30 @@ class AttackSurface:
                 line += f" ({entry['owasp']})"
             if entry.get("detail"):
                 line += f" — {entry['detail'][:120]}"
+            if entry.get("dismissed"):
+                line += f"（已复核信号后排除：{entry['dismissed'][:100]}）"
             lines.append(line)
         return lines
+
+    def signals_for_target(self, target: str) -> list[Attempt]:
+        """该 target（覆盖记录里的一段人话）指向的端点上，已记录的 `signal` 尝试。
+
+        用途：拦住"实测有信号，结论却写没问题"的自相矛盾记录（见
+        `tools._record_coverage`）。target 里抽不出路径就返回空列表——
+        宁可漏拦，也不靠猜去否定模型的结论。
+        """
+        wanted = target_paths(target)
+        if not wanted:
+            return []
+        with self._lock:
+            hits = [
+                attempt
+                for attempt in self.attempts.values()
+                if attempt.outcome == "signal"
+                and normalize_path(attempt.endpoint) in wanted
+            ]
+        hits.sort(key=lambda item: item.at, reverse=True)
+        return hits
 
     def add_agent_note(self, worker: str, text: str) -> None:
         """子代理留下的一条结论/线索（跨代理可读，对标 Strix 的 notes 工具）。"""

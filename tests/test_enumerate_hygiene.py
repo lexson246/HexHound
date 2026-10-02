@@ -177,5 +177,101 @@ class EnumerateCommonHygieneTests(unittest.TestCase):
             self.assertNotIn("受保护", target)
 
 
+class _ApiOnlyHandler(BaseHTTPRequestHandler):
+    """模拟"没有链接的接口"：只有 `/api/order` 存在，其余 404。"""
+
+    def do_GET(self) -> None:  # noqa: N802 标准库回调名
+        if urlsplit(self.path).path == "/api/order":
+            payload = b'{"code":0,"data":{"order_id":"1001","owner":"alice"}}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        body = b"not found"
+        self.send_response(404)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args) -> None:  # noqa: D102 静音
+        return
+
+
+class DefaultEnumerationTiersTests(unittest.TestCase):
+    """业务关键路径必须**无论选中哪些档位都被探到**。
+
+    事实经过（`docs/EVAL.md` §4.1 第 2 条）：靶场有 `/api/order?order_id=`
+    （越权读他人订单，含手机号/地址），两轮真实模型评测都漏了。查 trace 发现
+    侦察子代理显式指定了 `tiers=["core","leak","framework","admin","api"]`——
+    **没带 business 档**，而 `/api/order` 正好在 business 档里（且在第 68/77 位，
+    默认 `limit_per_tier=40` 也截不到）。于是攻面里根本没有这个端点，
+    覆盖闸门与报告都看不见，"没测"在报告里被读成"没漏"。
+
+    结论：档位交给模型挑，等于让模型决定"哪些入口不算数"。
+    """
+
+    server: object = None
+    base = ""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _ApiOnlyHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        cls.server, cls.base = server, f"http://127.0.0.1:{server.server_port}"
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()  # type: ignore[attr-defined]
+
+    def run_enumerate(self, args: dict) -> tuple[str, AttackSurface]:
+        surface = AttackSurface(target=self.base, mode="blackbox")
+        registry = ToolRegistry(
+            base_dir=Path("."),
+            allowed_hosts=frozenset({"127.0.0.1", "localhost"}),
+            timeout=10,
+            mode="blackbox",
+            surface=surface,
+        )
+        return registry.execute("enumerate_common", {"base_url": self.base, **args}), surface
+
+    def test_critical_paths_are_probed_even_when_the_model_omits_business(self) -> None:
+        output, surface = self.run_enumerate(
+            {"tiers": ["core", "leak", "framework", "admin", "api"], "limit_per_tier": 5}
+        )
+        self.assertIn(f"{self.base}/api/order", surface.endpoints, output)
+
+    def test_critical_paths_can_be_turned_off_explicitly(self) -> None:
+        """显式关掉时才真的不探（给"我就想只跑某一档"的调用方留出口）。"""
+        _output, surface = self.run_enumerate(
+            {"tiers": ["core"], "limit_per_tier": 2, "include_critical": False}
+        )
+        self.assertNotIn(f"{self.base}/api/order", surface.endpoints)
+
+    def test_default_tiers_still_probe_the_business_tier(self) -> None:
+        output, _surface = self.run_enumerate({"limit_per_tier": 3})
+        self.assertIn("business", output)
+
+    def test_critical_paths_are_documented_in_the_tool_description(self) -> None:
+        from hexhound.tools import _DESC_ENUMERATE_COMMON
+
+        self.assertIn("业务关键路径", _DESC_ENUMERATE_COMMON)
+        self.assertIn("只发 GET", _DESC_ENUMERATE_COMMON)
+
+    def test_critical_set_is_small_and_read_only(self) -> None:
+        """这一撮路径要小而准：十来条、全是只读 GET 的入口，不做写操作。"""
+        from hexhound import knowledge as KB
+
+        paths = KB.BUSINESS_CRITICAL_PATHS
+        self.assertGreaterEqual(len(paths), 8)
+        self.assertLessEqual(len(paths), 20, "别把整张字典塞进来——成本与噪音都要控制")
+        self.assertIn("/api/order", paths)
+        for path in paths:
+            self.assertTrue(path.startswith("/"), path)
+        self.assertNotIn("/order/create", paths, "改状态的入口不进'强制探测'名单")
+
+
 if __name__ == "__main__":
     unittest.main()

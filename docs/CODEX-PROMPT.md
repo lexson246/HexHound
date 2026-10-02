@@ -20,7 +20,7 @@
 
 读完先用三条命令确认基线（把输出贴给我）：`python -m pytest tests`、
 `python -m ruff check src tests tools`、`python tools/ci_status.py`。
-期望是 **992 passed + 50 subtests passed / 1 skipped**、ruff 干净、CI 8/8 绿。
+期望是 **1018 passed + 59 subtests passed / 1 skipped**、ruff 干净、CI 8/8 绿。
 （`pytest` 别再补 `-q`：`addopts` 里已经是 `-q`，双重 `-qq` 会让它连汇总行都不打印。）
 数字对不上就先查原因，不要在我给的任务上继续。
 

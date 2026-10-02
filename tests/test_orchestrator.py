@@ -295,6 +295,118 @@ class UserStopSemanticsTests(unittest.TestCase):
         self.assertNotEqual(result.finish_reason, "cancelled")
 
 
+class AssignedButUntestedCoverageTests(unittest.TestCase):
+    """没以 `done` 收尾的子任务：它**点名要打却没碰过**的端点必须留下痕迹。
+
+    事实经过（`docs/EVAL.md` §4.1 第 2 条，两轮 live 评测）：越权任务
+    （objective 里写着打 `/api/order` 的越权）以 `closing_no_finish` 收尾，
+    而 `closing_no_finish` 在 `CLOSED_OUTCOMES` 里——于是收尾阶段既不写
+    "子任务未收尾"的覆盖行，攻面里也没有 `/api/order` 的尝试记录。
+    报告读起来就像"这个面测过了、没漏洞"，实际是**没人测**。
+
+    这里钉住：未收尾任务点名的端点在既没尝试、也没结论时，被写成 `not_tested`；
+    已经尝试过/已有结论的不重复写；正常收尾（done）的任务不替它补。
+    """
+
+    def make(self, **overrides) -> Orchestrator:
+        settings = {
+            "target": TARGET,
+            "goal": "测试未收尾任务的覆盖留痕",
+            "mode": "blackbox",
+            "base_dir": Path("."),
+            "allowed_hosts": ALLOWED,
+            "timeout": 1,
+            "max_tasks": 1,
+            "task_steps": 4,
+            "parallel": 1,
+            "budget": Budget(BudgetLimits(max_tool_calls=200)),
+        }
+        settings.update(overrides)
+        return Orchestrator(ScriptedLLM(), **settings)
+
+    def finalise(self, orchestrator: Orchestrator, task: WorkerTask) -> dict[str, str]:
+        orchestrator._finalise_coverage([], [task])
+        return {
+            str(entry.get("target")): str(entry.get("status"))
+            for entry in orchestrator.surface.coverage.values()
+        }
+
+    def test_endpoints_named_by_an_unfinished_task_are_marked_not_tested(self) -> None:
+        orchestrator = self.make()
+        task = WorkerTask(
+            id="R-1", role="auth", steps=6,
+            objective="打越权：无凭据读 /api/order 的他人订单，并测 /api/users 未授权访问",
+        )
+        task.outcome = "closing_no_finish"
+        coverage = self.finalise(orchestrator, task)
+        self.assertEqual(coverage.get("/api/order"), "not_tested")
+        self.assertEqual(coverage.get("/api/users"), "not_tested")
+
+    def test_attempted_endpoints_are_not_marked_not_tested(self) -> None:
+        """试过了就不是"没测"——哪怕没形成结论，也不能写成 not_tested。"""
+        orchestrator = self.make()
+        orchestrator.surface.mark_attempt(
+            TARGET + "/api/order", "idor", param="order_id", outcome="no_signal",
+        )
+        task = WorkerTask(id="R-2", role="auth", objective="读 /api/order 与 /api/users")
+        task.outcome = "closing_no_finish"
+        coverage = self.finalise(orchestrator, task)
+        self.assertNotIn("/api/order", coverage)
+        self.assertEqual(coverage.get("/api/users"), "not_tested")
+
+    def test_settled_endpoints_are_not_marked_not_tested(self) -> None:
+        orchestrator = self.make()
+        orchestrator.surface.record_coverage(TARGET + "/api/users", "ruled_out", detail="403")
+        task = WorkerTask(id="R-3", role="auth", objective="读 /api/users")
+        task.outcome = "max_steps"
+        coverage = self.finalise(orchestrator, task)
+        self.assertEqual(coverage.get(TARGET + "/api/users"), "ruled_out")
+        self.assertNotIn("/api/users", coverage)
+
+    def test_done_tasks_are_left_alone(self) -> None:
+        """正常收尾的任务由模型自己写覆盖——别替它补一堆 not_tested 淹掉真盲区。"""
+        orchestrator = self.make()
+        task = WorkerTask(id="R-4", role="auth", objective="读 /api/order 与 /api/users")
+        task.outcome = "done"
+        coverage = self.finalise(orchestrator, task)
+        self.assertEqual(coverage, {})
+
+    def test_aborted_task_gets_both_rows(self) -> None:
+        """被打断的任务：既记"子任务 blocked"，也记它没碰过的端点。"""
+        orchestrator = self.make()
+        task = WorkerTask(id="R-5", role="injection", objective="打 /ssti 的模板注入")
+        task.outcome = "failed"
+        task.error = "模型调用失败"
+        coverage = self.finalise(orchestrator, task)
+        self.assertEqual(coverage.get("/ssti"), "not_tested")
+        self.assertEqual(coverage.get("子任务 R-5（injection）"), "blocked")
+
+    def test_prose_objective_marks_nothing(self) -> None:
+        orchestrator = self.make()
+        task = WorkerTask(id="R-6", role="auth", objective="排查认证与授权面的常见问题")
+        task.outcome = "closing_no_finish"
+        self.assertEqual(self.finalise(orchestrator, task), {})
+
+    def test_at_most_six_endpoints_per_task(self) -> None:
+        """任务目标里点一堆路径时不许刷屏——覆盖率表是给人看的。"""
+        orchestrator = self.make()
+        names = ["/alpha", "/bravo", "/charlie", "/delta", "/echo", "/foxtrot", "/golf", "/hotel"]
+        task = WorkerTask(id="R-7", role="recon", objective="枚举 " + "、".join(names))
+        task.outcome = "provider_error"
+        coverage = self.finalise(orchestrator, task)
+        marked = [key for key, status in coverage.items() if status == "not_tested" and key in names]
+        self.assertEqual(len(marked), 6)
+
+    def test_numeric_paths_are_written_as_they_were_named(self) -> None:
+        """数字段折叠只用于**比对**，写进报告的是原样路径（`/order/1001`，不是 `/order/{n}`）。"""
+        orchestrator = self.make()
+        task = WorkerTask(id="R-8", role="auth", objective="读 /order/1001 与 /order/1002")
+        task.outcome = "closing_no_finish"
+        coverage = self.finalise(orchestrator, task)
+        # 两条数字路径归一化后是同一条：只记一次，且按原样写
+        self.assertEqual([key for key in coverage if key.startswith("/order")], ["/order/1001"])
+
+
 class OrchestratorTests(unittest.TestCase):
     def make(self, **overrides) -> Orchestrator:
         settings = {

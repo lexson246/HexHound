@@ -28,7 +28,7 @@ HexHound 是一个 **LLM 驱动的黑盒 Web 安全审计 Agent**：编排者把
 
 | 项 | 状态 | 证据 |
 | --- | --- | --- |
-| 测试 | **992 passed + 50 subtests passed / 1 skipped** | `python -m pytest tests`（别再补 `-q`：`addopts` 已有 `-q`，双重 `-qq` 会让 pytest 连汇总行都不打印） |
+| 测试 | **1018 passed + 59 subtests passed / 1 skipped** | `python -m pytest tests`（别再补 `-q`：`addopts` 已有 `-q`，双重 `-qq` 会让 pytest 连汇总行都不打印） |
 | 代码风格 | 干净 | `python -m ruff check src tests tools` |
 | 本地 CI 执行器 | **Windows 作业真跑；Linux 作业是 SKIP**（见下） | `python tools/run_ci_locally.py --all` |
 | GitHub CI | **8/8 绿** | `python tools/ci_status.py --sha e6e2431` |
@@ -362,6 +362,36 @@ fuzz / compare / auth / creds / headers 全按"受阻、未完成"处理；
 `record_finding`，所以判分也认这种**结构化**命中（`coverage_mentions`：只认
 `status=reported` + target 命中端点路径，不从自由文本里猜）。
 
+### 6.13 覆盖记录把实测信号洗成"无问题"（live 评测发现）
+
+**症状**：`/reflect` 上攻面已记录 3 条 `signal`（"payload 原样回显（未转义）"），
+覆盖记录却写 `no_issue_found`，而它的 detail 里正是那个未转义回显——
+报告同时说"测到反射"和"测过没问题"，读者只会看到后者。
+**守卫**：`tools._record_coverage` 在写 `no_issue_found`/`ruled_out` 前查该对象上的 signal，
+有就**拒绝**并给两条出路（记成候选/finding，或带 `dismiss_signals` 说明为什么不成立）；
+理由写进覆盖行（`（已复核信号后排除：…）`）。target 认不出端点时不拦——
+宁可漏拦，不靠猜否定结论。回归：`tests/test_coverage_consistency.py`（13 条）。
+
+**同一批还修了一个会炸整轮运行的真 bug**：`surface.normalize_path()` 遇到人话 URL
+（`http://host：crawl 首页`，全角冒号进了 netloc）时 `urlparse` 抛 `ValueError`，
+直接把 `_finalise_coverage` 干崩。现在砍掉非 ASCII 尾巴重试，`looks_like_url` 判 False。
+
+### 6.14 档位由模型挑，于是整个越权面被漏掉（live 评测发现）
+
+**症状**：两轮真实模型评测都漏了 `/api/order` 越权。查 trace：侦察子代理显式挑了
+`["core","leak","framework","admin","api"]`，**没带 business 档**；
+`/api/order` 在 business 档第 68/77 位（默认 `limit_per_tier=40` 也截不到）——
+端点**根本没被发现**，攻面里是空的，报告读起来像"这个面没漏洞"。
+**守卫**：`knowledge.BUSINESS_CRITICAL_PATHS`（12 条只读、凭 id 就能读的入口）
+**无论调用方选哪些档位都会探**，非 ASCII 说明写在工具描述里；
+`include_critical=false` 才关。零额度验证：脚本档一次运行里
+`/api/order` 从 0 端点/0 尝试 → 1/1。回归：
+`tests/test_enumerate_hygiene.py::DefaultEnumerationTiersTests`（5 条）。
+
+**配套**：没以 `done` 收尾的任务（含算"已收尾"的 `closing_no_finish`），
+把它点名却没碰过的端点写成 `not_tested`（`_mark_assigned_but_untested`，每任务 ≤6 条）。
+回归：`tests/test_orchestrator.py::AssignedButUntestedCoverageTests`（8 条）。
+
 - **目标流量默认直连**（`trust_env=False`）：系统代理会把整轮扫描打成 502。
   要代理就用显式配置；LLM 调用与目标流量是两套。
 - **死代理自动绕开**：`llm._dead_proxy_detail()` 检测到"配了代理但端口连不上"时直连并
@@ -377,8 +407,9 @@ fuzz / compare / auth / creds / headers 全按"受阻、未完成"处理；
 | # | 事项 | 现状 | 验收标准 |
 | --- | --- | --- | --- |
 | 0 | ~~**带标准答案的多场景评测**（检出率/误报率/耗时/成本）~~ **已完成** | `tools/eval_scenarios.py` + `evals/scenarios.json`（12 场景，标准答案来自 vulnlab 的已知漏洞）+ 口径测试。引擎层实测 检出 100% / 误报 0%；Agent 层脚本 LLM 12.5%（是管道指标，不是能力指标）；**真实模型那一档已跑两轮**：75% / 误报 0%，¥0.4158 + ¥0.4357，351.8s + 407.2s（`--tier agent --llm live --allow-live`） | 详见 `docs/EVAL.md` §4 |
-| 0b | **覆盖记录与攻面证据自相矛盾**（live 评测发现，**未修**） | 攻面记了 3 条 `signal`（未转义回显），覆盖记录却写 `no_issue_found`，detail 里描述的正是那个未转义回显 | 有 `signal` 的端点不许停在 `no_issue_found`：要么升为候选/漏洞，要么带上明确的排除理由。测在**记录层**（覆盖写入路径），不是报告渲染层 |
-| 0c | **子任务超步数后不留"没测过"的痕**（live 评测发现，**未修**） | 两轮都漏 `/api/order` 越权：任务 `closing_no_finish` 收尾，该端点既无 attempt 也无 `not_tested` 覆盖行 → 覆盖率闸门与报告都看不见这块盲区 | 子任务没交结论时，把它被分配却没试过的端点写成 `not_tested`，报告覆盖率行按"未触及"计入而不是省略 |
+| 0b | ~~**覆盖记录与攻面证据自相矛盾**（live 评测发现）~~ **已修** | 攻面记了 3 条 `signal`（未转义回显），覆盖记录却写 `no_issue_found` | 记录层闸门：有 signal 时拒绝写 `no_issue_found`/`ruled_out`，除非带 `dismiss_signals`（理由随覆盖行进报告）。`tests/test_coverage_consistency.py`（13 条） |
+| 0c | ~~**子任务没跑完不留"没测过"的痕**（live 评测发现）~~ **已修** | 真根因更狠：侦察子代理自己挑档位时漏了 `business`，而 `/api/order` 在 business 档第 68/77 位——**端点根本没被发现**；`closing_no_finish` 又算"已收尾"，于是一片空白 | ① `knowledge.BUSINESS_CRITICAL_PATHS`（12 条只读、凭 id 就能读的入口）**无论选哪些档位都探**（`include_critical=false` 可关）；② 没以 `done` 收尾的任务，把它点名却没碰过的端点写成 `not_tested`。零额度验证：`/api/order` 从 0 端点/0 尝试 → 1/1 |
+| 0d | **字典发现的端点没有参数信息**（未修） | `/api/order` 登记时无参数，"该用 `order_id` 测"仍靠模型猜 | 按路径名词猜参数（`/api/order` → `order_id`）要单开字段与披露口径，不能把猜测混进事实层 |
 | 1 | `closing_no_finish` 占比 | 约 10%（模型不主动交总结，系统代写）；已把**最后一步**预留给收尾动作 | 一次真实运行里该终态 < 3%；或证明为什么降不下去 |
 | 2 | 关窗 45 秒上限 | `HEXHOUND_CLOSE_GRACE`；沙箱命令现在可被中断（实测 10 秒内退出） | 已在打包 exe 上验收（10/10）；剩余是把上限调到"不急不躁"的默认值 |
 | 3 | `memory/<host>.json` 无修剪 | 陈旧条目每次 diff 都以 `unknown` 复现 | `tests/test_diff.py` 加"已解决条目不再出现"；`hexhound memory` 报出修剪了什么 |

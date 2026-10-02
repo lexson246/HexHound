@@ -39,7 +39,13 @@ from .replan import (
 )
 from .sandbox import sandbox_report
 from .supervisor import Supervisor
-from .surface import AttackSurface, normalize_endpoint, sort_urls
+from .surface import (
+    AttackSurface,
+    normalize_endpoint,
+    normalize_path,
+    sort_urls,
+    target_path_list,
+)
 from .tools import ToolRegistry
 from .trace import TraceRecorder, summarize_trace, write_snapshot
 
@@ -455,7 +461,9 @@ def _fallback_plan(
             role="recon",
             objective=(
                 f"侦察 {target}：crawl 首页拿链接/表单/参数与技术栈，"
-                "enumerate_common 探测 core+leak+admin+framework 档位，"
+                "enumerate_common 探测 core+leak+admin+framework 档位"
+                "（**另加 business 档**：券码/订单/余额类入口常常没有任何链接，"
+                "只能靠字典探出来；工具还会强制带上业务关键路径，不必自己挑），"
                 "read_urls 读同域 JS 找接口与硬编码密钥，把可疑点用 leave_note 留给注入角色。"
             ),
             url=target,
@@ -1871,6 +1879,47 @@ class Orchestrator:
                     "not_tested",
                     detail=detail,
                 )
+            # 光记"子任务没跑完"还不够：报告读者要知道**哪些端点**因此没了结论。
+            # 任务目标里点名的端点，如果既没有尝试记录、也没有结论，就是
+            # "分配过但没测"的盲区——写进覆盖表，覆盖率闸门与报告才看得见。
+            # （live 评测实测：越权任务以 `closing_no_finish` 收尾——它在
+            #  `CLOSED_OUTCOMES` 里，于是上面这条 `not_tested` 根本没写；
+            #  任务点名要打的 `/api/order` 在攻面里连端点都没有，
+            #  报告里读起来就像"这个面测过了、没漏洞"。）
+            if task.outcome != "done":
+                self._mark_assigned_but_untested(task, attempted)
+
+    def _mark_assigned_but_untested(self, task: WorkerTask, attempted: set[str]) -> None:
+        """把"任务点名要打、但既没试过也没结论"的端点写成 `not_tested`（最多 6 条）。
+
+        只对**没以 `done` 收尾**的任务做：那类任务的覆盖情况不可信，不能让
+        "任务里提过的端点"在报告里消失。正常收尾的任务由模型自己的
+        `record_coverage` 负责——不去替它补，否则会把"模型有意跳过的低价值路径"
+        也写成一堆 `not_tested`，把真正的盲区淹掉。
+        """
+        settled = {
+            normalize_path(str(entry.get("target") or ""))
+            for entry in self.surface.coverage.values()
+            if str(entry.get("status") or "") in ("reported", "no_issue_found", "ruled_out")
+        }
+        attempted_paths = {normalize_path(endpoint) for endpoint in attempted}
+        marked = 0
+        already: set[str] = set()
+        for raw in target_path_list(task.objective):
+            if marked >= 6:
+                break
+            path = normalize_path(raw)
+            # `/order/1001` 与 `/order/1002` 归一化后是同一条路径：只记一次，
+            # 按任务里的原样写法写（报告里给人看的是 `/order/1001`）。
+            if path in settled or path in attempted_paths or path in already:
+                continue
+            self.surface.record_coverage(
+                raw,
+                "not_tested",
+                detail=f"子任务 {task.id}（{task.role}）未收尾，该端点未形成结论",
+            )
+            already.add(path)
+            marked += 1
 
     def run(self) -> AgentResult:
         """完整流程：规划 → 第一波 → 补扫 → 复核波 → 汇总 → 落盘记忆。

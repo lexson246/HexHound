@@ -289,6 +289,31 @@ PATH_TIERS: dict[str, list[str]] = {
     "business": BUSINESS_PATHS,
 }
 
+# 「无论选中哪些档位都要探」的业务关键路径。
+#
+# 为什么需要它（live 评测实测，`docs/EVAL.md` §4.1 第 2 条）：真实模型在侦察时
+# 显式指定了 `["core","leak","framework","admin","api"]`——**没带 business 档**，
+# 而靶场的 `/api/order?order_id=`（越权读他人订单，含手机号/地址）正好在 business 档里。
+# 结果两轮评测里这个端点连一次尝试都没有：攻面里没有它，覆盖闸门与报告都看不见，
+# "没测"在报告里被读成"没漏"。档位交给模型挑，就等于让模型决定"哪些入口不算数"。
+#
+# 这一小撮路径的共同点：**只有凭 id 就能读的入口**（越权/BOLA 高发区），
+# 且成本极低（十来条 GET）。探测只发 GET，不改任何数据。
+BUSINESS_CRITICAL_PATHS: list[str] = [
+    "/api/order",
+    "/api/orders",
+    "/api/user",
+    "/api/users",
+    "/api/profile",
+    "/api/account",
+    "/api/invoice",
+    "/api/reset_token",
+    "/coupon",
+    "/cart",
+    "/order/prepare",
+    "/order/confirm",
+]
+
 # 兼容旧常量名（老代码 / README 里提到 COMMON_PATHS）。
 COMMON_PATHS: list[str] = CORE_PATHS + LEAK_PATHS[:14] + ADMIN_PATHS[:6] + FRAMEWORK_PATHS[:6]
 

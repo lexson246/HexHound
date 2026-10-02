@@ -361,21 +361,33 @@ check the proxy first.
 9. 🔶 **XSS stops at string reflection** unless playwright + Edge/Chrome are present; the report
    states the weaker conclusion when they are not.
 10. ❌ **`reports/` is gitignored**; copy anything that must survive into `docs/`.
-11. ❌ **Coverage rows are not checked against the run's own evidence.** Live eval run #2: the
+11. ✅ **Coverage rows are checked against the run's own evidence.** Live eval run #2: the
     surface recorded three `signal`s for `/reflect` ("payload 原样回显（未转义）"), while the
-    coverage row for that endpoint says `no_issue_found` — and its own detail text describes the
-    unescaped reflection landing in `<h1>`. One record, two contradictory statements; the report
-    then reads as "XSS tested, nothing found". A string-level reflection should be recorded as a
-    **candidate** ("not verified executable in a browser"), never as a neutral conclusion.
-    Acceptance: a run whose attempts contain a `signal` cannot leave that endpoint at
-    `no_issue_found` — either it becomes a candidate/finding, or the row must carry an explicit
-    reason the signal was dismissed.
-12. ❌ **A sub-task that runs out of steps leaves no trace of what it never reached.**
-    Both live runs missed `/api/order` (IDOR): the auth sub-task ended `closing_no_finish`, the
-    endpoint appears in **no** attempt row and in **no** coverage row, so the coverage gate and
-    the report cannot see the blind spot. Acceptance: when a sub-task ends without a conclusion,
-    the endpoints it was assigned but never attempted are recorded as `not_tested`, and the
-    report's coverage line counts them as unattempted rather than omitting them.
+    coverage row for that endpoint said `no_issue_found` — and its own detail described the
+    unescaped reflection landing in `<h1>`. One record, two contradictory statements.
+    Fixed at the **recording layer**: `tools._record_coverage` refuses a
+    `no_issue_found`/`ruled_out` verdict while `signal` attempts exist for that object, and
+    names the two ways out (record it as a candidate/finding, or re-send with
+    `dismiss_signals="why those signals do not hold"`). The reason travels with the row into
+    the report. A target the code cannot resolve to an endpoint is **not** blocked — better to
+    miss a contradiction than to overrule a conclusion by guesswork.
+    Tests: `tests/test_coverage_consistency.py` (13).
+12. ✅ **An unfinished sub-task now leaves a trace of what it never reached.**
+    Both live runs missed `/api/order` (IDOR). Two causes, both fixed:
+    (a) the endpoint was never **discovered** — the recon agent picked the tiers itself and left
+    out `business`, and `/api/order` sits at index 68/77 (past the default `limit_per_tier=40`);
+    `knowledge.BUSINESS_CRITICAL_PATHS` (12 read-only id-addressable entry points) is now probed
+    **regardless of the tiers the caller picks** (`include_critical=false` opts out);
+    (b) `closing_no_finish` counts as a closed outcome, so nothing recorded the endpoints that
+    task had named but never touched — `orchestrator._mark_assigned_but_untested()` now writes
+    them as `not_tested` (≤6 per task, skipped when attempted or already concluded).
+    Zero-quota evidence: `/api/order` went from 0 endpoints / 0 attempts to 1 / 1 in a scripted
+    run. Tests: `tests/test_enumerate_hygiene.py::DefaultEnumerationTiersTests` (5),
+    `tests/test_orchestrator.py::AssignedButUntestedCoverageTests` (8).
+13. ❌ **Dictionary-discovered endpoints carry no parameter knowledge.** `/api/order` is
+    registered without params, so "test it with `order_id`" still depends on the model guessing.
+    A path-vocabulary mapping (`/api/order` → `order_id`) is the obvious next step, but it puts a
+    guess into the fact layer and needs its own field plus disclosure rules.
 
 
 ---
@@ -405,13 +417,17 @@ check the proxy first.
    cleared on load). Tests: `tests/test_provider_key_store.py` (9), including the
    "typing a new key for one provider must not wipe the others" case; the migration test is
    platform-branched because a non-DPAPI host cannot encrypt.
-9. ❌ **Make coverage rows agree with the surface evidence** (§10.11). Acceptance: a run whose
-   attempts contain a `signal` cannot leave that endpoint at `no_issue_found`; the row becomes a
-   candidate/finding or carries an explicit reason for dismissal. Test at the recording layer
-   (coverage write path), not in the report renderer.
-10. ❌ **Record untested endpoints for unfinished sub-tasks** (§10.12). Acceptance: a sub-task that
-   ends `closing_no_finish` still causes its assigned-but-unattempted endpoints to appear as
-   `not_tested` in the surface and in the report's coverage line.
+9. ✅ **Make coverage rows agree with the surface evidence** (§10.11). Done: the recording-layer
+   gate in `tools._record_coverage` (`dismiss_signals` is the documented escape hatch), with the
+   dismissal rendered into the report's coverage lines. Tests:
+   `tests/test_coverage_consistency.py`.
+10. ✅ **Record untested endpoints for unfinished sub-tasks** (§10.12). Done:
+   `orchestrator._mark_assigned_but_untested()` for every task that does not end `done`, plus
+   `knowledge.BUSINESS_CRITICAL_PATHS` so the id-addressable entry points are probed no matter
+   which tiers a caller picks. Tests: `tests/test_orchestrator.py::AssignedButUntestedCoverageTests`,
+   `tests/test_enumerate_hygiene.py::DefaultEnumerationTiersTests`.
+11. ❌ **Path-derived parameter suggestions** (§10.13) so a dictionary-discovered endpoint like
+   `/api/order` arrives with a candidate parameter name instead of none.
 
 When you finish any of these: update `README.md` **and** `README_ZH.md` in the same change, keep the
 "measured, not claimed" tone, and re-run §8.
@@ -538,11 +554,25 @@ and `sanitize.decode_console_output()`.
 Two live runs, both 6/8 with zero false positives, but **not the same six** — the injection
 scenarios are stable, the authorization ones are not. Both misses were diagnosed from the run
 artifacts without spending more quota, and neither is "the model did not look": one is a coverage
-row that contradicts the surface evidence, the other a sub-task that ran out of steps and left no
-trace. They are filed as §10.11 and §10.12 with acceptance criteria. The first live run also
-exposed an evaluation bug (memory not isolated → the run became a regression retest of the
-developer's own history) which is fixed and pinned by `MemoryIsolationTests` — the fix did **not**
-move the score (both runs are 6/8); it made the number comparable across machines.
+row that contradicted the surface evidence, the other an endpoint a task was told to attack but
+never reached. Both are now **fixed** (§10.11, §10.12):
+
+- coverage rows can no longer contradict the surface: `_record_coverage` refuses a
+  `no_issue_found`/`ruled_out` verdict while `signal` attempts exist for that object, unless the
+  caller supplies `dismiss_signals` (and that reason is rendered into the report);
+- `knowledge.BUSINESS_CRITICAL_PATHS` (12 read-only id-addressable entry points, `/api/order`
+  among them) is probed whatever tiers a caller asks for — the recon agent had picked five tiers
+  and left out `business`, which is where `/api/order` lives (index 68/77, past the default
+  per-tier cut). This was the actual root cause: the endpoint was never discovered at all;
+- a task that does not end `done` (including `closing_no_finish`, which counts as *closed*)
+  now has the endpoints it named but never touched written as `not_tested`.
+
+Zero-quota evidence: in a scripted run `/api/order` went from **0 endpoints / 0 attempts** to
+**1 / 1**. The live score has **not** been re-measured — that costs another ~¥0.44 and is waiting
+on the user. The first live run also exposed an evaluation bug (memory not isolated → the run
+became a regression retest of the developer's own history) which is fixed and pinned by
+`MemoryIsolationTests` — the fix did **not** move the score (both runs are 6/8); it made the
+number comparable across machines.
 
 Scoring was tightened in the same change: a "hit" needs the endpoint path **and** the vulnerability
 type, both for findings and for `reported` coverage rows. Without the type check the scripted tier
@@ -551,6 +581,12 @@ scored 37.5% instead of 12.5%, because the scripted model writes `status=reporte
 live runs offline under the stricter rule changes nothing (all 12 credited hits across the two runs
 came from findings/candidates, none from coverage rows).
 
+One real crash was found and fixed on the way: `surface.normalize_path()` let a `ValueError` from
+`urlparse` escape when a task objective embedded "人话" in a URL (`http://host：crawl 首页`, the
+full-width colon landing in the netloc), which took down `_finalise_coverage` — a value helper
+must not be able to kill a run. It now retries after trimming the non-ASCII tail, and
+`looks_like_url()` returns `False` for the same input.
+
 Test/lint state at the end of this round: `python -m pytest tests` →
-**992 passed, 50 subtests passed, 1 skipped** (run `-q` twice and pytest prints no totals —
+**1018 passed, 59 subtests passed, 1 skipped** (run `-q` twice and pytest prints no totals —
 `addopts` already contains `-q`, so pass no extra `-q`); `ruff check src tests tools` clean.

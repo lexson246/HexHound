@@ -307,6 +307,9 @@ __SCRIPT_REQUIREMENT__
 - 每个确认的漏洞：record_finding(..., verified=true, evidence_ref=[...], verification="复现步骤")。
 - 测过但没问题的：record_coverage(status="no_issue_found") 或 "ruled_out"。
   并发测过没问题就写 "并发 N=10 无重复发放" 这类**可核对**的结论，不要只写"无问题"。
+  **但如果这个对象上已经记录过 signal**（比如 fuzz 报过"payload 原样回显"），
+  写"没问题"会被拒绝：要么把信号记成候选/finding（未验证可执行性也要留证据），
+  要么带上 dismiss_signals="为什么这些信号不成立"（如"仅字符串回显、CSP 拦住内联脚本"）。
 - 结束时调用 finish_task。"""
 
 SYSTEM_PROMPT_AUTH = """<role>你是授权渗透测试中的**认证与越权子代理**（auth）。你专测「谁能看到什么」。</role>
