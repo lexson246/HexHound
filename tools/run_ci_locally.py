@@ -103,12 +103,15 @@ def _run_step(command: str, shell_hint: str, env: dict) -> int:
     return result.returncode
 
 
-def run_job(job_id: str, job: dict, workflow: dict, matrix: dict[str, str], force: bool) -> bool:
+def run_job(job_id: str, job: dict, workflow: dict, matrix: dict[str, str], force: bool) -> bool | None:
     target = _job_target(job, matrix)
     host = _host_kind()
     if target != host and not force:
         print(f"跳过作业 {job_id}：它跑在 {target}，本机是 {host}（用 --force 可强行执行，结果不可信）")
-        return True
+        # 三态：True 通过 / False 失败 / **None 未执行**。
+        # 返回 True 会让汇总额把它印成 PASS——实测因此把"没跑 Linux 作业"
+        # 误当成"Linux 也通过了"（CI 抓到的假绿）。
+        return None
     print("=" * 78)
     print(f"作业 {job_id}（runs-on={job.get('runs-on')}）")
     if matrix:
@@ -235,7 +238,7 @@ def main(argv: list[str]) -> int:
             matrix[key.strip()] = value.strip()
 
     selected = list(jobs) if args.all else [args.job]
-    results: dict[str, bool] = {}
+    results: dict[str, bool | None] = {}
     with _with_hidden_dotenv(not args.keep_dotenv):
         for job_id in selected:
             job = jobs.get(job_id)
@@ -248,13 +251,26 @@ def main(argv: list[str]) -> int:
     print("=" * 78)
     print(f"本地 CI 汇总（HEAD={_checkout_ref()}{'（工作树有未提交改动）' if _dirty() else ''}）")
     for job_id, ok in results.items():
-        print(f"  {'PASS' if ok else 'FAIL'}  {job_id}")
-    failed = [job_id for job_id, ok in results.items() if not ok]
+        mark = "PASS" if ok else ("SKIP" if ok is None else "FAIL")
+        print(f"  {mark}  {job_id}")
+    skipped_jobs = [job_id for job_id, ok in results.items() if ok is None]
+    failed = [job_id for job_id, ok in results.items() if ok is False]
+    if skipped_jobs:
+        print(
+            f"\n未执行的作业（平台不匹配）：{', '.join(skipped_jobs)}"
+            "——**这些没有被验证**，别当成通过。"
+        )
     if failed:
         print(f"\n失败的作业：{', '.join(failed)}")
         return 1
-    print("\n全部通过。注意：这仍**不等于** GitHub runner 上的结果——")
-    print("runner 镜像的预装工具、权限与网络都不同；真正的判定要看 GitHub 上的这一次运行。")
+    if skipped_jobs:
+        print(
+            f"\n通过：{len(results) - len(skipped_jobs)}/{len(results)} 个作业真的在本机跑了；"
+            f"{len(skipped_jobs)} 个因平台不匹配未执行（见上）。"
+        )
+    else:
+        print("\n全部通过。注意：这仍**不等于** GitHub runner 上的结果——")
+        print("runner 镜像的预装工具、权限与网络都不同；真正的判定要看 GitHub 上的这一次运行。")
     return 0
 
 

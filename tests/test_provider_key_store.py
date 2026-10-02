@@ -72,7 +72,14 @@ class ProviderKeyStoreTests(unittest.TestCase):
         self.assertIn("not-a-real-blob", self.settings.read_text(encoding="utf-8"))
 
     def test_legacy_plaintext_api_key_is_migrated_and_cleared(self) -> None:
-        """旧文件里的明文 `api_key` → 迁进 provider_keys，明文键清空、不再落盘。"""
+        """旧文件里的明文 `api_key` → 迁进 provider_keys，明文键清空、不再落盘。
+
+        **按平台分别断言**（CI 的 ubuntu 作业抓到过这条：Windows 上有 DPAPI，
+        明文不会落盘；非 Windows 没有 DPAPI，`provider_keys` 本身就是明文——
+        那是 `secretstore` 明确声明的契约，不是缺陷）。这里要钉住的是
+        "遗留的 `api_key` 字段被清空、密钥迁进 provider_keys"，
+        而不是"文件里一定没有明文"。
+        """
         self.settings.write_text(
             json.dumps(
                 {"provider": "deepseek", "api_key": FAKE_DEEPSEEK, "provider_keys": "{}"},
@@ -84,7 +91,12 @@ class ProviderKeyStoreTests(unittest.TestCase):
         data = self.read_file()
         self.assertEqual(str(data.get("api_key") or ""), "", "明文 api_key 必须被清空")
         self.assertEqual(self.read_keys().get("deepseek"), FAKE_DEEPSEEK)
-        self.assertNotIn(FAKE_DEEPSEEK, json.dumps(data, ensure_ascii=False))
+        available, _reason = secretstore.protection_available()
+        if available:
+            self.assertNotIn(FAKE_DEEPSEEK, json.dumps(data, ensure_ascii=False))
+        else:
+            # 无 DPAPI：明文落盘是已知行为，但**遗留字段**仍然必须是空的
+            self.assertNotIn("api_key", {key for key, value in data.items() if value})
 
     def test_migration_keeps_other_providers(self) -> None:
         gui._store_provider_key("qwen", FAKE_QWEN)
