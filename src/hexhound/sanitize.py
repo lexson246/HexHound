@@ -117,6 +117,56 @@ def _noise(text: str) -> int:
     return text.count("\ufffd") + text.count("\x00")
 
 
+def decode_console_output(raw: bytes | str | None) -> str:
+    """本机控制台命令输出的解码：**先按系统代码页，再按 UTF-8/UTF-16**。
+
+    为什么不能直接用 `subprocess.run(..., text=True)`（实测事故，中文 Windows）：
+    `route` / `ipconfig` / `docker info` / Edge 截图这类命令按**ANSI 代码页**
+    （中文 Windows = cp936/GBK）输出，而 `text=True` 按 UTF-8 解码，
+    读取线程里抛 `UnicodeDecodeError`——输出被截断，调用方只看到一条
+    `PytestUnhandledThreadExceptionWarning`，根本看不出是编码问题。
+
+    顺序刻意是**严格 UTF-8 优先**，失败才按系统代码页：
+
+    - `route` / `ipconfig` / `docker` 这类命令在中文 Windows 上是 GBK，
+      而 GBK 字节几乎不可能同时是合法 UTF-8（`0xd2 0xbb` 就不是），
+      所以 UTF-8 严格解码失败 → 落到 cp936，结果正确；
+    - 反过来（先按 cp936 试）会**静默解错**：UTF-8 的 `接口列表` 按 GBK 解出来是
+      `鎺ュ彛鍒楄〃`，而且一个替换字符都没有——按"噪音"根本判不出来。
+      这是实测踩到的坑，所以顺序不能反。
+
+    两边都失败时回落到 `decode_output`（UTF-8/UTF-16 择优 + 替换，永不抛）。
+
+    传入已是 `str` 时原样返回（调用方可能自己解过码）。
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    data = bytes(raw)
+    if not data:
+        return ""
+    import locale
+
+    preferred = locale.getpreferredencoding(False)
+    candidates: list[str] = []
+    for name in ("utf-8", preferred, "gbk", "cp1252"):
+        if name and name.lower() not in {item.lower() for item in candidates}:
+            candidates.append(name)
+    for name in candidates:
+        try:
+            decoded = data.decode(name)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        if "\x00" not in decoded:
+            return decoded
+        # ASCII + NUL 的字节流通常是 **UTF-16LE**（`wsl.exe -l -q` 就是），
+        # 而它是合法 UTF-8（NUL 是合法字符）——不能就这么用，交给
+        # `decode_output` 按噪音（替换字符 + NUL）择优。
+        break
+    return decode_output(data)
+
+
 def _replay_backspaces(text: str) -> str:
     """按终端语义重放退格：`abc\\b\\b\\b   \\b\\b\\bxyz` → `xyz`。
 

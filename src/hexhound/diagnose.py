@@ -18,7 +18,6 @@
 """
 from __future__ import annotations
 
-import locale
 import os
 import socket
 import ssl
@@ -486,28 +485,16 @@ def parse_adapter_names(ipconfig_text: str) -> list[str]:
 
 
 def _decode_console(raw: bytes | str) -> str:
-    """控制台命令输出的解码：Windows 上 `route`/`ipconfig` 按**ANSI 代码页**输出。
+    """控制台命令输出的解码（统一走 `sanitize.decode_console_output`）。
 
     实测事故（中文 Windows + 本地 CI 执行器）：`subprocess.run(..., text=True)`
     会按 UTF-8 去解 GBK 字节，读取线程里抛 `UnicodeDecodeError`——输出被截断，
     而调用方只看到一条 `PytestUnhandledThreadExceptionWarning`，
     排查时完全看不出是"本机命令输出不是 UTF-8"。
-
-    顺序：UTF-8 → 系统首选编码（中文 Windows 即 cp936）→ GBK → 兜底替换解码。
-    传入已经是 `str` 时原样返回（调用方可能自己解过码）。
     """
-    if isinstance(raw, str):
-        return raw
-    for name in ("utf-8", locale.getpreferredencoding(False), "gbk", "cp1252"):
-        if not name:
-            continue
-        try:
-            return raw.decode(name)
-        except (UnicodeDecodeError, LookupError):
-            continue
-    from .sanitize import decode_output
+    from .sanitize import decode_console_output
 
-    return decode_output(raw)
+    return decode_console_output(raw)
 
 
 def _run_console(command: list[str], *, timeout: float = 10.0) -> str:

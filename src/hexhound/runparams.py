@@ -62,6 +62,8 @@ FIELDS: tuple[NumberField, ...] = (
     NumberField("max_llm_calls", "模型调用上限", "次", "int", 0, unlimited_at_zero=True),
     NumberField("max_tool_calls", "工具调用上限", "次", "int", 0, unlimited_at_zero=True),
     NumberField("max_seconds", "总时长上限", "秒", "float", 0.0, unlimited_at_zero=True),
+    NumberField("soft_seconds", "运行软上限", "秒", "float", 1800.0, unlimited_at_zero=True,
+                hint="只拦「要不要再开一波」，不打断进行中的波次；0 = 不限制"),
     # --- 执行规模 ---
     NumberField("max_steps", "单代理最大步数", "步", "int", 30, minimum=1,
                 hint="仅单代理模式；多代理使用子任务最大步数"),

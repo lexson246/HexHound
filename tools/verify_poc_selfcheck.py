@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import locale
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +14,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from hexhound.memory import RunArtifacts  # noqa: E402
+
+#: WSL/本机命令输出按系统代码页：显式声明编码，避免 UTF-8 解码在读取线程里抛异常
+_CONSOLE_ENCODING = locale.getpreferredencoding(False) or "utf-8"
 
 RUNS = sorted(Path.home().joinpath(".hexhound/runs").glob("http---127.0.0.1-5000-*"))
 
@@ -45,6 +49,7 @@ def wsl_bash(script: str, timeout: int = 180) -> subprocess.CompletedProcess:
             ["wsl.exe", "-d", "Ubuntu-24.04", "-u", "root", "--", "bash", "-c",
              f"tr -d '\\r\\n' < {mount} | base64 -d | bash"],
             capture_output=True, text=True, timeout=timeout, check=False,
+            # wsl.exe 里跑的是 Linux 侧命令，输出是 UTF-8，显式声明即可
             encoding="utf-8", errors="replace",
         )
     finally:

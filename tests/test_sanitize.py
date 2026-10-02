@@ -15,6 +15,7 @@ sys.path.insert(0, str(SRC))
 
 from hexhound.sanitize import (  # noqa: E402
     clip_head_tail,
+    decode_console_output,
     decode_output,
     normalize_newlines,
     sanitize_terminal_text,
@@ -495,6 +496,35 @@ class SandboxOutputSanitisationTests(unittest.TestCase):
         self.assertEqual(env["PYTHONUTF8"], "1")
         # 不能把宿主环境整个替换掉（PATH 等必须保留）
         self.assertIn("PATH", env)
+
+
+class ConsoleDecodingTests(unittest.TestCase):
+    """控制台输出的解码（`decode_console_output`）。
+
+    这一条是为了消灭"同类事故的另一半"：`subprocess.run(..., text=True)` 在
+    中文 Windows 上会按 UTF-8 解 GBK 字节，读取线程抛 `UnicodeDecodeError`，
+    输出被截断而调用方只看到一条 threading 警告（实测踩过）。
+    """
+
+    def test_gbk_bytes_from_windows_commands(self) -> None:
+        text = "接口列表\r\n默认网关 . . . : 192.168.1.1\r\n"
+        self.assertEqual(decode_console_output(text.encode("gbk")), text)
+
+    def test_utf8_bytes_are_not_mangled(self) -> None:
+        """顺序不能反：先按 cp936 试会把 UTF-8 中文**静默解错**（且无替换字符可判）。"""
+        text = "Ubuntu-24.04 已安装 sqlmap"
+        self.assertEqual(decode_console_output(text.encode("utf-8")), text)
+
+    def test_utf16le_bytes_still_work(self) -> None:
+        """`wsl.exe -l -q` 的 UTF-16LE：NUL 是合法 UTF-8，不能就这么用。"""
+        self.assertEqual(decode_console_output("Ubuntu-24.04".encode("utf-16-le")), "Ubuntu-24.04")
+
+    def test_ascii_str_none_and_junk_never_raise(self) -> None:
+        self.assertEqual(decode_console_output(b"ServerVersion: 29.1.3"), "ServerVersion: 29.1.3")
+        self.assertEqual(decode_console_output("已解码"), "已解码")
+        self.assertEqual(decode_console_output(None), "")
+        self.assertEqual(decode_console_output(b""), "")
+        self.assertIsInstance(decode_console_output(b"\xff\xfe\x00\xd2\xbb\x8f"), str)
 
 
 if __name__ == "__main__":

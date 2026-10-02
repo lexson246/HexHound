@@ -68,6 +68,10 @@ def _checkout_ref() -> str:
         return subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=ROOT, capture_output=True, text=True, check=False,
+            # 显式声明编码：不写的话按 UTF-8 解本机命令输出，中文 Windows 上是
+            # GBK 字节 → 读取线程抛 UnicodeDecodeError（实测同类事故见
+            # src/hexhound/diagnose.py 的 _decode_console 注释）。
+            encoding="utf-8", errors="replace",
         ).stdout.strip()
     except OSError:
         return ""
@@ -75,7 +79,8 @@ def _checkout_ref() -> str:
 
 def _dirty() -> bool:
     out = subprocess.run(
-        ["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True, check=False
+        ["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True, check=False,
+        encoding="utf-8", errors="replace",
     ).stdout.strip()
     return bool(out)
 

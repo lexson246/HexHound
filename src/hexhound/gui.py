@@ -1847,6 +1847,7 @@ def _run_audit(settings: dict, token: int) -> None:
                 (BY_KEY["max_llm_calls"], f"模型调用 ≤ {config.max_llm_calls} 次"),
                 (BY_KEY["max_tool_calls"], f"工具调用 ≤ {config.max_tool_calls} 次"),
                 (BY_KEY["max_seconds"], f"总时长 ≤ {config.max_seconds:.0f} 秒"),
+                (BY_KEY["soft_seconds"], f"软上限 {config.soft_seconds:.0f} 秒（只拦新波次）"),
             )
             if getattr(config, field.key)
         ]
@@ -1944,6 +1945,7 @@ def _run_audit(settings: dict, token: int) -> None:
                 llm_pool=llm_pool,
                 sandbox=sandbox,
                 sandbox_note=sandbox_setup,
+                soft_seconds=getattr(config, "soft_seconds", 0.0),
             )
             result = orchestrator.run()
         else:

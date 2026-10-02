@@ -279,6 +279,11 @@ CLOSING_TOOLS: frozenset[str] = frozenset({
 #: 允许的最大收尾回合数（硬上限，配置不了——这是"给两次机会"，不是"再跑一轮"）。
 MAX_CLOSING_ROUNDS = 2
 
+#: 步数预算至少到这个值，才把**最后一步**预留给收尾动作。
+#: 低于它（例如测试里的 `max_steps=1/2`）不预留：那会把"收敛"变成"一步都不探测"。
+#: 真实配置里 `task_steps` 下限是 4，所以正常情况下一定生效。
+MIN_STEPS_FOR_RESERVED_FINAL = 3
+
 #: 收尾结果的原因码：模型没主动 finish_task，但东西已经落库。
 CLOSE_REASON_SYNTHESIZED = "closing_no_finish"
 
@@ -450,9 +455,13 @@ class ReActAgent:
         # 且只有 CLOSING_TOOLS 可用——所以"多出来的两轮"不可能变成新一轮扫描。
         total_budget = self.max_steps + MAX_CLOSING_ROUNDS
         step_no = 0
+        final_step_announced = False
         while step_no < total_budget:
             step_no += 1
             phase = closing.phase(step_no, self.max_steps)
+            # 最后一步正常步预留给收尾（见 `_ClosingState.restricted`）
+            reserved_final = phase == "probe" and closing.restricted(step_no, self.max_steps)
+            restricted = phase == "closing" or reserved_final
 
             if should_stop is not None and should_stop():
                 finish_reason = "stopped"
@@ -474,6 +483,11 @@ class ReActAgent:
                     messages.append({"role": "user", "content": directive})
                     closing.tools_used["_directive"] = closing.rounds_started
             else:
+                if reserved_final and not final_step_announced:
+                    final_step_announced = True
+                    messages.append({"role": "user", "content": closing.final_step_directive()})
+                    if self.on_notice is not None:
+                        self.on_notice("FINAL_STEP", "最后一步只允许收尾动作（写结论/交总结）")
                 # 预算预警带：把收尾指令插进对话。
                 notice = self.budget.pending_notice()
                 if notice is not None:
@@ -608,11 +622,15 @@ class ReActAgent:
                 messages.append({"role": "user", "content": observation + "\n\n请继续，输出下一轮的 JSON。"})
                 continue
 
-            if phase == "closing" and str(action) not in CLOSING_TOOLS:
-                # 收尾阶段拒绝一切探测类动作。**不执行**，只回一条说明——
+            if restricted and str(action) not in CLOSING_TOOLS:
+                # 收尾阶段（含最后一步）拒绝一切探测类动作。**不执行**，只回一条说明——
                 # 模型在收尾阶段要求扫端口/发请求是常见行为，执行一次就等于
                 # 收尾回合变成了普通回合，"两轮封顶"的约束也就失效了。
-                observation = closing.rejection(str(action))
+                observation = (
+                    closing.final_rejection(str(action))
+                    if reserved_final
+                    else closing.rejection(str(action))
+                )
                 record["observation"] = observation
                 closing.rejected += 1
                 emit(record)
@@ -622,7 +640,7 @@ class ReActAgent:
             observation = self.tools.execute(str(action), action_input)
             record["observation"] = observation
             emit(record)
-            if phase == "closing":
+            if restricted:
                 closing.note_tool(str(action))
             messages.append(
                 {
@@ -689,7 +707,6 @@ class _ClosingState:
     单独成类是为了让"收尾"这件事**可测**：给定步号就能判定当前处于哪个阶段，
     不需要真的把一个 ReAct 循环跑到上限。
     """
-
     def __init__(self) -> None:
         self.rounds_started = 0
         self.closed = False
@@ -700,6 +717,40 @@ class _ClosingState:
     def phase(self, step_no: int, max_steps: int) -> str:
         """当前是 `probe`（正常步）还是 `closing`（受限收尾回合）。"""
         return "closing" if step_no > max_steps else "probe"
+
+    def restricted(self, step_no: int, max_steps: int) -> bool:
+        """这一步是否**只允许收尾动作**。
+
+        除了收尾回合，还有一条更早的约束：**最后一步正常步也预留给它写结论**。
+
+        为什么（实测数据）：收尾回合上线之后 `max_steps` 终态已经归零，但仍有约
+        10% 的子任务落在 `closing_no_finish`——模型把最后一步继续花在探测上，
+        收尾只能由系统代写总结（"下一步建议/未覆盖说明"这类内容就没了）。
+        把最后一步改成"只能写结论"，模型就有机会在**自己的预算内**交出总结，
+        终态从"系统替它收尾"变成"它自己收尾"。
+
+        代价为零：不增加请求数（步数预算不变），只是把最后一步的用途收窄。
+        模型若仍坚持探测，拿到的是一条说明，后面两轮收尾照旧。
+
+        **步数太少时不预留**（`MIN_STEPS_FOR_RESERVED_FINAL`）：`max_steps=1/2`
+        这种预算下把最后一步也锁死，等于整个子任务一步都探测不了——
+        那是把"收敛"做成了"不作为"。真实配置里 `task_steps` 下限是 4。
+        """
+        return max_steps >= MIN_STEPS_FOR_RESERVED_FINAL and step_no >= max_steps
+
+    def final_step_directive(self) -> str:
+        """最后一步正常步的指令：把"这一步该干什么"说透。"""
+        allowed = "、".join(sorted(CLOSING_TOOLS))
+        return (
+            "<final_step>\n"
+            "这是你的**最后一步**（步数预算里剩下的最后一个动作）。\n"
+            f"从这一步起**只接受收尾动作**：{allowed}。任何扫描 / HTTP 请求 / shell / "
+            "脚本调用都会被拒绝，而且不会被执行。\n"
+            "请把已经查到的东西写下来（record_finding / record_coverage / leave_note），"
+            "然后 finish_task，summary 里写清：确认了什么、覆盖到哪、还有什么没做。\n"
+            "如果已经无可记录，直接 finish_task。\n"
+            "</final_step>"
+        )
 
     def begin_round(self, step_no: int) -> bool:
         """进入一个新收尾回合；返回是否需要下发收尾指令。
@@ -725,6 +776,16 @@ class _ClosingState:
             f"可用动作：{allowed}。\n"
             "请立刻：把已确认的问题用 record_finding 记下（带 evidence_ref），"
             "把「测过但没问题」的位置用 record_coverage 记清，然后 finish_task 交回总结。"
+        )
+
+    def final_rejection(self, action: str) -> str:
+        """最后一步正常步里拒绝探测动作时的话术（比收尾回合更强调"就这一步了"）。"""
+        allowed = "、".join(sorted(CLOSING_TOOLS))
+        return (
+            f"这是**最后一步**，不接受 {action}（后面只剩 {MAX_CLOSING_ROUNDS} 轮受限收尾）。\n"
+            f"现在只接受收尾动作：{allowed}。\n"
+            "把已经查到的东西写下来，然后用 finish_task 交回总结——"
+            "别让这一轮变成「系统替你收尾」。"
         )
 
     def to_dict(self) -> dict[str, Any]:

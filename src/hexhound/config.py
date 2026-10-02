@@ -285,6 +285,10 @@ class Config:
     max_llm_calls: int = 0
     max_tool_calls: int = 0
     max_seconds: float = 0.0
+    #: 运行时长**软上限**（秒）：只拦"要不要再开一波"，不打断进行中的波次。
+    #: 0 = 不限制。默认 1800 秒是刻意的——`max_seconds=0`（默认）时原本没有任何
+    #: 墙钟上限，实测跑出过 20 分钟 / 125 万 token 的一轮（见第四轮报告 §11）。
+    soft_seconds: float = 1800.0
     #: 采样温度（推理型模型建议保持默认）。
     temperature: float = 0.2
     #: DeepSeek 推理强度；空值不发送参数，沿用服务端默认值。
@@ -349,6 +353,8 @@ class Config:
             max_llm_calls=max(0, _parse_int("MAX_LLM_CALLS", 0)),
             max_tool_calls=max(0, _parse_int("MAX_TOOL_CALLS", 0)),
             max_seconds=max(0.0, _parse_float("MAX_SECONDS", 0.0)),
+            # 软上限默认 1800 秒：不设的话"要不要再开一波"永远放行（实测跑飞过）
+            soft_seconds=max(0.0, _parse_float("HEXHOUND_SOFT_SECONDS", 1800.0)),
             temperature=min(2.0, max(0.0, _parse_float("TEMPERATURE", 0.2))),
             reasoning_effort=os.getenv("LLM_REASONING_EFFORT", "").strip().lower(),
         )

@@ -53,8 +53,8 @@ def _iso(mtime: float) -> str:
 
 #: 这些收尾原因说明"这次没跑完"，历史里必须显示为未完成。
 PARTIAL_FINISH_REASONS = frozenset({
-    "cancelled", "stopped", "budget", "supervisor_abort", "provider_error",
-    "failed", "closing_no_finish",
+    "cancelled", "stopped", "budget", "soft_timeout", "supervisor_abort",
+    "provider_error", "failed", "closing_no_finish",
 })
 
 #: 报告里的中断标记（用户主动停止时写入正文，见 gui._mark_partial）。

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import locale
 import os
 import subprocess
 import sys
@@ -25,6 +26,11 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+#: 本机命令（netstat / tasklist / taskkill）按**系统代码页**输出：中文 Windows 是 GBK。
+#: 不写 encoding 时按 UTF-8 解，读取线程会抛 UnicodeDecodeError（同类事故见
+#: src/hexhound/sanitize.py 的 decode_console_output）。
+_CONSOLE_ENCODING = locale.getpreferredencoding(False) or "utf-8"
 
 ROOT = Path(__file__).resolve().parents[1]
 EXE = ROOT / "hexhound.exe"
@@ -112,7 +118,7 @@ def _children_of(pids: set[int]) -> dict[str, int]:
 def _listening_port(pid: int) -> int | None:
     """用 netstat 找该进程的监听端口（不依赖 pwsh，避免 PATH 差异）。"""
     out = subprocess.run(["netstat", "-ano", "-p", "TCP"],
-                         capture_output=True, text=True, check=False).stdout
+                         capture_output=True, text=True, encoding=_CONSOLE_ENCODING, errors="replace", check=False).stdout
     for line in out.splitlines():
         parts = line.split()
         if len(parts) < 5 or parts[0].upper() != "TCP":
@@ -152,7 +158,7 @@ def _wait_exit(pid: int, timeout: float = 60.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         alive = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                               capture_output=True, text=True, check=False).stdout
+                               capture_output=True, text=True, encoding=_CONSOLE_ENCODING, errors="replace", check=False).stdout
         if str(pid) not in alive:
             return True
         time.sleep(0.5)
@@ -170,7 +176,7 @@ def _window_ready(timeout: float = 60.0) -> bool:
     while time.monotonic() < deadline:
         out = subprocess.run(
             ["tasklist", "/V", "/FI", "IMAGENAME eq hexhound.exe", "/FO", "CSV", "/NH"],
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, encoding=_CONSOLE_ENCODING, errors="replace", check=False,
         ).stdout
         if '"HexHound"' in out:
             return True
@@ -190,7 +196,7 @@ def _wait_all_gone(timeout: float = 120.0) -> bool:
 
 def _graceful_close(window_pid: int) -> bool:
     """等于点窗口右上角关闭：taskkill 不带 /F 就是发 WM_CLOSE。"""
-    subprocess.run(["taskkill", "/PID", str(window_pid)], capture_output=True, text=True, check=False)
+    subprocess.run(["taskkill", "/PID", str(window_pid)], capture_output=True, text=True, encoding=_CONSOLE_ENCODING, errors="replace", check=False)
     gone = _wait_all_gone()
     if not gone:  # 兜底清理，免得留下进程影响后续检查
         for leftover in _hexhound_pids():
@@ -329,7 +335,7 @@ def main() -> int:
         ))
         ready2 = _window_ready()
         checks.append(("重启后窗口也正常创建", ready2, "窗口就绪" if ready2 else "未见窗口"))
-        subprocess.run(["taskkill", "/PID", str(pid2)], capture_output=True, text=True, check=False)
+        subprocess.run(["taskkill", "/PID", str(pid2)], capture_output=True, text=True, encoding=_CONSOLE_ENCODING, errors="replace", check=False)
         closed2 = _wait_all_gone()
         if not closed2:
             for leftover in _hexhound_pids():

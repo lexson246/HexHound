@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -620,6 +621,7 @@ class Orchestrator:
         sandbox: Any = None,
         sandbox_note: Any = None,
         coverage_sweep: bool = True,
+        soft_seconds: float = 0.0,
     ) -> None:
         self.llm = llm
         #: 按角色分配的模型客户端（planner/recon/injection/auth/verify）。
@@ -633,6 +635,15 @@ class Orchestrator:
         self.sandbox_note = sandbox_note
         #: 是否在收尾前对"从未被碰过"的端点做强制补扫（覆盖率闸门）
         self.coverage_sweep = bool(coverage_sweep)
+        #: 运行时长**软上限**（秒，0 = 不限制）：只拦"要不要再开一波"，
+        #: 不打断已经开始的波次（半途掐断会让子代理来不及写结论，产出全丢）。
+        #: 为什么要有默认值：`max_seconds` 默认 0，而原本没有任何墙钟上限——
+        #: 实测跑出过 20 分钟 / 125 万 token 的一轮（第四轮报告 §11）。
+        self.soft_seconds = max(0.0, float(soft_seconds or 0.0))
+        #: 软上限的计时起点（`run()` 开始时设置；None = 还没开始）。
+        self._started_at: float | None = None
+        #: 是否因为软上限停掉了后续波次（写进报告，不能静默）。
+        self.soft_stopped = False
         self.target = target
         self.goal = goal
         self.mode = mode
@@ -762,6 +773,12 @@ class Orchestrator:
         """剩余墙钟时间（秒）；未设 `MAX_SECONDS` 时返回 None。"""
         return self.budget.remaining_seconds()
 
+    def _soft_time_left(self) -> float | None:
+        """距软上限还剩多少秒；未启用或还没开始时返回 None。"""
+        if self.soft_seconds <= 0 or self._started_at is None:
+            return None
+        return self.soft_seconds - (time.monotonic() - self._started_at)
+
     def _may_start_wave(self, stage: str, *, need: float = SWEEP_MIN_SECONDS) -> bool:
         """波次边界闸门：时间不够就别开新的一波。
 
@@ -769,8 +786,28 @@ class Orchestrator:
         来不及写结论，比"这一波根本没开始"更糟（产出全丢）。
 
         每次拒绝都写进事件流，报告里能看出"为什么后面几波没跑"。
+
+        两道时间闸门：**硬上限**（`MAX_SECONDS`，预算耗尽会终止运行）与
+        **软上限**（`soft_seconds`，默认 1800 秒，只是不再开新波次）。
+        软上限存在的意义：没设硬上限时原本会一直开波次，实测跑飞过。
         """
         if self._stopped():
+            return False
+        left = self._soft_time_left()
+        if left is not None and left < need:
+            if not self.soft_stopped:
+                self.soft_stopped = True
+                self._event(
+                    kind="soft_time_stop",
+                    stage=stage,
+                    elapsed=round(self.soft_seconds - left, 1),
+                    limit=round(self.soft_seconds, 1),
+                    message=(
+                        f"运行已到软上限（{self.soft_seconds:.0f}s），不再开启新的波次："
+                        f"{stage} 至少还需要 {need:.0f}s。已完成的波次不受影响；"
+                        "需要更长时间就调大 HEXHOUND_SOFT_SECONDS（0 = 不限制）。"
+                    ),
+                )
             return False
         left = self._time_left()
         if left is None or left >= need:
@@ -1674,6 +1711,11 @@ class Orchestrator:
         budget_reasons = self.budget.stop_reasons()
         if budget_reasons:
             stop_reasons.extend(budget_reasons)
+        if self.soft_stopped:
+            stop_reasons.append(
+                f"运行时长达到软上限 {self.soft_seconds:.0f}s：已跳过后续波次"
+                "（HEXHOUND_SOFT_SECONDS=0 可关闭该上限）"
+            )
         user_stopped = self._user_stopped()
         final = "\n".join(summaries)
         if user_stopped:
@@ -1722,7 +1764,12 @@ class Orchestrator:
             estimated_cost=cost,
             total_tokens=total,
             steps_used=len(steps),
-            finish_reason="cancelled" if user_stopped else "budget" if budget_reasons else "finish",
+            finish_reason=(
+                "cancelled" if user_stopped
+                else "budget" if budget_reasons
+                else "soft_timeout" if self.soft_stopped
+                else "finish"
+            ),
             surface=self.surface,
             tasks=[task.to_dict() for task in tasks],
             artifacts_dir=str(self.artifacts.dir) if self.artifacts.enabled else "",
@@ -1816,6 +1863,9 @@ class Orchestrator:
 
         3/4 最多各跑两轮，且只在盲区确实缩小时继续。
         """
+        # 软上限从这里开始计时（只影响"要不要再开一波"的判断）
+        self._started_at = time.monotonic()
+        self.soft_stopped = False
         tasks = self.plan()
         self._event(kind="wave", wave=1, count=len(tasks))
         done = self.run_wave(tasks, wave=1)

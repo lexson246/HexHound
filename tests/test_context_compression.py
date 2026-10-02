@@ -264,6 +264,54 @@ class ContextCompressionTests(unittest.TestCase):
         self.assertEqual(result.closing["attempted"], 1)
         self.assertEqual(result.final_summary, "收尾回合内完成收尾")
 
+    def test_final_step_is_reserved_for_closing(self) -> None:
+        """**最后一步正常步**只接受收尾动作（给模型一次自己交总结的机会）。
+
+        实测数据支撑：收尾回合上线后 `max_steps` 终态归零，但仍有约 10% 的子任务
+        落在 `closing_no_finish`（系统代写总结）——模型把最后一步继续花在探测上。
+        把最后一步的用途收窄，模型才有机会在**自己的预算内**交出总结。
+
+        判据必须落在"探测动作没有执行"上（而不是只看提示词里说了什么）。
+        """
+        tools = FakeTools()
+        result = agent.ReActAgent(
+            NeverFinishingLLM(), tools, max_steps=4, budget=Budget()
+        ).run("goal")
+        final_probe = [s for s in result.steps if s.get("step") == 4]
+        self.assertTrue(final_probe, "第 4 步应当存在")
+        self.assertIn("最后一步", final_probe[0]["observation"])
+        # 前 3 步真的探测过；第 4 步的探测被拒绝（没有留下执行痕迹）
+        self.assertEqual(tools.calls.count("http_request"), 3)
+
+    def test_reserved_final_step_can_still_finish(self) -> None:
+        """模型在第 4 步交出总结 → 终态是它自己收的尾（`finish`，不是代写）。"""
+
+        class FinishesOnFinalStep:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages):
+                self.calls += 1
+                usage = SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+                if self.calls >= 4:
+                    return json.dumps(
+                        {"action": "finish_task", "action_input": {"summary": "我自己收的尾"}}
+                    ), usage
+                return json.dumps({"action": "think", "action_input": {"note": "继续"}}), usage
+
+        result = agent.ReActAgent(
+            FinishesOnFinalStep(), FakeTools(), max_steps=4, budget=Budget()
+        ).run("goal")
+        self.assertEqual(result.finish_reason, "finish")
+        self.assertEqual(result.final_summary, "我自己收的尾")
+        self.assertEqual(result.closing["attempted"], 0, "不该用到收尾回合")
+
+    def test_tiny_budgets_are_not_locked_down(self) -> None:
+        """步数预算太小时不预留最后一步——否则整个子任务一步都探测不了。"""
+        tools = FakeTools()
+        agent.ReActAgent(NeverFinishingLLM(), tools, max_steps=2, budget=Budget()).run("goal")
+        self.assertGreaterEqual(tools.calls.count("http_request"), 2)
+
     def test_provider_error_is_a_terminal_state_with_output_preserved(self) -> None:
         """provider 故障必须形成明确终态，且**保住已记录的发现**。"""
 

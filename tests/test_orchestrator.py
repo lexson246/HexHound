@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -92,6 +93,86 @@ class PlanParsingTests(unittest.TestCase):
         self.assertFalse(_looks_like_auth(surface))
         surface.add_endpoint(TARGET + "/login", source="crawl")
         self.assertTrue(_looks_like_auth(surface))
+
+
+class SoftTimeLimitTests(unittest.TestCase):
+    """墙钟**软上限**：默认必须存在，且只在波次边界生效。
+
+    为什么需要它（第四轮报告 §12.2）：`max_seconds` 默认 0，而软上限此前根本不存在，
+    于是"要不要再开一波"永远放行——实测跑出过 20 分钟 / 125 万 token 的一轮。
+    软上限必须：① 只拦新波次、不打断进行中的波次；② 事件与报告如实写明；
+    ③ 可配置、可关闭（0 = 不限制）。
+    """
+
+    def make(self, **overrides) -> Orchestrator:
+        settings = {
+            "target": TARGET,
+            "goal": "测试软上限",
+            "mode": "blackbox",
+            "base_dir": Path("."),
+            "allowed_hosts": ALLOWED,
+            "timeout": 1,
+            "max_tasks": 2,
+            "task_steps": 3,
+            "parallel": 1,
+            "budget": Budget(BudgetLimits(max_tool_calls=50)),
+        }
+        settings.update(overrides)
+        return Orchestrator(ScriptedLLM(), **settings)
+
+    def test_default_config_has_a_soft_limit(self) -> None:
+        from hexhound.config import Config
+
+        self.assertGreater(
+            Config(api_key="sk-fake").soft_seconds, 0, "软上限必须有非零默认值"
+        )
+        # 也能用环境变量显式关掉（0 = 不限制）
+        with patch.dict("os.environ", {
+            "LLM_PROVIDER": "custom", "LLM_API_KEY": "sk-fake",
+            "LLM_BASE_URL": "http://127.0.0.1:9/v1", "LLM_MODEL": "fixture-model",
+            "HEXHOUND_SOFT_SECONDS": "0",
+        }):
+            self.assertEqual(Config.from_env().soft_seconds, 0.0)
+
+    def test_wave_is_refused_past_the_soft_limit(self) -> None:
+        orchestrator = self.make(soft_seconds=0.01)
+        orchestrator._started_at = time.monotonic() - 5  # 假装已经跑了 5 秒
+        self.assertFalse(orchestrator._may_start_wave("补扫波"))
+        kinds = [event["kind"] for event in orchestrator.events]
+        self.assertIn("soft_time_stop", kinds)
+        message = next(e["message"] for e in orchestrator.events if e["kind"] == "soft_time_stop")
+        self.assertIn("软上限", message)
+        self.assertIn("HEXHOUND_SOFT_SECONDS", message, "要告诉用户怎么关掉它")
+
+    def test_wave_is_allowed_before_the_soft_limit(self) -> None:
+        orchestrator = self.make(soft_seconds=600)
+        orchestrator._started_at = time.monotonic()
+        self.assertTrue(orchestrator._may_start_wave("补扫波"))
+
+    def test_zero_disables_the_soft_limit(self) -> None:
+        orchestrator = self.make(soft_seconds=0)
+        orchestrator._started_at = time.monotonic() - 100000
+        self.assertTrue(orchestrator._may_start_wave("补扫波"))
+        self.assertFalse(orchestrator.soft_stopped)
+
+    def test_soft_stop_is_recorded_in_the_result(self) -> None:
+        """撞上软上限的运行必须写明原因，不能被当成正常收尾。"""
+        orchestrator = self.make(soft_seconds=0.01)
+
+        def fake_run_wave(tasks, wave=1):  # noqa: ANN001, ANN202
+            orchestrator._started_at = time.monotonic() - 5
+            return []
+
+        with patch.object(orchestrator, "run_wave", side_effect=fake_run_wave):
+            result = orchestrator.run()
+        self.assertTrue(orchestrator.soft_stopped)
+        self.assertEqual(result.finish_reason, "soft_timeout")
+        self.assertIn("软上限", result.final_summary)
+
+    def test_soft_timeout_history_status_is_partial(self) -> None:
+        from hexhound import history
+
+        self.assertIn("soft_timeout", history.PARTIAL_FINISH_REASONS)
 
 
 class UserStopSemanticsTests(unittest.TestCase):

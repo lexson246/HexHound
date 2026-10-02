@@ -62,12 +62,17 @@ def capture_url(
         result = subprocess.run(
             command,
             capture_output=True,
-            text=True,
             timeout=timeout,
             shell=False,
         )
         if not output.exists() or output.stat().st_size == 0:
-            detail = (result.stderr or result.stdout or "").strip()
+            # 浏览器在中文 Windows 上按 ANSI 代码页输出错误信息：交给统一的
+            # 控制台解码，**不能**用 `text=True`（会按 UTF-8 解 GBK 字节，
+            # 在读取线程里抛 UnicodeDecodeError，连失败原因都拿不到）。
+            from .sanitize import decode_console_output
+
+            raw = result.stderr or result.stdout or b""
+            detail = decode_console_output(raw).strip()
             if detail:
                 detail = detail[-500:]
             raise RuntimeError(f"浏览器截图失败：{detail or '未生成图片'}")

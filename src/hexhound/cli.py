@@ -450,6 +450,7 @@ def _run_audit(
             sandbox=sandbox,
             sandbox_note=sandbox_setup,
             coverage_sweep=coverage_sweep,
+            soft_seconds=getattr(config, "soft_seconds", 0.0),
         )
         result = orchestrator.run()
     else:
