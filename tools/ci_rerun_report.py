@@ -68,7 +68,13 @@ def main(argv: list[str] | None = None) -> int:
             Path(path).write_text(summary, encoding="utf-8")
         except OSError as exc:  # noqa: BLE001 摘要写不进去不影响判失败
             print(f"[note] 写 GITHUB_STEP_SUMMARY 失败：{exc}", file=sys.stderr)
-    else:
+    # **注解**是另一半（实测：step summary 不会出现在公共 check-run 的 output.summary 里，
+    # 只有 `::error::` 这类 workflow command 才会变成本仓库可公开读取的 annotation）。
+    # 因此这里同时发一条注解：失败用例名 + 尾部关键行，二者都能在无 token 的情况下读到。
+    excerpt = tail_lines(output, 40)
+    escaped = excerpt.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+    print(f"::error title={title} 失败::{escaped[:2500]}", flush=True)
+    if not path:
         print("[note] 没有 GITHUB_STEP_SUMMARY（本地跑），失败摘要只在上面。", file=sys.stderr)
     return proc.returncode
 

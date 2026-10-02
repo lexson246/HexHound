@@ -57,17 +57,33 @@ def describe_run(repo: str, run: dict, *, summaries: bool = False) -> int:
         for job in failed:
             check_url = str(job.get("check_run_url") or "")
             text = ""
+            annotations: list[str] = []
             if check_url:
                 try:
                     text = str((_api(check_url).get("output") or {}).get("summary") or "")
                 except Exception:  # noqa: BLE001 摘要读不到就只报状态
                     text = ""
-            print(f"===== {job['name']} 的公开摘要 =====")
-            print(text.strip() or "（这个作业没有写摘要——对应步骤可能还没接上包装脚本）")
+                try:
+                    items = _api(check_url + "/annotations?per_page=20")
+                    annotations = [
+                        str(item.get("message") or "")
+                        for item in items
+                        if item.get("annotation_level") in ("failure", "warning")
+                    ]
+                except Exception:  # noqa: BLE001 注解读不到就只报状态
+                    annotations = []
+            print(f"===== {job['name']} 的公开原因 =====")
+            if text.strip():
+                print(text.strip())
+            # 注解是公共仓库上另一种可读通道（由 `::error::` workflow command 产生）
+            for message in annotations[:5]:
+                print("[注解] " + message.strip()[:2000])
+            if not text.strip() and not annotations:
+                print("（这个作业既没写摘要也没有注解——对应步骤可能还没接上包装脚本）")
     if failed:
         print(
-            "\n提示：失败原因看上面的公开摘要（由 tools/ci_rerun_report.py 写入 "
-            "$GITHUB_STEP_SUMMARY）；原始日志需要 GitHub 认证。"
+            "\n提示：失败原因看上面的公开摘要/注解（由 tools/ci_rerun_report.py 写入）；"
+            "原始日志需要 GitHub 认证。"
         )
     return len(failed)
 
