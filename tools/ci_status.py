@@ -32,8 +32,13 @@ def _api(url: str) -> dict:
         return json.load(response)
 
 
-def describe_run(repo: str, run: dict) -> int:
-    """打印一次运行的作业状态；返回非绿作业数。"""
+def describe_run(repo: str, run: dict, *, summaries: bool = False) -> int:
+    """打印一次运行的作业状态；返回非绿作业数。
+
+    `summaries=True` 时额外把非绿作业的 check-run `output.summary` 打出来——
+    那正是 `tools/ci_rerun_report.py` 写进去的失败原因（Actions 原始日志要认证，
+    公共仓库只能读到这一段）。
+    """
     jobs = _api(f"https://api.github.com/repos/{repo}/actions/runs/{run['id']}/jobs").get("jobs", [])
     failed = [
         job for job in jobs
@@ -47,9 +52,21 @@ def describe_run(repo: str, run: dict) -> int:
         if steps:
             detail = "｜失败步骤：" + ", ".join(f"{s['name']}（{s['conclusion']}）" for s in steps[:3])
         print(f"  {job['name'][:44]:46} {job['status']:11} {job.get('conclusion')}{detail}")
+    if failed and summaries:
+        print()
+        for job in failed:
+            check_url = str(job.get("check_run_url") or "")
+            text = ""
+            if check_url:
+                try:
+                    text = str((_api(check_url).get("output") or {}).get("summary") or "")
+                except Exception:  # noqa: BLE001 摘要读不到就只报状态
+                    text = ""
+            print(f"===== {job['name']} 的公开摘要 =====")
+            print(text.strip() or "（这个作业没有写摘要——对应步骤可能还没接上包装脚本）")
     if failed:
         print(
-            "\n提示：失败原因看该作业的 check-run 摘要（由 tools/ci_rerun_report.py 写入 "
+            "\n提示：失败原因看上面的公开摘要（由 tools/ci_rerun_report.py 写入 "
             "$GITHUB_STEP_SUMMARY）；原始日志需要 GitHub 认证。"
         )
     return len(failed)
@@ -60,6 +77,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", default=DEFAULT_REPO, help=f"owner/repo（默认 {DEFAULT_REPO}）")
     parser.add_argument("--sha", default="", help="只看这个 commit（前缀匹配）")
     parser.add_argument("--runs", type=int, default=1, help="列出最近几次运行（默认 1，最多 10）")
+    parser.add_argument(
+        "--summaries", action="store_true",
+        help="非绿作业额外打印 check-run 公开摘要（失败原因，无需 token）",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -86,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     for index, run in enumerate(runs):
         if index:
             print()
-        failed_total += describe_run(args.repo, run)
+        failed_total += describe_run(args.repo, run, summaries=args.summaries)
     return 1 if failed_total else 0
 
 

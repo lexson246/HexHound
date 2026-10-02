@@ -1,4 +1,4 @@
-"""CI 里"再跑一次并打印 skip 明细"这一步：失败原因要能被**公开读到**。
+"""CI 里跑 pytest 的包装：失败原因要能被**公开读到**。
 
 背景（真实痛点）：GitHub Actions 的**原始日志需要认证**，公共仓库上第三方
 （包括下一个接手的 AI）只能读到 check run 的 `output.summary`。于是"某个可选
@@ -6,16 +6,21 @@
 
 这个脚本做三件事：
 
-1. 跑 `pytest -q -rs`（和 workflow 里那一步完全一致）；
+1. 跑 pytest（默认 `-q -rs`，可用 `--pytest-args` 覆盖）；
 2. 把输出完整打到 stdout（人看日志时和以前一样）；
 3. 失败时把尾部摘要写进 `$GITHUB_STEP_SUMMARY`（公开可读），并原样返回退出码。
+
+**两个步骤都要用它**：早先只包了"再跑一次看 skip 明细"那一步，结果第一次
+`Run test suite` 红在 Ubuntu 上时依旧拿不到任何原因（实测踩过）。
 
 刻意**不**用 `| tail`：那依赖 Git 自带的 coreutils（GitHub 的 windows runner
 恰好有，别的 Windows 环境没有）——本地 CI 执行器第一次跑就因此报 rc=1。
 """
 from __future__ import annotations
 
+import argparse
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -29,9 +34,18 @@ def tail_lines(text: str, limit: int = TAIL_LINES) -> str:
     return "\n".join(lines[-limit:]) if len(lines) > limit else text
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="跑 pytest 并在失败时写公开摘要")
+    parser.add_argument(
+        "--pytest-args", default="-q -rs",
+        help='pytest 参数（默认 "-q -rs"；传 "" 表示不带参数，对应 CI 的第一步）',
+    )
+    parser.add_argument("--label", default="", help="摘要标题里的说明（可选）")
+    args = parser.parse_args(argv)
+
+    command = [sys.executable, "-m", "pytest", *shlex.split(args.pytest_args or "")]
     proc = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-rs"],
+        command,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -42,9 +56,10 @@ def main() -> int:
     print(output, flush=True)
     if proc.returncode == 0:
         return 0
+    title = args.label or f"pytest {' '.join(command[3:])}".strip()
     summary = (
-        f"# 测试重跑失败（pytest 退出码 {proc.returncode}）\n\n"
-        "`python -m pytest -q -rs` 的尾部输出（详细日志见该步骤的原始日志）：\n\n"
+        f"# 测试失败（{title}，退出码 {proc.returncode}）\n\n"
+        "尾部输出（完整日志需 GitHub 认证；这里给出可公开阅读的失败原因）：\n\n"
         f"```\n{tail_lines(output)}\n```\n"
     )
     path = os.getenv("GITHUB_STEP_SUMMARY", "").strip()

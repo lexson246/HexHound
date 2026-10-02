@@ -75,7 +75,11 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
       - name: Run test suite
-        run: python -m pytest
+        # 与下面那一步同一个包装脚本：失败时把尾部输出写进 `$GITHUB_STEP_SUMMARY`
+        # （Actions 原始日志需要认证，公共仓库只能读到 check run 摘要）。
+        # 实测教训：只包"重跑那一步"是不够的——第一次 `Run test suite` 红在
+        # Ubuntu 上时依旧没有任何可读原因。
+        run: python tools/ci_rerun_report.py --pytest-args "" --label "Run test suite"
       - name: Fail if any test was silently skipped for a bad reason
         # pytest 的退出码不会因为 skip 而失败，但"跳过数量突然变多"通常意味着
         # 某个可选依赖悄悄缺失、一整层测试没跑。这里**再跑一次并打印 skip 明细**
