@@ -414,6 +414,10 @@ class BrowserVerifier:
         channel: str = "",
         headless: bool = True,
         user_agent: str = "",
+        auth_headers: dict[str, str] | None = None,
+        cookies: list[dict[str, Any]] | None = None,
+        storage_state: dict[str, Any] | None = None,
+        session_storage: dict[str, str] | None = None,
     ) -> None:
         self.allowed_hosts = frozenset(host.lower() for host in allowed_hosts if host)
         self.timeout_ms = max(1000, int(timeout_ms))
@@ -421,6 +425,10 @@ class BrowserVerifier:
         self.channel = channel
         self.headless = bool(headless)
         self.user_agent = user_agent
+        self.auth_headers = dict(auth_headers or {})
+        self.cookies = cookies
+        self.storage_state = storage_state
+        self.session_storage = session_storage
 
     # ---------- 可用性 ----------
 
@@ -466,6 +474,9 @@ class BrowserVerifier:
         dialogs: list[str] = []
         requests: list[str] = []
         navigation: list[str] = []
+        #: 被拦下的重定向（越界 / 同主机其它端口）。必须让读者看到：
+        #: "页面本来想跳去哪、为什么没让它跳"——否则"验证没做成"会被误读成"没问题"。
+        blocked_redirects: list[str] = []
         observation = PageObservation(url=url)
 
         with sync_playwright() as playwright:
@@ -480,10 +491,14 @@ class BrowserVerifier:
                     "若提示缺少浏览器，运行 `python -m playwright install chromium`；"
                     "或系统装有 Edge/Chrome 时，构造时传 channel='msedge' / 'chrome'。"
                 ) from exc
-            context_args: dict[str, Any] = {}
-            if self.user_agent:
-                context_args["user_agent"] = self.user_agent
-            context = browser.new_context(**context_args)
+            from .browser import browser_context
+
+            context = browser_context(
+                browser, url, allowed_hosts=self.allowed_hosts, auth_headers=self.auth_headers,
+                cookies=self.cookies, storage_state=self.storage_state,
+                session_storage=self.session_storage, user_agent=self.user_agent,
+                blocked_redirects=blocked_redirects,
+            )
             page = context.new_page()
 
             page.on(
@@ -509,7 +524,7 @@ class BrowserVerifier:
 
                 def _as_post(route) -> None:
                     try:
-                        route.continue_(
+                        route.fallback(
                             method="POST",
                             post_data=body,
                             headers={
@@ -517,8 +532,8 @@ class BrowserVerifier:
                                 "content-type": "application/x-www-form-urlencoded",
                             },
                         )
-                    except Exception:  # noqa: BLE001 改写失败就退回原始请求
-                        route.continue_()
+                    except Exception:  # noqa: BLE001 不把失败的 POST 验证悄悄降为 GET
+                        route.abort()
 
                 page.route(pattern, _as_post)
             try:
@@ -575,6 +590,11 @@ class BrowserVerifier:
         observation.dialogs = dialogs
         observation.requests = requests
         observation.navigation = navigation
+        if blocked_redirects:
+            observation.notes = [
+                *(observation.notes or []),
+                "已拦截重定向：" + "；".join(blocked_redirects[:5]),
+            ]
         observation.console_errors = [
             str(item.get("text") or "")
             for item in console
@@ -652,10 +672,12 @@ class BrowserVerifier:
             post_data = urlencode({**extra_fields, param: chosen})
             baseline_post_data = urlencode({**extra_fields, param: ""})
         elif param:
-            from urllib.parse import quote
+            from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-            separator = "&" if "?" in url else "?"
-            target_url = f"{url}{separator}{param}={quote(chosen, safe='')}"
+            parsed = urlsplit(url)
+            query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True) if key != param]
+            query.append((param, chosen))
+            target_url = urlunsplit(parsed._replace(query=urlencode(query)))
 
         notes: list[str] = []
         baseline_dialogs: list[str] = []

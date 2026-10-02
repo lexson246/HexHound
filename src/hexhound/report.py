@@ -411,6 +411,47 @@ def _finding_section(finding: dict, goal: str, index: int) -> list[str]:
     return lines
 
 
+def _tool_failure_lines(failures: object) -> list[str]:
+    """工具失败统计 → 报告行（为什么这轮没测出东西，这里给出可核对的原因）。
+
+    四类必须分开写：`unknown` 是环境能力缺口（提示词/模型想调但没下发），
+    `crashed` 是我们自己的 bug，`returned` 多为 scope 拒绝，`budget` 是预算用尽。
+    混成一个"失败 N 次"读者无法据以行动——是去补工具、修 bug，还是调预算。
+    """
+    stats = failures if isinstance(failures, dict) else {}
+    total = int(stats.get("total") or 0)
+    if not total:
+        return []
+    labels = {
+        "unknown": "调用未下发的工具",
+        "crashed": "工具内部异常",
+        "returned": "工具返回错误",
+        "budget": "预算拒绝",
+    }
+
+    def render(bucket: object) -> str:
+        if not isinstance(bucket, dict):
+            return ""
+        items = sorted(
+            ((str(k), int(v)) for k, v in bucket.items() if int(v or 0) > 0),
+            key=lambda pair: (-pair[1], pair[0]),
+        )
+        return "、".join(f"{name}×{count}" for name, count in items)
+
+    details = [
+        f"{labels.get(kind, kind)}（{render(stats.get(kind))}）"
+        for kind in ("unknown", "crashed", "returned", "budget")
+        if render(stats.get(kind))
+    ]
+    lines = [f"- 工具调用失败：**{total} 次**｜" + "｜".join(details)]
+    if stats.get("unknown"):
+        lines.append(
+            "  - **调用未下发的工具**说明本次环境缺少对应能力（真工具没接上或组件没装）——"
+            "这不是模型乱编，报告读者应据此判断覆盖是否完整。"
+        )
+    return lines
+
+
 def _scope_line(result: AgentResult) -> str:
     """报告头里的范围说明（来自快照/结果里的 allowed_hosts）。"""
     allowed = getattr(result, "allowed_hosts", None)
@@ -502,6 +543,9 @@ def to_markdown(result: AgentResult, goal: str) -> str:
                 f"- 真工具沙箱：**未启用/不可用**（{sandbox.get('reason', '未说明')}）"
                 "——本次仅有内置 HTTP 探测能力，覆盖深度低于挂载真工具的运行"
             )
+        if sandbox.get("hint"):
+            lines.append(f"  - 恢复方式：{sandbox['hint']}")
+    lines += _tool_failure_lines(result.tool_failures)
     lines.append("")
 
     # 跨运行对比：放在台账之前——"这次比上次好了还是坏了"是读者最先要看的结论之一

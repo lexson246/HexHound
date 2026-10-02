@@ -355,6 +355,8 @@ class TaskWorker:
         # 把本子任务的 **T 编号证据** 带上：报告附录必须能按 finding 里引用的编号查到命令，
         # 否则"证据可复核"就是一句空话（早先附录用的是沙箱内部 X 编号，两边对不上）。
         result.tool_log = list(registry.sandbox_log)
+        # 工具失败统计随子任务带回：编排器要把各角色加起来，回答"这轮为什么没测出东西"。
+        result.tool_failures = registry.tool_failure_stats()
         if self.trace is not None:
             self._trace_tool_calls(result.tool_log)
             for finding in result.findings:
@@ -404,7 +406,10 @@ def _outcome_for(result: AgentResult) -> str:
     return reason
 
 
-def _parse_plan(text: str, target: str, surface: AttackSurface, max_tasks: int) -> list[WorkerTask]:
+def _parse_plan(
+    text: str, target: str, surface: AttackSurface, max_tasks: int,
+    task_steps: int = DEFAULT_TASK_STEPS,
+) -> list[WorkerTask]:
     """解析编排者的计划 JSON；失败则返回确定性兜底计划。"""
     tasks: list[WorkerTask] = []
     try:
@@ -423,22 +428,25 @@ def _parse_plan(text: str, target: str, surface: AttackSurface, max_tasks: int) 
             if not objective:
                 continue
             try:
-                steps = int(item.get("steps") or DEFAULT_TASK_STEPS)
+                steps = int(item.get("steps") or task_steps)
             except (TypeError, ValueError):
-                steps = DEFAULT_TASK_STEPS
+                steps = task_steps
             tasks.append(
                 WorkerTask(
                     id=f"T{index}",
                     role=role,
                     objective=objective[:400],
                     url=str(item.get("url") or target or "").strip(),
-                    steps=max(4, min(steps, 20)),
+                    steps=max(4, min(steps, task_steps)),
                 )
             )
-    return tasks or _fallback_plan(target, surface, max_tasks)
+    return tasks or _fallback_plan(target, surface, max_tasks, task_steps)
 
 
-def _fallback_plan(target: str, surface: AttackSurface, max_tasks: int) -> list[WorkerTask]:
+def _fallback_plan(
+    target: str, surface: AttackSurface, max_tasks: int,
+    task_steps: int = DEFAULT_TASK_STEPS,
+) -> list[WorkerTask]:
     """编排器不可用时的确定性计划（也是重建计划的模板）。"""
     tasks: list[WorkerTask] = [
         WorkerTask(
@@ -450,7 +458,7 @@ def _fallback_plan(target: str, surface: AttackSurface, max_tasks: int) -> list[
                 "read_urls 读同域 JS 找接口与硬编码密钥，把可疑点用 leave_note 留给注入角色。"
             ),
             url=target,
-            steps=DEFAULT_TASK_STEPS + 2,
+            steps=task_steps,
         )
     ]
     interesting = _interesting_endpoints(surface, limit=3)
@@ -466,7 +474,7 @@ def _fallback_plan(target: str, surface: AttackSurface, max_tasks: int) -> list[
                     "命中的用 compare_responses 确认差异，证据成立才 record_finding。"
                 ),
                 url=url,
-                steps=DEFAULT_TASK_STEPS,
+                steps=task_steps,
             )
         )
     if len(tasks) < max_tasks and _looks_like_auth(surface):
@@ -480,7 +488,7 @@ def _fallback_plan(target: str, surface: AttackSurface, max_tasks: int) -> list[
                     "对带 id/uid/order_id 的接口测 IDOR（切 A/B 身份对比）。"
                 ),
                 url=target,
-                steps=DEFAULT_TASK_STEPS,
+                steps=task_steps,
             )
         )
     return tasks[:max_tasks]
@@ -572,6 +580,20 @@ SECRET_HINTS: tuple[str, ...] = (
 class Orchestrator:
     """分层编排：规划 → 分波执行 → 复核 → 合并。"""
 
+    def describe_sandbox(self) -> dict[str, Any]:
+        """容器环境状态（含"没用上时到底是哪一步没成"）。
+
+        报告与 run.json 都读这里：只要真工具没接上，读者必须能直接看到原因，
+        而不是从一堆"未知工具 xxx"里反推。
+        """
+        note = getattr(self, "sandbox_note", None)
+        return sandbox_report(
+            self.sandbox,
+            reason=str(getattr(note, "reason", "") or ""),
+            hint=str(getattr(note, "hint", "") or ""),
+            tools=list(getattr(note, "tools", []) or []),
+        )
+
     def __init__(
         self,
         llm: LLMClient,
@@ -596,6 +618,7 @@ class Orchestrator:
         verify: bool = True,
         llm_pool: dict[str, LLMClient] | None = None,
         sandbox: Any = None,
+        sandbox_note: Any = None,
         coverage_sweep: bool = True,
     ) -> None:
         self.llm = llm
@@ -604,6 +627,10 @@ class Orchestrator:
         self.llm_pool: dict[str, LLMClient] = dict(llm_pool or {})
         #: 真工具执行环境（None = 只有内置 HTTP 探测）
         self.sandbox = sandbox
+        #: `prepare_sandbox()` 的结果（None = 调用方没做探测）。真工具没接上时，
+        #: 这里保存的"到底是哪一步没成"会写进 run.json 与报告——否则事后只看得到
+        #: 子代理报"未知工具 xxx"，根本查不出是环境没准备好。
+        self.sandbox_note = sandbox_note
         #: 是否在收尾前对"从未被碰过"的端点做强制补扫（覆盖率闸门）
         self.coverage_sweep = bool(coverage_sweep)
         self.target = target
@@ -763,7 +790,7 @@ class Orchestrator:
                         "证据成立才 record_finding。"
                     ),
                     url=self.target,
-                    steps=self.task_steps + 4,
+                    steps=self.task_steps,
                 )
             ]
         brief = self.surface.to_llm_summary()
@@ -778,7 +805,7 @@ class Orchestrator:
             + (api_brief + "\n\n" if api_brief else "")
             + (history_brief + "\n\n" if history_brief else "")
             + (sandbox_brief + "\n\n" if sandbox_brief else "")
-            + f"<constraints>\n最多 {self.max_tasks} 个任务；每个任务 4–20 步；"
+            + f"<constraints>\n最多 {self.max_tasks} 个任务；每个任务 4–{self.task_steps} 步；"
             "第一波必须能并行执行（不要有互相依赖的任务）。\n</constraints>\n\n"
             "请输出任务计划 JSON。"
         )
@@ -787,9 +814,15 @@ class Orchestrator:
             {"role": "user", "content": user},
         ]
         if not self.budget.can_spend():
-            return self._refine_plan(_fallback_plan(self.target, self.surface, self.max_tasks))
+            return self._refine_plan(
+                _fallback_plan(self.target, self.surface, self.max_tasks, self.task_steps)
+            )
         try:
-            content, usage = self._llm_for("planner").complete(messages)
+            planner = self._llm_for("planner")
+            request_config = getattr(planner, "request_config", None)
+            if self.trace is not None and callable(request_config):
+                self.trace.record("llm_config", role="planner", **request_config())
+            content, usage = planner.complete(messages)
             self.budget.add_usage(usage)
             if self.callbacks.on_usage is not None and hasattr(usage, "prompt_tokens"):
                 self.callbacks.on_usage(
@@ -801,6 +834,19 @@ class Orchestrator:
                         "estimated_cost": 0.0,
                         "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
                     }
+                )
+            response_finish = str(getattr(usage, "finish_reason", "") or "")
+            if self.trace is not None:
+                self.trace.record(
+                    "llm_response", role="planner", finish_reason=response_finish,
+                    reasoning_tokens=int(getattr(usage, "reasoning_tokens", 0) or 0),
+                    total_tokens=int(getattr(usage, "total_tokens", 0) or 0),
+                    content_empty=not bool(content.strip()),
+                )
+            if not content.strip() or response_finish not in ("", "stop"):
+                raise ValueError(
+                    f"模型返回空内容或未完成响应（finish_reason={response_finish or '未提供'}），"
+                    "计划不可用；本次用量已保留。"
                 )
         except Exception as exc:  # noqa: BLE001 规划失败不该让整次运行失败
             # 规划失败常常是"模型根本调不通"的第一现场（实测：规划 7.8 秒失败，
@@ -818,9 +864,11 @@ class Orchestrator:
                     message="模型端点现场探测（未使用凭据、不消耗额度）：\n"
                     + "\n".join(probe_lines(getattr(self.llm, "base_url", ""), indent="  ")),
                 )
-            return self._refine_plan(_fallback_plan(self.target, self.surface, self.max_tasks))
+            return self._refine_plan(
+                _fallback_plan(self.target, self.surface, self.max_tasks, self.task_steps)
+            )
         tasks = self._refine_plan(
-            _parse_plan(content, self.target, self.surface, self.max_tasks)
+            _parse_plan(content, self.target, self.surface, self.max_tasks, self.task_steps)
         )
         self._event(
             kind="plan",
@@ -1078,6 +1126,9 @@ class Orchestrator:
     # ---------- 执行 ----------
 
     def _run_task(self, task: WorkerTask) -> WorkerTask:
+        # 所有波次（包含确定性补扫/复核任务）共用配置中的探测步数上限。
+        # ReActAgent 用尽后仍有至多两轮仅用于固化结论的收尾回合。
+        task.steps = max(4, min(task.steps, self.task_steps))
         if self._stopped():
             task.outcome = "skipped"
             task.error = "预算/用户停止"
@@ -1260,7 +1311,7 @@ class Orchestrator:
             tasks.append(
                 WorkerTask(
                     id=f"C{round_index * max_tasks + index + 1}",
-                    role="recon",
+                    role="injection",
                     objective=(
                         "对以下**尚未被任何子代理碰过**的端点做覆盖性排查：\n"
                         f"{listing}\n"
@@ -1268,7 +1319,10 @@ class Orchestrator:
                         "（带参数的端点用 fuzz_params 或 sqlmap_scan、看是否返回敏感数据、"
                         "是否泄露报错/版本）。\n"
                         "**必须对每个端点给出结论**：发现问题就 record_finding（带证据）；"
-                        "没问题就用 record_coverage(status=\"no_issue_found\" 或 \"ruled_out\") 记清楚。\n"
+                        "只有实际完成验证且未见问题，才用 record_coverage(status=\"no_issue_found\")；"
+                        "确认候选不可利用才记 ruled_out。"
+                        "401/403/429、超时或工具不可用记 blocked；"
+                        "仅 GET 触达却未做参数验证记 not_tested，并写清尚未完成的测试。\n"
                         "这是为了消除报告里「列出来了但没测」的盲区，别跳过任何一条。"
                     ),
                     url=self.target,
@@ -1312,7 +1366,9 @@ class Orchestrator:
                         "sqlmap_scan 或 compare_responses 留工具级证据。\n"
                         "**每个参数都必须有结论**：命中就 record_finding（带 evidence_ref）；"
                         "试过没问题就用 record_coverage(status=\"no_issue_found\") "
-                        "把「哪个参数、试过哪些类别」写清楚——这是消除参数级盲区的唯一凭据。"
+                        "把「哪个参数、试过哪些类别」写清楚；"
+                        "401/403/429、超时或工具不可用记 blocked，未真正发送参数测试记 not_tested，"
+                        "不能把访问受阻或只读过一次当作已排除漏洞。"
                     ),
                     url=self.target,
                     steps=max(6, min(3 * len(chunk) + 6, 18)),
@@ -1617,6 +1673,19 @@ class Orchestrator:
                 evidence.append(entry)
         if not evidence and self.sandbox is not None:
             evidence = list(getattr(self.sandbox, "_exec_log", []) or [])
+        # 各子任务的工具失败统计合并：问答"这轮为什么没测出东西"时，
+        # "模型想调但没下发的工具"必须一眼可见（沙箱没接上时它就会涨）。
+        failures: dict[str, dict[str, int]] = {}
+        for task in tasks:
+            stats = getattr(task.result, "tool_failures", None) or {}
+            for kind, bucket in stats.items():
+                if not isinstance(bucket, dict):
+                    continue
+                merged_bucket = failures.setdefault(str(kind), {})
+                for tool, count in bucket.items():
+                    merged_bucket[str(tool)] = merged_bucket.get(str(tool), 0) + int(count)
+        if failures:
+            failures["total"] = sum(sum(b.values()) for b in failures.values())
         return AgentResult(
             steps=steps,
             findings=deduped,
@@ -1635,7 +1704,8 @@ class Orchestrator:
             poc_paths={str(item.get("id")): str(item.get("poc_path") or "") for item in deduped},
             deduped=merged,
             models=self.describe_models(),
-            sandbox=sandbox_report(self.sandbox),
+            sandbox=self.describe_sandbox(),
+            tool_failures=failures,
             tool_log=evidence,
             coverage_gate=self.coverage_gate(),
             previous_findings=self.previous_findings,
@@ -1839,7 +1909,8 @@ class Orchestrator:
                 "mode": self.mode,
                 "tasks": result.tasks,
                 "models": result.models,
-                "sandbox": sandbox_report(self.sandbox),
+                "sandbox": self.describe_sandbox(),
+                "tool_failures": (result.tool_failures or {}),
                 "stats": self.surface.stats(),
                 "coverage": self.surface.coverage_summary(),
                 "usage": self.budget.snapshot(),

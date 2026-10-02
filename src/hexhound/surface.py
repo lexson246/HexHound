@@ -173,9 +173,12 @@ class Attempt:
     param: str = ""
     category: str = ""
     payload: str = ""
-    outcome: str = "signal"  # signal / no_signal / error
+    outcome: str = "signal"  # signal / no_signal / blocked / error
     detail: str = ""
     at: float = field(default_factory=time.time)
+    method: str = "GET"
+    account: str = ""  # 身份指纹；不得保存 Cookie/Authorization 明文
+    location: str = "query"
 
 
 @dataclass
@@ -252,7 +255,7 @@ class AttackSurface:
         self.forms: dict[str, dict[str, Any]] = {}
         self.tech: dict[str, str] = {}
         self.notes: list[str] = []
-        self.attempts: dict[tuple[str, str, str], Attempt] = {}
+        self.attempts: dict[tuple[str, ...], Attempt] = {}
         self.candidates: dict[str, Finding] = {}
         self.findings: list[Finding] = []
         self.extra_paths: list[str] = []
@@ -532,9 +535,10 @@ class AttackSurface:
 
     @staticmethod
     def attempt_key(
-        endpoint: str, param: str = "", category: str = "", payload: str = ""
-    ) -> tuple[str, str, str, str]:
-        """尝试指纹：端点 + 参数 + 类别 + payload。
+        endpoint: str, param: str = "", category: str = "", payload: str = "",
+        *, method: str = "GET", account: str = "", location: str = "query",
+    ) -> tuple[str, ...]:
+        """尝试指纹：端点 + 参数 + 类别 + payload + 方法 + 身份 + 参数位置。
 
         带上 payload 是必要的：同一 (端点, 参数, 类别) 下往往要试多个 payload
         （单引号触发报错、布尔盲注、时间盲注…），只按前三者去重会把后面的 payload
@@ -545,6 +549,9 @@ class AttackSurface:
             str(param or ""),
             str(category or ""),
             str(payload or "")[:120],
+            str(method or "GET").upper(),
+            str(account or ""),
+            str(location or "query").lower(),
         )
 
     def mark_attempt(
@@ -556,9 +563,14 @@ class AttackSurface:
         payload: str = "",
         outcome: str = "signal",
         detail: str = "",
+        method: str = "GET",
+        account: str = "",
+        location: str = "query",
     ) -> None:
         """记录一次尝试；`outcome=no_signal` 的同一组合（同 payload）不再重试。"""
-        key = self.attempt_key(endpoint, param, category, payload)
+        key = self.attempt_key(
+            endpoint, param, category, payload, method=method, account=account, location=location
+        )
         with self._lock:
             existing = self.attempts.get(key)
             if existing is not None and existing.outcome == "signal":
@@ -569,40 +581,53 @@ class AttackSurface:
             self.attempts[key] = Attempt(
                 endpoint=key[0], param=key[1], category=key[2],
                 payload=str(payload or "")[:200], outcome=outcome, detail=str(detail or "")[:300],
+                method=key[4], account=key[5], location=key[6],
             )
 
     def tried_outcome(
-        self, endpoint: str, category: str, param: str = "", payload: str = ""
+        self, endpoint: str, category: str, param: str = "", payload: str = "",
+        *, method: str = "GET", account: str = "", location: str = "query",
     ) -> Attempt | None:
         """返回该组合已有的尝试记录（None = 没试过）。"""
         with self._lock:
-            return self.attempts.get(self.attempt_key(endpoint, param, category, payload))
+            return self.attempts.get(self.attempt_key(
+                endpoint, param, category, payload, method=method, account=account, location=location
+            ))
 
     def is_tried(
-        self, endpoint: str, category: str, param: str = "", payload: str = ""
+        self, endpoint: str, category: str, param: str = "", payload: str = "",
+        *, method: str = "GET", account: str = "", location: str = "query",
     ) -> bool:
         """该组合（含 payload）是否已有结论（命中或无信号都算）。
 
         命中也算「已试」：并发子代理里 A 打到命中后，B 不该重复发同一个 payload，
         而应直接去看 A 留下的证据（`tried_outcome`）并进入复核阶段。
         """
-        return self.tried_outcome(endpoint, category, param, payload) is not None
+        result = self.tried_outcome(
+            endpoint, category, param, payload, method=method, account=account, location=location
+        )
+        return result is not None and result.outcome in ("signal", "no_signal")
 
     def tried_summary(self, limit: int = 40) -> list[str]:
         """给 LLM 看的「已试过什么」，避免重复劳动（按端点+参数+类别聚合）。"""
         with self._lock:
             items = list(self.attempts.values())
-        grouped: dict[tuple[str, str, str], list[Attempt]] = {}
+        grouped: dict[tuple[str, ...], list[Attempt]] = {}
         for item in items:
-            grouped.setdefault((item.endpoint, item.param, item.category), []).append(item)
+            grouped.setdefault((
+                item.endpoint, item.param, item.category, item.method, item.account, item.location,
+            ), []).append(item)
         lines = []
-        for (endpoint, param, category), group in grouped.items():
+        for (endpoint, param, category, method, account, location), group in grouped.items():
             target = endpoint + (f"?{param}=" if param else "")
+            target += f" ({method}/{location} 身份={account[:12] or '匿名'})"
             hits = [g for g in group if g.outcome == "signal"]
             if hits:
                 lines.append(f"{target} [{category or '-'}] 命中 {len(hits)} 次：{hits[0].detail[:80]}")
-            else:
+            elif any(g.outcome == "no_signal" for g in group):
                 lines.append(f"{target} [{category or '-'}] 无信号（已试 {len(group)} 个 payload）")
+            else:
+                lines.append(f"{target} [{category or '-'}] 阻塞/失败（尚未形成检测结论）")
         return sorted(set(lines))[:limit]
 
     # ---------- 发现（候选 / 已复核）----------
@@ -710,8 +735,9 @@ class AttackSurface:
         """
         touched: set[str] = set()
         with self._lock:
-            for key in self.attempts:
-                touched.add(key[0])
+            for key, attempt in self.attempts.items():
+                if attempt.outcome not in ("error", "blocked"):
+                    touched.add(key[0])
             for collection in (self.findings, self.candidates.values()):
                 for item in collection:
                     if item.url:
@@ -760,7 +786,7 @@ class AttackSurface:
             attempted: set[tuple[str, str]] = {
                 (key[0], key[1])
                 for key, item in self.attempts.items()
-                if item.outcome != "error"
+                if item.outcome not in ("error", "blocked")
             }
             for collection in (self.findings, self.candidates.values()):
                 for item in collection:
@@ -815,7 +841,10 @@ class AttackSurface:
     def untested_endpoints(self, limit: int = 40) -> list[str]:
         """还没被任何 attempt 覆盖过的端点（优先高价值），用于任务计划。"""
         with self._lock:
-            tried = {key[0] for key, item in self.attempts.items() if item.outcome != "error"}
+            tried = {
+                key[0] for key, item in self.attempts.items()
+                if item.outcome not in ("error", "blocked")
+            }
             pending = [url for url in self.endpoints if url not in tried]
         return sort_urls(pending, limit)
 
@@ -1008,6 +1037,9 @@ class AttackSurface:
                 payload=str(item.get("payload") or ""),
                 outcome=str(item.get("outcome") or "no_signal"),
                 detail=str(item.get("detail") or ""),
+                method=str(item.get("method") or "GET"),
+                account=str(item.get("account") or ""),
+                location=str(item.get("location") or "query"),
             )
         for item in raw.get("findings", []) or []:
             surface.findings.append(_finding_from_dict(item, default_status="verified"))

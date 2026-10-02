@@ -39,6 +39,95 @@ def build_system_prompt(tools_description: str, mode: str = "source", role: str 
     return "".join(extras)
 
 
+#: "没下发就别提"提示块的起始行。测试与报告靠它区分"正文里的工具名"与
+#: "明确告知缺失的工具名"——正文只允许出现真正可以调用的工具。
+MISSING_TOOLS_NOTE = "⚠️ 本次运行未下发的真工具："
+
+#: 脚本能力缺失时，`<advanced_playbooks>` 的导语要换掉。
+#: 原文是"必须用 sandbox_script 主动打"——没有脚本能力时这句话会把模型
+#: 逼着反复调用一个不存在的工具（用户实际遇到的"未知工具"就是这么来的）。
+_SCRIPT_REQUIREMENT_TOKEN = "__SCRIPT_REQUIREMENT__"
+_SCRIPT_REQUIREMENT_WITH = (
+    "**这三类漏洞内置 payload 永远测不出来，必须用 sandbox_script 主动打：**"
+)
+_SCRIPT_REQUIREMENT_WITHOUT = (
+    "**这三类漏洞内置 payload 测不出来，而本次运行没有脚本能力（脚本工具未下发）：**\n"
+    "只能用 http_request / compare_responses 尽量表达（并发窗口很难用单发请求证明），"
+    "做不到的必须在 finish_task 的 summary 里写明「未覆盖」，不要写成「测过没问题」。"
+)
+
+
+def adapt_prompt_to_tools(text: str, available: object, optional: object) -> str:
+    """把角色提示词里"本次其实没有下发"的真工具段落摘掉，并显式说明缺什么。
+
+    为什么必须做这件事：角色正文（`SYSTEM_PROMPT_INJECTION` 等）是静态文本，
+    里面写着"参数疑似注入时第一选择 sqlmap_scan"、"必须用 sandbox_script 主动打"。
+    而工具集是按环境动态裁剪的——沙箱不可用时注册表里根本没有这些名字。
+    两边不一致的后果不是报错，是模型照着提示词反复调用不存在的工具，
+    每次拿回一句"未知工具 xxx"，白烧步数与 token（实测事故，见 docs/WORK-REPORT-ROUND4）。
+
+    处理规则：
+    - 以 `- ` 开头的条目行若提到缺失工具，整条（含缩进续行）删除；
+    - 脚本缺失时替换 `<advanced_playbooks>` 的导语；
+    - 其余行里的零星提及保留原文，但会在末尾追加一个显式清单，
+      告诉模型"这些名字不可用，请改用内置工具"——工具清单本身以注册表为准。
+
+    `available` / `optional` 传可迭代的工具名（optional = 依赖环境的工具）。
+    """
+    present = {str(item) for item in _iter_names(available)}
+    optional_names = tuple(str(item) for item in _iter_names(optional))
+    script_missing = "sandbox_script" in optional_names and "sandbox_script" not in present
+    text = text.replace(
+        _SCRIPT_REQUIREMENT_TOKEN,
+        _SCRIPT_REQUIREMENT_WITHOUT if script_missing else _SCRIPT_REQUIREMENT_WITH,
+    )
+    missing = [name for name in optional_names if name not in present and name in text]
+    if not missing:
+        return text
+    lines = text.splitlines()
+    kept: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        is_bullet = stripped.startswith("- ") or stripped.startswith("* ")
+        is_continuation = line[:1] in (" ", "\t") and bool(stripped)
+        if is_bullet and any(name in stripped for name in missing):
+            index += 1
+            # 丢掉这条的缩进续行（提示词里长条目都换行了）
+            while index < len(lines) and lines[index][:1] in (" ", "\t") and lines[index].strip():
+                index += 1
+            continue
+        if is_continuation and any(name in stripped for name in missing):
+            # 只提到缺失工具的续行：删掉这一行（不牵连整条），
+            # 缺失能力由末尾清单兜底说明。
+            index += 1
+            continue
+        kept.append(line)
+        index += 1
+    result = "\n".join(kept)
+    note = [
+        "",
+        "",
+        MISSING_TOOLS_NOTE + "、".join(missing),
+        "这些工具名**不可调用**（调用只会拿回「未知工具」，浪费步数）。"
+        "凡是上文提到它们的地方，请改用你已经实际持有的内置工具；"
+        "关键能力缺失会导致覆盖不全，请在 finish_task 的 summary 里如实写明。",
+    ]
+    return result + "\n".join(note)
+
+
+def _iter_names(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    try:
+        return [str(item) for item in value]  # type: ignore[union-attr]
+    except TypeError:
+        return [str(value)]
+
+
 def build_task_prompt(
     goal: str,
     mode: str = "source",
@@ -171,7 +260,7 @@ SYSTEM_PROMPT_INJECTION = """<role>你是授权渗透测试中的**注入验证�
 </core_capabilities>
 
 <advanced_playbooks>
-**这三类漏洞内置 payload 永远测不出来，必须用 sandbox_script 主动打：**
+__SCRIPT_REQUIREMENT__
 
 1. **竞态 / 并发（TOCTOU）**——看到"先查后写"的接口就该试：优惠券/兑换码、余额或积分扣减、
    库存/名额、投票、一次性令牌（重置密码、验证码）、限购与限额。

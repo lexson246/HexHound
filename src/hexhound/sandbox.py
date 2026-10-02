@@ -34,7 +34,8 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -1526,14 +1527,29 @@ def _clip(text: str, limit: int = MAX_OUTPUT_CHARS) -> tuple[str, bool]:
     return clip_head_tail(str(text or ""), limit)
 
 
-def sandbox_report(sandbox: Sandbox | None) -> dict[str, Any]:
+def sandbox_report(
+    sandbox: Sandbox | None,
+    *,
+    reason: str = "",
+    hint: str = "",
+    tools: Iterable[str] = (),
+) -> dict[str, Any]:
     """生成"容器环境状态"摘要，写进报告与 run.json。
 
     关键：无论容器可用与否都如实记录——如果没用上容器，
     报告里必须能看出来（下游才不会把纯 Python 探测当成完整覆盖）。
+
+    `reason` / `hint` 来自 `prepare_sandbox()`：**未启用时必须写清是哪一步没成**。
+    早先这里只有一句"本次运行未启用容器沙箱"，于是"装好了工具却全程没用上"
+    在事后完全无法判定（用户只能读到模型报"未知工具"）。
     """
     if sandbox is None:
-        return {"enabled": False, "reason": "本次运行未启用容器沙箱"}
+        data: dict[str, Any] = {"enabled": False, "reason": reason or "本次运行未启用容器沙箱"}
+        if hint:
+            data["hint"] = hint
+        if list(tools):
+            data["tools_expected"] = sorted(str(item) for item in tools)
+        return data
     info = sandbox.probe()
     if not info.get("ok"):
         return {"enabled": False, **info}
@@ -1550,3 +1566,76 @@ def sandbox_report(sandbox: Sandbox | None) -> dict[str, Any]:
         "host_map_notes": sandbox._host_map_notes[:5],
         "exec_count": len(sandbox.exec_log()),
     }
+
+
+@dataclass
+class SandboxSetup:
+    """一次"准备执行环境"的结果：可用的沙箱**或**为什么没有。"""
+
+    sandbox: Sandbox | None = None
+    reason: str = ""
+    hint: str = ""
+    runtime: str = ""
+    tools: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.sandbox is not None
+
+    def message(self) -> str:
+        """一行可读状态（CLI 打印与界面运行记录共用同一句话）。"""
+        if self.ok:
+            return f"真工具沙箱：{self.runtime}（可用工具：{', '.join(self.tools)}）"
+        return f"真工具沙箱不可用，降级为内置 HTTP 探测：{self.reason}"
+
+
+def prepare_sandbox(
+    allowed_hosts: Iterable[str],
+    *,
+    exec_timeout: int = 300,
+    map_loopback: bool = True,
+    verbose: bool = False,
+    local_image_only: bool = False,
+) -> SandboxSetup:
+    """探测执行环境并返回**本次运行实际可用**的沙箱（或原因）。
+
+    为什么必须只有一份实现：CLI 与 GUI 原先各写一段，降级条件与文案都不一致，
+    而"沙箱没接上"的直接后果是 sqlmap / nuclei / sandbox_script 等工具
+    **从工具集里静默消失**——用户看到的是模型报"未知工具"，
+    而不是"环境没准备好"。抽成一份并让 reason 落盘，这类事故才能事后判定。
+
+    `local_image_only=True`（桌面端）：只用本地已有镜像，不自动拉取。
+    """
+    setup = SandboxSetup()
+    try:
+        sandbox = Sandbox(
+            allowed_hosts=frozenset(allowed_hosts),
+            exec_timeout=max(120, int(exec_timeout)),
+            map_loopback=map_loopback,
+            verbose=verbose,
+        )
+        probe = sandbox.probe()
+        setup.runtime = str(probe.get("runtime") or "")
+        if not probe.get("ok"):
+            setup.reason = str(probe.get("reason") or "环境探测失败")
+            setup.hint = str(probe.get("hint") or "")
+            return setup
+        if local_image_only and sandbox.runtime_kind == "docker":
+            image = sandbox.pick_image()
+            if image not in sandbox.images():
+                setup.reason = f"本地没有可用镜像（{image}）"
+                setup.hint = "先执行 hexhound sandbox build 构建镜像（桌面端不自动下载）"
+                return setup
+            sandbox.start(pull=False)
+        tools = sandbox.tool_status()
+        present = sorted(name for name, available in tools.items() if available)
+        if not present:
+            setup.reason = "环境中没有可用工具"
+            setup.hint = "执行 hexhound sandbox install 安装工具链（sqlmap/nmap/ffuf/nuclei…）"
+            return setup
+        setup.sandbox = sandbox
+        setup.tools = present
+        return setup
+    except Exception as exc:  # noqa: BLE001 环境故障不该丢掉内置探测能力
+        setup.reason = f"{type(exc).__name__}: {exc}"
+        return setup

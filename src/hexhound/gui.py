@@ -55,6 +55,7 @@ from .runparams import (
     numeric_defaults,
     parse_fields,
 )
+from .sandbox import prepare_sandbox, sandbox_report
 from .screenshot import capture_url
 from .submission import write_butian_package
 from .surface import AttackSurface
@@ -101,6 +102,7 @@ DEFAULTS = {
     "provider": "",
     "provider_keys": "{}",
     "temperature": "0.2",
+    "reasoning_effort": "",
     "role_models": "{}",
     "max_steps": "30",
     "request_timeout": "10",
@@ -291,7 +293,7 @@ HTML = r"""<!doctype html>
         <div>
           <label for="f-{{ field.key }}">{{ field.label }}{% if field.unit %} / {{ field.unit }}{% endif %}</label>
           <input id="f-{{ field.key }}" name="{{ field.key }}" value="{{ settings[field.key] }}" inputmode="decimal">
-          <small class="muted" id="hint-{{ field.key }}">范围：{{ field.range }}</small>
+          <small class="muted" id="hint-{{ field.key }}">范围：{{ field.range }}{% if field.hint %}。{{ field.hint }}{% endif %}</small>
         </div>
         {% endfor %}
       </div>
@@ -363,6 +365,13 @@ HTML = r"""<!doctype html>
       <input name="api_key" id="apiKeyInput" type="password" value="{{ settings.api_key }}" autocomplete="off" placeholder="sk-...">
       <label>模型 URL（base_url）</label>
       <input name="base_url" id="baseUrlInput" value="{{ settings.base_url }}" placeholder="https://api.example.com/v1">
+      <label for="reasoningEffort">推理强度</label>
+      <select name="reasoning_effort" id="reasoningEffort">
+        {% for value, label in [('', '服务端默认'), ('low', 'low'), ('high', 'high'), ('max', 'max')] %}
+        <option value="{{ value }}"{% if settings.reasoning_effort == value %} selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+      <div class="hint">仅 DeepSeek 生效；其他提供商使用自身默认设置。DeepSeek 思考模式会忽略采样温度。</div>
       <div class="row" style="margin-top:8px;">
         <button type="button" id="testBtn" style="background:var(--line);color:var(--fg);flex:1;">测试连接</button>
         <button type="button" id="fillKeyBtn" style="background:var(--line);color:var(--fg);flex:1;">填入该提供商密钥</button>
@@ -853,7 +862,8 @@ $('#testBtn').onclick = async () => {
       provider: currentProvider(),
       model: $('#modelInput').value.trim(),
       base_url: $('#baseUrlInput').value.trim(),
-      api_key: $('#apiKeyInput').value.trim()
+      api_key: $('#apiKeyInput').value.trim(),
+      reasoning_effort: $('#reasoningEffort').value
     })
   });
   const j = await r.json();
@@ -1057,8 +1067,11 @@ def _load_settings() -> dict:
     try:
         data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {}
-    return {k: v for k, v in data.items() if isinstance(v, str)}
+        data = {}
+    settings = {k: v for k, v in data.items() if isinstance(v, str)}
+    # 旧配置缺少此字段时继承环境值；显式空值仍表示服务端默认。
+    settings.setdefault("reasoning_effort", os.getenv("LLM_REASONING_EFFORT", "").strip())
+    return settings
 
 
 #: 并发保存的互斥锁：多个请求（/api/save 与 /api/provider_key）同时写
@@ -1649,6 +1662,8 @@ def _validate_run_settings(settings: dict) -> dict[str, dict[str, str]]:
         parse_fields(settings)
     except ValueError as exc:
         problems.append(str(exc))
+    if str(settings.get("reasoning_effort") or "").strip().lower() not in ("", "low", "high", "max"):
+        problems.append("推理强度只能留空（服务端默认）或填写 low / high / max。")
     profiles: dict[str, dict[str, str]] = {}
     try:
         profiles = _parse_auth_profiles(settings)
@@ -1762,6 +1777,7 @@ def _mark_partial(result, settings: dict):
 
 
 def _run_audit(settings: dict, token: int) -> None:
+    runtime_sandbox = None
     try:
         allowed = frozenset(
             host
@@ -1810,6 +1826,14 @@ def _run_audit(settings: dict, token: int) -> None:
         # 身份解析已在 `/api/run` 里预先校验过（错误会以 400 返回给界面）；
         # 这里再解析一次拿到结果——线程里不做"静默降级成匿名"。
         auth_profiles = _parse_auth_profiles(settings)
+        if not auth_profiles:
+            STATE.add_event(
+                {
+                    "kind": "notice", "task": "身份", "level": "info",
+                    "message": "未配置账号 A/B，当前仅使用匿名身份；需要登录的接口应配置认证信息。",
+                },
+                token,
+            )
         # 预算上限与 CLI 同源（`budget.limits_from_config`），五个上限全部生效。
         budget = Budget(limits_from_config(config))
         budget.on_change(lambda snapshot: STATE.update_tokens(snapshot, token))
@@ -1848,6 +1872,42 @@ def _run_audit(settings: dict, token: int) -> None:
             },
             token,
         )
+        STATE.add_event(
+            {
+                "kind": "notice", "task": "步数", "level": "info",
+                "message": (
+                    f"每个子任务最多 {config.task_steps} 个探测步骤，各波次累计；"
+                    "单代理最大步数不用于多代理。总量可用模型调用/工具调用/时长上限限制。"
+                    if swarm and mode == "blackbox" else
+                    f"单代理最多 {config.max_steps} 个探测步骤。"
+                ) + "步数用尽后另有至多两轮仅用于保存结论的收尾回合。",
+            },
+            token,
+        )
+        STATE.add_event(
+            {"kind": "notice", "task": "沙箱", "level": "info", "message": "正在探测已安装的工具环境…"},
+            token,
+        )
+        sandbox = None
+        sandbox_setup = None
+        try:
+            # 与 CLI 共用同一份探测/降级逻辑（桌面端只使用已有镜像，不自动下载）。
+            sandbox_setup = prepare_sandbox(
+                allowed,
+                exec_timeout=max(120, config.request_timeout * 30),
+                local_image_only=True,
+            )
+            sandbox = sandbox_setup.sandbox
+            runtime_sandbox = sandbox
+            message = sandbox_setup.message()
+            if not sandbox_setup.ok and sandbox_setup.hint:
+                message = f"{message}｜{sandbox_setup.hint}"
+        except Exception as exc:  # noqa: BLE001 环境故障不丢弃内置探测能力
+            message = f"真工具沙箱不可用，降级为内置 HTTP 探测：{type(exc).__name__}: {exc}"
+        STATE.add_event(
+            {"kind": "notice", "task": "沙箱", "level": "info" if sandbox else "warn", "message": _scrub_secrets(message)},
+            token,
+        )
         artifacts = RunArtifacts(target)
         surface = AttackSurface(
             target=target, mode=mode, path=artifacts.surface_path, allowed_hosts=allowed
@@ -1882,6 +1942,8 @@ def _run_audit(settings: dict, token: int) -> None:
                 callbacks=callbacks,
                 memory=HostMemory(target),
                 llm_pool=llm_pool,
+                sandbox=sandbox,
+                sandbox_note=sandbox_setup,
             )
             result = orchestrator.run()
         else:
@@ -1897,6 +1959,7 @@ def _run_audit(settings: dict, token: int) -> None:
                 role="source" if mode == "source" else "blackbox",
                 artifacts=artifacts,
                 rate_limit=config.rate_limit,
+                sandbox=sandbox,
             )
             agent = ReActAgent(
                 llm,
@@ -1913,6 +1976,13 @@ def _run_audit(settings: dict, token: int) -> None:
                 should_stop=lambda: STATE.is_stopped(token),
             )
             artifacts.save_surface(surface)
+            # 单代理路径同样要记录执行环境状态（报告里必须能看出有没有用上真工具）。
+            result.sandbox = sandbox_report(
+                sandbox,
+                reason=sandbox_setup.reason if sandbox_setup else "",
+                hint=sandbox_setup.hint if sandbox_setup else "",
+                tools=sandbox_setup.tools if sandbox_setup else (),
+            )
         # ---- 收尾：**无论正常结束、用户中断还是异常，都要落盘成果** ----
         #
         # 早先这里是 `if STATE.is_stopped(token): return`——按下停止之后
@@ -1940,6 +2010,13 @@ def _run_audit(settings: dict, token: int) -> None:
         )
     except Exception as exc:  # noqa: BLE001  # 后台线程兜底，任何异常转成界面错误
         STATE.fail(_scrub_secrets(f"{type(exc).__name__}: {exc}"), token)
+    finally:
+        if runtime_sandbox is not None:
+            try:
+                # stop 只回收本次创建的容器；WSL 后端不停止或删除发行版。
+                runtime_sandbox.stop()
+            except Exception:  # noqa: BLE001 清理失败不能覆盖审计成果
+                pass
 
 def create_app() -> Flask:
     app = Flask(__name__)
@@ -2058,7 +2135,13 @@ def create_app() -> Flask:
             return jsonify({"error": "请先填写 base_url（自定义提供商必填）。"}), 400
         if not api_key and provider not in ("ollama", "vllm", "custom"):
             return jsonify({"error": f"请先填写 {provider} 的 API 密钥。"}), 400
-        client = LLMClient(api_key, base_url, model, provider=provider, timeout=25)
+        try:
+            client = LLMClient(
+                api_key, base_url, model, provider=provider, timeout=25,
+                reasoning_effort=data.get("reasoning_effort", _load_settings().get("reasoning_effort", "")),
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         try:
             check = client.test_connection()
         except Exception as exc:  # noqa: BLE001 兜底：任何异常都转成可读结论
@@ -2073,12 +2156,16 @@ def create_app() -> Flask:
     def write_env_api() -> str:
         """把当前提供商设置写进 .env（保留其它键；先备份原文件）。"""
         data = request.get_json(force=True) or {}
+        effort = str(data.get("reasoning_effort", _load_settings().get("reasoning_effort", "")) or "").strip().lower()
+        if effort not in ("", "low", "high", "max"):
+            return jsonify({"error": "推理强度只能留空（服务端默认）或填写 low / high / max。"}), 400
         resolved = _resolve_llm_settings(data)
         updates = {
             "LLM_PROVIDER": resolved["provider"],
             "LLM_MODEL": resolved["model"],
             "LLM_BASE_URL": resolved["base_url"],
             "LLM_API_KEY": resolved["api_key"],
+            "LLM_REASONING_EFFORT": effort,
         }
         if resolved["provider"] not in ("ollama", "vllm", "custom") and resolved["api_key"]:
             updates[env_key_name(resolved["provider"])] = resolved["api_key"]

@@ -561,7 +561,7 @@ def _merge_auth_headers(
 ) -> dict[str, str]:
     """按 account 参数合并账号 A/B 的 Cookie/Authorization 等请求头。"""
     merged = {str(key): str(value) for key, value in headers.items()}
-    name = str(account or ctx.active_account or "").strip().upper()
+    name = str(ctx.active_account if account is None else account).strip().upper()
     profile = ctx.auth_profiles.get(name) or {}
     for key, value in profile.items():
         merged[str(key)] = str(value)
@@ -725,7 +725,9 @@ def _http_request(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     # 成功建立的会话（Set-Cookie / token）登记进共享账号池，供其它子代理复用。
     session_note = _capture_session(ctx, url, response)
     ctx.surface.add_endpoint(
-        url, methods=[method], params=param_names(url), source="http_request",
+        url, methods=[method],
+        params=param_names(url, [*params, *data, *(json_body if isinstance(json_body, dict) else {})]),
+        source="http_request",
         status=response.status_code,
     )
     key_headers = {k: v for k, v in response.headers.items() if k.lower() in _KEY_HEADERS}
@@ -757,16 +759,31 @@ def _compare_responses(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     base_params = args.get("params") or {}
     inject_params = args.get("inject_params") or {}
     data = args.get("data") or {}
-    if not isinstance(base_params, dict) or not isinstance(inject_params, dict):
-        return "错误：params / inject_params 必须是对象（dict）。"
+    json_body = args.get("json")
+    if not all(isinstance(item, dict) for item in (base_params, inject_params, data)) or (
+        json_body is not None and not isinstance(json_body, dict)
+    ):
+        return "错误：params / inject_params / data / json 必须是对象（dict）。"
     merged = dict(base_params)
     merged.update(inject_params)
     headers = _merge_auth_headers(ctx, args.get("headers") or {}, args.get("account"))
+    location = str(args.get("location") or (
+        "json" if json_body is not None else "form" if method in ("POST", "PUT", "PATCH") else "query"
+    )).lower()
+    if location not in ("query", "form", "json") or (
+        (location == "form" and json_body is not None) or (location == "json" and data)
+    ):
+        return "错误：location 必须匹配实际的 query / form / json 请求体。"
+    account_key = hashlib.sha256(json.dumps(
+        {key.lower(): value for key, value in headers.items()}, sort_keys=True
+    ).encode("utf-8")).hexdigest() if headers else ""
+    attempt_context = {"method": method, "account": account_key, "location": location}
 
     baseline = _send(
         ctx, method, url,
-        params=base_params if method != "POST" else None,
-        data=data if method == "POST" else None,
+        params=base_params if location == "query" else None,
+        data={**data, **base_params} if location == "form" else data or None if location == "query" else None,
+        json_body={**(json_body or {}), **base_params} if location == "json" else json_body if location == "query" else None,
         headers=headers,
     )
     if baseline is None:
@@ -774,13 +791,21 @@ def _compare_responses(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     baseline_id = _log_exchange(ctx, baseline, note="baseline")
     injected = _send(
         ctx, method, url,
-        params=merged if method != "POST" else None,
-        data={**data, **inject_params} if method == "POST" else None,
+        params=merged if location == "query" else None,
+        data={**data, **merged} if location == "form" else data or None if location == "query" else None,
+        json_body={**(json_body or {}), **merged} if location == "json" else json_body if location == "query" else None,
         headers=headers,
     )
     if injected is None:
         return f"对比失败：注入请求不可达（基线 [{baseline_id}]）。"
     injected_id = _log_exchange(ctx, injected, note=f"inject {inject_params}")
+    if injected.status_code in (401, 403):
+        ctx.surface.mark_attempt(
+            url, str(args.get("category") or "compare"), param=",".join(inject_params),
+            outcome="blocked", detail=f"HTTP {injected.status_code}：注入请求被访问控制阻断",
+            **attempt_context,
+        )
+        return f"对比失败：注入请求被 HTTP {injected.status_code} 阻断（{baseline_id}/{injected_id}），不能排除漏洞。"
 
     base_text, inj_text = baseline.text, injected.text
     differences: list[str] = []
@@ -808,10 +833,13 @@ def _compare_responses(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     ctx.surface.mark_attempt(
         url, category or "compare", param=",".join(inject_params) or "",
         payload=json.dumps(inject_params, ensure_ascii=False)[:200],
-        outcome="signal" if differences else "no_signal",
+        outcome="signal" if differences else "blocked" if baseline.status_code in (401, 403) else "no_signal",
         detail="; ".join(differences)[:300],
+        **attempt_context,
     )
     if not differences:
+        if baseline.status_code in (401, 403):
+            return f"对比失败：正常请求被 HTTP {baseline.status_code} 阻断，不能排除漏洞。"
         return (
             f"[{baseline_id} vs {injected_id}] 基线与注入响应无实质差异"
             "（该参数大概率不存在该漏洞，请换参数或换端点）。"
@@ -902,7 +930,8 @@ def _crawl(ctx: ToolRegistry, args: dict[str, Any]) -> str:
         return err
     url = parsed.geturl()
     host = (parsed.hostname or "").lower()
-    response = _send(ctx, "GET", url)
+    headers = _merge_auth_headers(ctx, args.get("headers") or {}, args.get("account"))
+    response = _send(ctx, "GET", url, headers=headers)
     if response is None:
         return "请求失败：页面不可达。"
     exchange_id = _log_exchange(ctx, response, note="crawl")
@@ -1027,7 +1056,8 @@ def _discover_endpoints(ctx: ToolRegistry, args: dict[str, Any]) -> str:
         return err
     url = parsed.geturl()
     host = (parsed.hostname or "").lower()
-    response = _send(ctx, "GET", url)
+    headers = _merge_auth_headers(ctx, args.get("headers") or {}, args.get("account"))
+    response = _send(ctx, "GET", url, headers=headers)
     if response is None:
         return "请求失败：页面不可达。"
     _log_exchange(ctx, response, note="discover_endpoints")
@@ -1039,9 +1069,16 @@ def _discover_endpoints(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     fetched: list[str] = []
     for src in script_srcs[:max_js]:
         joined = urljoin(url, src)
-        if not _same_host(joined, host):
+        js_parsed, js_error = _validate_url(ctx, joined)
+        if js_error or not _same_host(joined, host):
             continue
-        js_response = _send(ctx, "GET", joined)
+        # JS 可以跨端口引用；登录凭据只发回首页的精确 origin。
+        same_origin = (
+            js_parsed.scheme, js_parsed.hostname, js_parsed.port or (443 if js_parsed.scheme == "https" else 80)
+        ) == (
+            parsed.scheme, parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80)
+        )
+        js_response = _send(ctx, "GET", joined, headers=headers if same_origin else {})
         if js_response is None:
             continue
         _log_exchange(ctx, js_response, note="js")
@@ -1271,7 +1308,10 @@ def _dynamic_crawl(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     wait_ms = max(0, min(int(args.get("wait_ms") or 2500), 10000))
     execute_js = str(args.get("execute_js") or "").strip() or None
     try:
-        result = dynamic_scan(url, wait_ms=wait_ms, execute_js=execute_js)
+        result = dynamic_scan(
+            url, wait_ms=wait_ms, execute_js=execute_js, allowed_hosts=ctx.allowed_hosts,
+            auth_headers=_merge_auth_headers(ctx, args.get("headers") or {}, args.get("account")),
+        )
     except Exception as exc:  # noqa: BLE001 浏览器/页面异常转成可读错误
         return f"动态执行失败：{type(exc).__name__}: {exc}"
 
@@ -1417,9 +1457,13 @@ def _fuzz_params(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     if err:
         return err
     method = str(args.get("method") or "GET").upper()
-    params = args.get("params")
+    data = args.get("data") or {}
+    json_body = args.get("json")
+    params = args.get("params", json_body if isinstance(json_body, dict) else data)
     if not isinstance(params, dict) or not params:
         return '错误：params 必须是 {"参数名": "示例值"} 的非空对象（示例值给正常值即可）。'
+    if not isinstance(data, dict) or (json_body is not None and not isinstance(json_body, dict)):
+        return "错误：data / json 必须是对象（dict）。"
     categories = args.get("categories")
     if isinstance(categories, str):
         categories = [categories]
@@ -1429,7 +1473,19 @@ def _fuzz_params(ctx: ToolRegistry, args: dict[str, Any]) -> str:
             return f"错误：未知类别 {bad}。可用：{', '.join(KB.FUZZ_PAYLOADS)}"
     per_category = max(1, min(int(args.get("per_category") or 4), 12))
     headers = _merge_auth_headers(ctx, args.get("headers") or {}, args.get("account"))
-    hint_params = {name: str(value) for name, value in params.items()}
+    location = str(args.get("location") or (
+        "json" if json_body is not None else "form" if method in ("POST", "PUT", "PATCH") else "query"
+    )).lower()
+    if location not in ("query", "form", "json"):
+        return "错误：location 必须是 query / form / json。"
+    if (location == "form" and json_body is not None) or (location == "json" and data):
+        return "错误：form 与 json 请求体不能同时发送，请使用与实际接口一致的 location。"
+    # 只存有效请求头的哈希；同名账号换了会话后也允许重测。
+    account_key = hashlib.sha256(json.dumps(
+        {key.lower(): value for key, value in headers.items()}, sort_keys=True
+    ).encode("utf-8")).hexdigest() if headers else ""
+    attempt_context = {"method": method, "account": account_key, "location": location}
+    body_fields = dict(json_body or {}) if location == "json" else dict(data)
     # 被 fuzz 的端点也是攻面的一部分（否则「未测端点」统计会漏掉它）。
     ctx.surface.add_endpoint(
         url, methods=[method], params=list(params), source="fuzz"
@@ -1438,8 +1494,9 @@ def _fuzz_params(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     def send(payload_map: dict[str, Any]):
         return _send(
             ctx, method, url,
-            params=payload_map if method != "POST" else None,
-            data={**hint_params, **payload_map} if method == "POST" else None,
+            params=payload_map if location == "query" else None,
+            data={**body_fields, **payload_map} if location == "form" else data or None if location == "query" else None,
+            json_body={**body_fields, **payload_map} if location == "json" else json_body if location == "query" else None,
             headers=headers,
         )
 
@@ -1447,6 +1504,7 @@ def _fuzz_params(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     already_hit: list[str] = []
     tried = 0
     skipped = 0
+    incomplete = 0
     for name, _sample in list(params.items())[:8]:
         chosen: list[str] = list(categories) if categories else list(
             KB.PARAM_PAYLOAD_HINTS.get(str(name).lower(), ())
@@ -1456,8 +1514,10 @@ def _fuzz_params(ctx: ToolRegistry, args: dict[str, Any]) -> str:
         for category in chosen:
             payloads = _payloads_for(category)[:per_category]
             for payload in payloads:
-                previous = ctx.surface.tried_outcome(url, category, str(name), payload)
-                if previous is not None:
+                previous = ctx.surface.tried_outcome(
+                    url, category, str(name), payload, **attempt_context
+                )
+                if previous is not None and previous.outcome in ("signal", "no_signal"):
                     skipped += 1
                     if previous.outcome == "signal":
                         already_hit.append(
@@ -1469,10 +1529,23 @@ def _fuzz_params(ctx: ToolRegistry, args: dict[str, Any]) -> str:
                 payload_map = dict(params)
                 payload_map[name] = payload
                 response = send(payload_map)
-                tried += 1
+                tried += 2
                 if response is None:
+                    incomplete += 1
+                    ctx.surface.mark_attempt(
+                        url, category, param=str(name), payload=payload,
+                        outcome="error", detail="请求失败", **attempt_context,
+                    )
                     continue
                 _log_exchange(ctx, response, note=f"fuzz {name}={payload[:40]!r} ({category})")
+                if response.status_code in (401, 403):
+                    incomplete += 1
+                    ctx.surface.mark_attempt(
+                        url, category, param=str(name), payload=payload,
+                        outcome="blocked", detail=f"HTTP {response.status_code}：鉴权或访问控制阻断",
+                        **attempt_context,
+                    )
+                    continue
                 signal = _fuzz_signal(category, payload, response)
                 if not signal and baseline is not None and _reflects_and_ran(payload, response, baseline):
                     signal = (
@@ -1485,11 +1558,19 @@ def _fuzz_params(ctx: ToolRegistry, args: dict[str, Any]) -> str:
                     )
                     ctx.surface.mark_attempt(
                         url, category, param=str(name), payload=payload,
-                        outcome="signal", detail=signal,
+                        outcome="signal", detail=signal, **attempt_context,
+                    )
+                elif baseline is None or baseline.status_code in (401, 403):
+                    incomplete += 1
+                    ctx.surface.mark_attempt(
+                        url, category, param=str(name), payload=payload,
+                        outcome="error" if baseline is None else "blocked",
+                        detail="正常请求未成功取得可测试基线", **attempt_context,
                     )
                 else:
                     ctx.surface.mark_attempt(
-                        url, category, param=str(name), payload=payload, outcome="no_signal"
+                        url, category, param=str(name), payload=payload, outcome="no_signal",
+                        **attempt_context,
                     )
         # SSRF 内网地址注入：只有"语义上就是 URL/主机"的参数才试——
         # 名字命中 SSRF_PARAM_TOKENS，或该参数的建议类别里本来就有 ssrf。
@@ -1502,8 +1583,10 @@ def _fuzz_params(ctx: ToolRegistry, args: dict[str, Any]) -> str:
                 f"http://127.0.0.1:1{KB.SSRF_CANARY_PATH}",
                 f"http://127.0.0.1{KB.SSRF_CANARY_PATH}",
             ):
-                previous = ctx.surface.tried_outcome(url, "ssrf", str(name), canary)
-                if previous is not None:
+                previous = ctx.surface.tried_outcome(
+                    url, "ssrf", str(name), canary, **attempt_context
+                )
+                if previous is not None and previous.outcome in ("signal", "no_signal"):
                     skipped += 1
                     if previous.outcome == "signal":
                         already_hit.append(
@@ -1517,8 +1600,21 @@ def _fuzz_params(ctx: ToolRegistry, args: dict[str, Any]) -> str:
                 response = send(payload_map)
                 tried += 2
                 if response is None:
+                    incomplete += 1
+                    ctx.surface.mark_attempt(
+                        url, "ssrf", param=str(name), payload=canary,
+                        outcome="error", detail="请求失败", **attempt_context,
+                    )
                     continue
                 _log_exchange(ctx, response, note=f"fuzz ssrf {name}={canary}")
+                if response.status_code in (401, 403):
+                    incomplete += 1
+                    ctx.surface.mark_attempt(
+                        url, "ssrf", param=str(name), payload=canary,
+                        outcome="blocked", detail=f"HTTP {response.status_code}：鉴权或访问控制阻断",
+                        **attempt_context,
+                    )
+                    continue
                 signal = _fuzz_signal("ssrf", canary, response)
                 if not signal and baseline is not None:
                     # 回退判据：响应体显著变大 → 服务端可能真的取回了内容。
@@ -1531,11 +1627,19 @@ def _fuzz_params(ctx: ToolRegistry, args: dict[str, Any]) -> str:
                     )
                     ctx.surface.mark_attempt(
                         url, "ssrf", param=str(name), payload=canary,
-                        outcome="signal", detail=signal,
+                        outcome="signal", detail=signal, **attempt_context,
+                    )
+                elif baseline is None or baseline.status_code in (401, 403):
+                    incomplete += 1
+                    ctx.surface.mark_attempt(
+                        url, "ssrf", param=str(name), payload=canary,
+                        outcome="error" if baseline is None else "blocked",
+                        detail="正常请求未成功取得可测试基线", **attempt_context,
                     )
                 else:
                     ctx.surface.mark_attempt(
-                        url, "ssrf", param=str(name), payload=canary, outcome="no_signal"
+                        url, "ssrf", param=str(name), payload=canary, outcome="no_signal",
+                        **attempt_context,
                     )
 
     # 记录 URL 自带参数（部分接口用 query 而非表单）。
@@ -1547,6 +1651,10 @@ def _fuzz_params(ctx: ToolRegistry, args: dict[str, Any]) -> str:
         header += f"，跳过 {skipped} 个已有结论的组合"
     if already_hit:
         header += f"（其中 {len(already_hit)} 个是共享攻面里已存在的命中）"
+    if incomplete:
+        header += f"；{incomplete} 个测试被阻断或请求失败，尚未形成结论（不能据此排除漏洞）"
+        if not hits and not already_hit:
+            return "fuzz 未完成：" + header
     if not hits and not already_hit:
         return header + "：未发现异常响应信号（该类参数已标记为已试，请换端点或换参数名）。"
     lines = [header]
@@ -1759,10 +1867,13 @@ def _auth_test(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     method = str(args.get("method") or "GET").upper()
     params = args.get("params") or {}
     data = args.get("data") or {}
-    account_a = str(args.get("account_a") or "A").strip().upper()
-    account_b = str(args.get("account_b") or "B").strip().upper()
+    account_a = str(args.get("account_a", "A") or "").strip().upper()
+    account_b = str(args.get("account_b", "B") or "").strip().upper()
     if not all(isinstance(item, dict) for item in (params, data)):
         return "错误：params / data 必须是对象（dict）。"
+    for account in (account_a, account_b):
+        if account and not ctx.auth_profiles.get(account):
+            return f"错误：账号 {account} 未配置，无法完成身份对比。"
 
     def send(account: str) -> httpx.Response | None:
         headers = _merge_auth_headers(ctx, {}, account)
@@ -1779,6 +1890,12 @@ def _auth_test(ctx: ToolRegistry, args: dict[str, Any]) -> str:
         return "越权测试失败：其中一个账号的请求不可达（检查账号是否已配置）。"
     exchange_a = _log_exchange(ctx, response_a, note=f"auth_test {account_a}")
     exchange_b = _log_exchange(ctx, response_b, note=f"auth_test {account_b}")
+    if response_a.status_code in (401, 403) and response_b.status_code in (401, 403):
+        ctx.surface.mark_attempt(
+            url, "auth", param=param_names(url)[0] if param_names(url) else "",
+            outcome="blocked", detail="两个身份均被访问控制阻断", method=method,
+        )
+        return f"越权测试失败：两个身份均返回 401/403（{exchange_a}/{exchange_b}），未形成授权检查结论。"
     differences: list[str] = []
     if response_a.status_code != response_b.status_code:
         differences.append(f"状态码 {response_a.status_code} -> {response_b.status_code}")
@@ -2381,7 +2498,17 @@ def _sqlmap_scan(ctx: ToolRegistry, args: dict[str, Any]) -> str:
     ]
     body = "\n".join(key_lines[:60]) or output[:2500]
 
-    if "is vulnerable" in output or "injectable" in output.lower():
+    confirmed = any(
+        re.search(
+            r"\bidentified the following injection point|\bis vulnerable\b|"
+            r"\b(?:GET|POST|URI|Cookie|HTTP header|custom) parameter\b[^\n]*"
+            r"\b(?:is|appears to be)\b[^\n]*\binjectable\b",
+            line, re.I,
+        )
+        and not re.search(r"\b(?:not|isn't|doesn't|cannot|can't|unable)\b", line, re.I)
+        for line in output.splitlines()
+    )
+    if confirmed:
         ctx.surface.add_note(f"sqlmap 确认注入：{url} {data}".strip())
         verdict = (
             "结论：**注入成立**（工具级证据）。把上面的 payload 与类型写进 record_finding 的 "
@@ -2746,6 +2873,7 @@ def _browser_verify_xss(ctx: ToolRegistry, args: dict[str, Any]) -> str:
         )
     verifier = BrowserVerifier(
         allowed_hosts=ctx.allowed_hosts,
+        auth_headers=_merge_auth_headers(ctx, args.get("headers") or {}, args.get("account")),
         timeout_ms=int(args.get("timeout_ms") or 20000),
         wait_ms=int(args.get("wait_ms") or 1500),
         channel=str(args.get("channel") or "").strip(),
@@ -2846,19 +2974,21 @@ _DESC_HTTP_REQUEST = (
     "请求/响应会被完整保存，供 record_finding 作为证据。"
 )
 _DESC_COMPARE_RESPONSES = (
-    "基线/注入响应精确对比（找差异=找证据）。参数：{\"url\": 端点, \"method\": \"GET/POST\", "
+    "基线/注入响应精确对比（找差异=找证据）。参数：{\"url\": 端点, \"method\": \"GET/POST/PUT/PATCH\", "
     "\"params\": {原始参数}, \"inject_params\": {要覆盖的参数: payload}, \"data\": {POST 表单}, "
+    "\"json\": {正常JSON体}, \"location\": \"query/form/json\"(可选，指定注入位置), "
     "\"category\": \"sqli/xss/ssti/cmd/path/ssrf/nosqli/xxe/redirect/crlf\"(可选，附加特征判定)}。"
     "返回状态码/长度/响应头/内容差异与首个差异片段，并给出两个证据编号。"
     "强烈建议：fuzz 命中后先用本工具确认差异稳定，再 record_finding。"
 )
 _DESC_CRAWL = (
-    "爬取页面并提取攻击面。参数：{\"url\": 页面URL}。返回状态码、标题、Server/X-Powered-By、"
+    "爬取页面并提取攻击面。参数：{\"url\": 页面URL, \"account\": \"A/B/C\"(可选，空串为匿名)}。返回状态码、标题、Server/X-Powered-By、"
     "技术栈指纹、同域链接（高价值优先）、表单（方法/action/参数名）、同域 JS 地址。"
     "结果会写入共享攻面，其他子代理可直接复用，不要重复爬同一页。"
 )
 _DESC_DISCOVER_ENDPOINTS = (
     "从页面与同域 JS 中提取疑似 API/接口路径。参数：{\"url\": 页面URL, \"max_js\": 最多读几个JS(默认5)}。"
+    "可传 account=\"A/B/C\" 使用登录态；跨 origin JS 不携带登录凭据。"
     "适合发现隐藏接口与前端调用的 /api 路径。"
 )
 _DESC_ENUMERATE_COMMON = (
@@ -2875,7 +3005,9 @@ _DESC_READ_URLS = (
 )
 _DESC_FUZZ_PARAMS = (
     "对参数批量注入 payload（按参数语义自动选类别，已试过且无信号的组合自动跳过）。参数："
-    "{\"url\": 端点, \"method\": \"GET/POST\", \"params\": {参数名: 正常示例值}, "
+    "{\"url\": 端点, \"method\": \"GET/POST/PUT/PATCH\", \"params\": {参数名: 正常示例值}, "
+    "\"location\": \"query/form/json\"(可选，默认GET=query、POST/PUT/PATCH=form，给json时=json), "
+    "\"data\": {正常表单其它字段}, \"json\": {正常JSON体}, \"account\": \"A/B/C\"(可选，空串为匿名), "
     "\"categories\": [\"sqli\",\"xss\",\"ssti\",\"cmd\",\"path\",\"ssrf\",\"redirect\",\"crlf\",\"nosqli\",\"xxe\"](可选), "
     "\"per_category\": 每类几条(默认4)}。返回命中信号 + 明确的复现指引。命中仅为「疑似」。"
 )
@@ -3211,6 +3343,10 @@ class ToolRegistry:
         #: 在 execute() 里统一记，两个来源都覆盖到，且天然带时长与成败。
         self.trace = trace
         self._tools: dict[str, Tool] = {}
+        #: 工具失败统计（种类 → {工具名: 次数}）。见 `tool_failure_stats()`：
+        #: 报告要能回答"这一轮为什么没测出东西"——是环境缺工具、还是我们自己的 bug。
+        self._tool_failures: dict[str, dict[str, int]] = {}
+        self._failure_lock = threading.Lock()
         self._register_defaults()
 
     # ---------- 共享状态访问 ----------
@@ -3488,12 +3624,16 @@ class ToolRegistry:
         """
         tool = self._tools.get(name)
         if tool is None:
+            # 统计"模型想调但没下发"的工具：这是环境能力缺口最直接的证据
+            # （沙箱没接上时，用户看到的就是这个数字在涨）。
+            self._count_failure("unknown", name)
             available = ", ".join(sorted(self._tools))
             return f"错误：未知工具 {name!r}。当前角色的可用工具：{available}。"
         if not isinstance(action_input, dict):
             action_input = {}
         granted, reason = self.budget.reserve_tool_call(task=self.task_usage)
         if not granted:
+            self._count_failure("budget", name)
             return (
                 f"错误：预算已用尽，本次 {name} 调用未执行（{reason}）。"
                 "请立刻用 finish_task 交回已有结论，不要再发起新的工具调用。"
@@ -3504,13 +3644,54 @@ class ToolRegistry:
             result = tool.func(_truncate_args(action_input))
         except Exception as exc:  # noqa: BLE001 工具层兜底：任何异常都转成字符串喂回 agent
             error = f"{type(exc).__name__}: {exc}"
+            self._count_failure("crashed", name)
             self._trace_tool(name, action_input, started, output="", error=error)
             return f"工具执行出错：{error}"
         text, structured = _govern(name, result, self)
         if structured is not result:
             self.last_result = structured
-        self._trace_tool(name, action_input, started, output=text)
+        raw_text = str(structured.get("llm") or text)
+        returned_error = structured.get("error") or (
+            raw_text if structured.get("ok") is False or re.match(
+                r"^(?:\[[^\]\n]+\]\s*)?(?:错误[:：]|拒绝[:：]|工具执行出错[:：]|"
+                r"[^\n]{0,60}(?:失败|未完成)[:：])", raw_text,
+            ) else ""
+        )
+        if returned_error:
+            self._count_failure("returned", name)
+        self._trace_tool(name, action_input, started, output=text, error=str(returned_error)[:500])
         return text
+
+    def _count_failure(self, kind: str, name: str) -> None:
+        """记一次工具失败（按种类 + 工具名）。并发下用锁保护，读侧永远拿快照。"""
+        try:
+            with self._failure_lock:
+                bucket = self._tool_failures.setdefault(kind, {})
+                bucket[name] = int(bucket.get(name, 0)) + 1
+        except Exception:  # noqa: BLE001 统计失败绝不影响工具执行
+            pass
+
+    def tool_failure_stats(self) -> dict[str, Any]:
+        """工具失败统计（写进 run.json / 报告，用来回答"为什么这轮没测出东西"）。
+
+        - `unknown`：提示词/模型想调、但本次**没有下发**的工具——环境能力缺口的直接证据；
+        - `crashed`：工具内部抛异常（我们自己的 bug）；
+        - `returned`：工具正常返回但结果是错误/拒绝（例如白名单外主机被拒）；
+        - `budget`：预算用尽导致的未执行。
+
+        这四类必须分开：它们对应的动作完全不同（补环境 / 修 bug / 核对 scope / 调预算）。
+        """
+        try:
+            with self._failure_lock:
+                stats = {kind: dict(bucket) for kind, bucket in self._tool_failures.items()}
+        except Exception:  # noqa: BLE001
+            stats = {}
+        total = sum(sum(bucket.values()) for bucket in stats.values())
+        return {
+            **stats,
+            "total": total,
+            "tools_available": len(self._tools),
+        }
 
     def _trace_tool(
         self,

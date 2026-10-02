@@ -53,7 +53,7 @@ from .providers import (
     get_preset,
 )
 from .report import build_diff, write_report
-from .sandbox import Sandbox, detect_runtime
+from .sandbox import Sandbox, detect_runtime, prepare_sandbox, sandbox_report
 from .submission import write_butian_package
 from .surface import SEVERITY_RANK, AttackSurface
 from .tools import ToolRegistry
@@ -294,26 +294,25 @@ def _run_audit(
     llm, llm_pool = _build_llm_pool(config, verbose)
     budget = Budget(limits_from_config(config))
 
-    # 真工具沙箱：自动探测执行环境；不可用则如实降级（报告里会写明）
+    # 真工具沙箱：自动探测执行环境；不可用则如实降级（报告里会写明到底哪一步没成）
     sandbox = None
+    sandbox_setup = None
     if use_sandbox:
-        sandbox = Sandbox(
-            allowed_hosts=config.allowed_hosts,
+        sandbox_setup = prepare_sandbox(
+            config.allowed_hosts,
             exec_timeout=max(120, config.request_timeout * 30),
             map_loopback=map_loopback,
             verbose=verbose,
         )
-        probe = sandbox.probe()
-        if probe.get("ok"):
-            present = sorted(name for name, ok in (probe.get("tools") or {}).items() if ok)
-            click.echo(f"真工具沙箱：{probe.get('runtime')}（可用工具：{', '.join(present)}）")
+        sandbox = sandbox_setup.sandbox
+        if sandbox_setup.ok:
+            click.echo(sandbox_setup.message())
             if map_loopback:
                 click.echo(f"  回环目标映射到：{sandbox.host_gateway()}")
         else:
-            click.echo(f"{MARK_WARN} 真工具沙箱不可用，降级为内置 HTTP 探测：{probe.get('reason')}")
-            if probe.get("hint"):
-                click.echo(f"  {probe['hint']}")
-            sandbox = None
+            click.echo(f"{MARK_WARN} {sandbox_setup.message()}")
+            if sandbox_setup.hint:
+                click.echo(f"  {sandbox_setup.hint}")
     artifacts = RunArtifacts(target)
     surface = AttackSurface(
             target=target, mode=mode, path=artifacts.surface_path,
@@ -449,6 +448,7 @@ def _run_audit(
             memory=HostMemory(target),
             llm_pool=llm_pool,
             sandbox=sandbox,
+            sandbox_note=sandbox_setup,
             coverage_sweep=coverage_sweep,
         )
         result = orchestrator.run()
@@ -476,6 +476,13 @@ def _run_audit(
             role="source" if mode == "source" else "blackbox",
         )
         result = agent.run(goal, on_step=on_step)
+        # 单代理路径也必须记录执行环境状态：报告里要能看出"这次到底有没有用上真工具"。
+        result.sandbox = sandbox_report(
+            sandbox,
+            reason=sandbox_setup.reason if sandbox_setup else "",
+            hint=sandbox_setup.hint if sandbox_setup else "",
+            tools=sandbox_setup.tools if sandbox_setup else (),
+        )
         artifacts.save_surface(surface)
 
     output_path = Path(output)

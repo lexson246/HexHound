@@ -23,6 +23,7 @@ import socket
 import ssl
 import time
 from dataclasses import dataclass, field
+from typing import Any
 from urllib.parse import urlparse
 
 #: 常见代理环境变量（httpx/openai 默认 trust_env=True 会读它们）。
@@ -275,13 +276,48 @@ def probe_endpoint(base_url: str, *, timeout: float = 8.0) -> EndpointProbe:
     return probe
 
 
+def _is_loopback(host: str) -> bool:
+    name = str(host or "").strip().strip("[]").lower()
+    if name in ("localhost", "::1", "0.0.0.0"):
+        return True
+    return name.startswith("127.")
+
+
+def diagnostic_client(base_url: str, *, timeout: float) -> Any:
+    """构造诊断用的 httpx 客户端：**不读环境变量**，代理由我们自己决定。
+
+    为什么要绕开 `trust_env`（真实故障，Round4 实测）：不少代理工具会把
+    `NO_PROXY=localhost,127.0.0.1,::1,[::1]` 写进环境变量，而 httpx 解析
+    `[::1]` 这个条目时会抛 `InvalidURL: Invalid port: ':1]'`——**请求还没发出去**
+    诊断自己就先崩了，用户看到的是一句与网络状况毫无关系的 "InvalidURL"。
+
+    规则：
+    - 本机目标（127.0.0.1/localhost/::1）**直连**，绝不走代理——
+      诊断本地服务却经过代理毫无意义，而且代理多半连不上回环地址；
+    - 其它目标用 `effective_proxy()` 解析出来的代理（含 Windows 系统代理）。
+    """
+    import httpx
+
+    kwargs: dict[str, Any] = {
+        "timeout": timeout,
+        "follow_redirects": True,
+        # 关掉 env 解析：代理由上面的规则显式给出，坏掉的 NO_PROXY 不该拖垮诊断
+        "trust_env": False,
+    }
+    host = urlparse(str(base_url or "")).hostname or ""
+    if not _is_loopback(host):
+        proxy = effective_proxy()
+        chosen = proxy.get("all") or proxy.get("https") or proxy.get("http") or ""
+        if chosen:
+            kwargs["proxy"] = chosen
+    return httpx.Client(**kwargs)
+
+
 def _unauthenticated_get(base_url: str, *, timeout: float) -> tuple[int, str]:
     """发一个**不带凭据**的请求，只看服务是否响应。"""
     url = base_url.rstrip("/") + "/v1/models"
     try:
-        import httpx
-
-        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        with diagnostic_client(base_url, timeout=timeout) as client:
             response = client.get(url)
             return response.status_code, ""
     except Exception as exc:  # noqa: BLE001 探测失败就是失败，不必区分类型
@@ -299,9 +335,7 @@ def list_models(base_url: str, api_key: str, *, timeout: float = 15.0) -> tuple[
         return [], "没有可用的 API key（此接口需要鉴权；key 不会被记录或打印）"
     url = str(base_url or "").rstrip("/") + "/v1/models"
     try:
-        import httpx
-
-        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        with diagnostic_client(base_url, timeout=timeout) as client:
             response = client.get(url, headers={"Authorization": f"Bearer {api_key}"})
     except Exception as exc:  # noqa: BLE001
         return [], describe_exception(exc)

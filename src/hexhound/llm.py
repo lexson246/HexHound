@@ -1,9 +1,12 @@
 """OpenAI 兼容 LLM 客户端封装（支持按提供商计价与连通性自检）。"""
 from __future__ import annotations
 
+import json
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 from openai import OpenAI
 
@@ -28,6 +31,8 @@ class LLMUsage:
     total_tokens: int
     cache_hit_tokens: int = 0
     cache_miss_tokens: int = 0
+    reasoning_tokens: int = 0
+    finish_reason: str = ""
 
 
 def estimate_cost(usage: LLMUsage, pricing: dict[str, float] | None = None) -> float:
@@ -148,6 +153,7 @@ def build_llm_pool(
         config.base_url,
         config.model,
         temperature=getattr(config, "temperature", 0.2),
+        reasoning_effort=getattr(config, "reasoning_effort", ""),
         provider=config.provider,
         pricing=pricing_for(config.provider),
         label=f"{config.provider}/{config.model}",
@@ -169,6 +175,7 @@ def build_llm_pool(
             resolved.base_url,
             resolved.model,
             temperature=getattr(config, "temperature", 0.2),
+            reasoning_effort=getattr(config, "reasoning_effort", ""),
             provider=resolved.provider,
             pricing=pricing_for(resolved.provider),
             label=f"{resolved.provider}/{resolved.model}",
@@ -195,6 +202,77 @@ def _dead_proxy_detail() -> tuple[bool, str]:
     except Exception:  # noqa: BLE001 诊断失败就当没有代理问题
         return False, ""
     return False, ""
+
+
+def _no_proxy_entries() -> list[str]:
+    """`NO_PROXY` / `no_proxy` 里的条目（宽容解析，坏的条目直接丢弃）。"""
+    raw = os.getenv("NO_PROXY") or os.getenv("no_proxy") or ""
+    return [item.strip().lower() for item in raw.split(",") if item.strip()]
+
+
+def _host_in_no_proxy(host: str) -> bool:
+    """目标主机是否被 `NO_PROXY` 排除在代理之外（自己实现，不吃 httpx 的解析）。
+
+    为什么要自己实现：某些代理工具会把 `NO_PROXY=...,::1,[::1]` 写进环境变量，
+    而 httpx 解析 `[::1]` 这个条目时会抛 `InvalidURL: Invalid port: ':1]'`——
+    **客户端还没发请求就构造失败**，用户看到的是一句与网络无关的报错。
+    这里的实现只做"能不能对上"的匹配，遇到不认识的条目就跳过。
+    """
+    import fnmatch
+
+    name = str(host or "").strip().strip("[]").lower()
+    if not name:
+        return False
+    for entry in _no_proxy_entries():
+        candidate = entry.lstrip(".").strip("[]")
+        if candidate in ("*", ""):
+            return True
+        if name == candidate or name.endswith("." + candidate):
+            return True
+        if fnmatch.fnmatch(name, candidate) or fnmatch.fnmatch(name, entry):
+            return True
+    return False
+
+
+def _proxy_for_target(target_url: str) -> str:
+    """这个目标该用哪个代理（空串 = 直连）。规则与浏览器/httpx 的常规语义一致。"""
+    from .diagnose import _is_loopback, effective_proxy
+
+    host = urlparse(str(target_url or "")).hostname or ""
+    if _is_loopback(host) or _host_in_no_proxy(host):
+        return ""
+    try:
+        resolved = effective_proxy()
+    except Exception:  # noqa: BLE001 解析不出来就当没有代理
+        return ""
+    return str(resolved.get("all") or resolved.get("https") or resolved.get("http") or "")
+
+
+def _client_for_target(target_url: str, timeout: float):
+    """按目标决定代理的 httpx 客户端（None = 用 SDK 默认行为）。
+
+    为什么要接管代理解析：默认的 `trust_env=True` 让 httpx 去解析整套环境变量，
+    其中 `NO_PROXY` 只要有一个它不认识的写法（例如 `[::1]`）就会**构造失败**。
+    这里改成我们自己解析（`_proxy_for_target`），把 NO_PROXY 的语义实现得宽容一些，
+    行为与常规语义一致：本机/被排除的目标直连，其余按 `effective_proxy()` 走代理。
+    """
+    try:
+        import httpx
+    except Exception:  # noqa: BLE001 没装 httpx 时交给 SDK 自己处理
+        return None
+    try:
+        proxy = _proxy_for_target(target_url)
+    except Exception:  # noqa: BLE001
+        return None
+    if not proxy:
+        # 目标应当直连：显式关掉 env，避免坏掉的 NO_PROXY 把客户端构造搞崩
+        from .diagnose import _is_loopback
+
+        host = str(urlparse(str(target_url or "")).hostname or "")
+        if _no_proxy_entries() or _is_loopback(host):
+            return httpx.Client(timeout=timeout, trust_env=False)
+        return None
+    return httpx.Client(timeout=timeout, trust_env=False, proxy=proxy)
 
 
 def _http_client_for_timeout(timeout: float):
@@ -240,10 +318,15 @@ class LLMClient:
         label: str = "",
         timeout: float = 180.0,
         pricing: dict[str, float] | None = None,
+        reasoning_effort: str = "",
     ) -> None:
         self._model = model
         self._temperature = temperature
         self.provider = provider or "custom"
+        effort = str(reasoning_effort or "").strip().lower()
+        if effort not in ("", "low", "high", "max"):
+            raise ValueError("DeepSeek 推理强度只能留空（服务端默认）或填写 low / high / max。")
+        self.reasoning_effort = effort if self.provider == "deepseek" else ""
         self.label = label or self.provider
         self.base_url = base_url or ""
         #: 建客户端时的网络侧说明（例如"绕过了已死的系统代理"），供界面/CLI 展示。
@@ -255,6 +338,9 @@ class LLMClient:
                 "若你需要走代理出网，请先启动代理客户端；否则请在系统设置里关掉代理。"
             )
         http_client = _http_client_for_timeout(timeout) if dead_proxy else None
+        if http_client is None:
+            # 代理解析由我们自己做：坏掉的 NO_PROXY 不该让"构造客户端"这一步就失败
+            http_client = _client_for_target(self.base_url, timeout)
         # 本地服务/自定义端点常常不需要 key；SDK 只是要求非空字符串。
         self._client = OpenAI(
             api_key=api_key or "EMPTY",
@@ -274,6 +360,23 @@ class LLMClient:
     def describe(self) -> str:
         return f"{self.provider}/{self._model}"
 
+    def request_config(self) -> dict[str, Any]:
+        """实际发送的非敏感参数，空推理强度明确表示未覆盖服务端默认值。"""
+        return {
+            "provider": self.provider,
+            "model": self._model,
+            "temperature": self._temperature,
+            "reasoning_effort": self.reasoning_effort or "server_default",
+        }
+
+    def _request_options(self) -> dict[str, Any]:
+        if self.reasoning_effort:
+            return {
+                "reasoning_effort": self.reasoning_effort,
+                "extra_body": {"thinking": {"type": "enabled"}},
+            }
+        return {}
+
     # ---------- 调用 ----------
 
     def complete(self, messages: list[Message]) -> tuple[str, LLMUsage]:
@@ -282,6 +385,7 @@ class LLMClient:
             model=self._model,
             messages=messages,
             temperature=self._temperature,
+            **self._request_options(),
         )
         content = response.choices[0].message.content or ""
         usage_obj = response.usage
@@ -307,6 +411,8 @@ class LLMClient:
             total_tokens=total_tokens,
             cache_hit_tokens=int(cache_hit_tokens or 0),
             cache_miss_tokens=int(cache_miss_tokens or 0),
+            reasoning_tokens=int(getattr(getattr(usage_obj, "completion_tokens_details", None), "reasoning_tokens", 0) or 0),
+            finish_reason=str(getattr(response.choices[0], "finish_reason", "") or ""),
         )
 
     def test_connection(self, timeout: float = 30.0) -> ConnectionCheck:
@@ -319,10 +425,11 @@ class LLMClient:
         try:
             response = self._client.chat.completions.create(
                 model=self._model,
-                messages=[{"role": "user", "content": '只回复两个字：可用'}],
-                max_tokens=16,
-                temperature=0,
+                messages=[{"role": "user", "content": '只输出此 JSON，不要 Markdown：{"action":"finish_task","action_input":{"summary":"可用"}}'}],
+                max_tokens=2048,
+                temperature=self._temperature,
                 timeout=timeout,
+                **self._request_options(),
             )
         except Exception as exc:  # noqa: BLE001 这里就是要把各种 SDK 异常转成可读结论
             category, advice = classify_error(exc)
@@ -337,9 +444,11 @@ class LLMClient:
             )
         latency = int((time.time() - started) * 1000)
         content = ""
+        finish_reason = ""
         usage: dict[str, Any] = {}
         try:
             content = (response.choices[0].message.content or "").strip()
+            finish_reason = str(getattr(response.choices[0], "finish_reason", "") or "")
         except (AttributeError, IndexError):
             content = ""
         if response.usage is not None:
@@ -348,14 +457,34 @@ class LLMClient:
                 "completion_tokens": int(response.usage.completion_tokens or 0),
                 "total_tokens": int(response.usage.total_tokens or 0),
             }
+        problem = ""
+        if finish_reason == "length":
+            problem = "模型响应被输出上限截断；连接已建立，但未通过动作 JSON 检查。"
+        elif finish_reason not in ("", "stop"):
+            problem = f"模型响应未正常完成（finish_reason={finish_reason}）；未通过动作 JSON 检查。"
+        elif not content:
+            problem = "模型返回空内容；连接已建立，但未通过动作 JSON 检查。"
+        else:
+            try:
+                action = json.loads(content)
+                valid = (
+                    isinstance(action, dict)
+                    and action.get("action") == "finish_task"
+                    and isinstance(action.get("action_input"), dict)
+                    and bool(action["action_input"].get("summary"))
+                )
+            except (TypeError, ValueError):
+                valid = False
+            if not valid:
+                problem = "模型没有返回要求的动作 JSON；请检查模型的指令遵循能力或兼容端点。"
         return ConnectionCheck(
-            ok=True,
+            ok=not problem,
             provider=self.provider,
             model=self._model,
             base_url=self.base_url,
             latency_ms=latency,
-            message=f"连接正常（{latency} ms）",
+            message=problem or f"连接正常，动作 JSON 检查通过（{latency} ms）；推理强度：{self.reasoning_effort or '服务端默认'}",
             sample=content[:80],
             usage=usage,
-            category="ok",
+            category="response" if problem else "ok",
         )

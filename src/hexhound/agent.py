@@ -20,9 +20,18 @@ from typing import Any
 
 from .budget import Budget
 from .llm import LLMClient, estimate_cost
-from .prompts import build_system_prompt, build_task_prompt, finish_instruction
+from .prompts import (
+    adapt_prompt_to_tools,
+    build_system_prompt,
+    build_task_prompt,
+    finish_instruction,
+)
 from .surface import AttackSurface
-from .tools import ToolRegistry
+from .tools import BROWSER_TOOLS, SANDBOX_TOOLS, ToolRegistry
+
+#: 依赖执行环境的工具名（沙箱/浏览器缺失时不下发）。
+#: 提示词里提到它们的地方必须同步摘掉——见 `adapt_prompt_to_tools`。
+_OPTIONAL_TOOLS: tuple[str, ...] = (*SANDBOX_TOOLS, *BROWSER_TOOLS)
 
 
 def _summarize_steps(steps: list[dict[str, Any]], limit: int = 6000) -> str:
@@ -128,6 +137,17 @@ def _extract_balanced_object(text: str) -> Any:
     raise ValueError("JSON 对象未闭合")
 
 
+def _tool_failure_stats(tools: Any) -> dict[str, Any]:
+    """取工具失败统计（注册表没有这个能力时返回空，不影响主流程）。"""
+    getter = getattr(tools, "tool_failure_stats", None)
+    if not callable(getter):
+        return {}
+    try:
+        return dict(getter() or {})
+    except Exception:  # noqa: BLE001 统计拿不到不该影响一次运行
+        return {}
+
+
 @dataclass
 class AgentResult:
     """一次审计运行的完整结果。"""
@@ -152,6 +172,9 @@ class AgentResult:
     models: dict[str, str] = field(default_factory=dict)
     #: 真工具沙箱状态（报告里必须能看出"这次用了真工具还是只做了 HTTP 探测"）。
     sandbox: dict[str, Any] = field(default_factory=dict)
+    #: 工具失败统计（未知工具/崩溃/返回错误/预算拒绝）。报告要能回答
+    #: "这一轮为什么没测出东西"——是环境缺工具，还是我们自己的 bug。
+    tool_failures: dict[str, Any] = field(default_factory=dict)
     #: 真工具执行记录（命令 + 输出），作为报告的证据附录。
     tool_log: list[dict[str, Any]] = field(default_factory=list)
     #: 覆盖率闸门结果：{total, touched, untouched, ratio, untouched_sample}
@@ -196,6 +219,7 @@ class AgentResult:
             "poc_paths": dict(self.poc_paths),
             "models": dict(self.models),
             "sandbox": dict(self.sandbox),
+            "tool_failures": dict(self.tool_failures),
             "tool_log": list(self.tool_log),
             "coverage_gate": dict(self.coverage_gate),
             "deduped": self.deduped,
@@ -232,6 +256,7 @@ class AgentResult:
             deduped=int(payload.get("deduped") or 0),
             models=dict(payload.get("models") or {}),
             sandbox=dict(payload.get("sandbox") or {}),
+            tool_failures=dict(payload.get("tool_failures") or {}),
             tool_log=list(payload.get("tool_log") or []),
             coverage_gate=dict(payload.get("coverage_gate") or {}),
             previous_findings=list(payload.get("previous_findings") or []),
@@ -350,8 +375,21 @@ class ReActAgent:
         role = self.role if self.role in ("recon", "injection", "auth", "verify", "source") else (
             "blackbox" if mode == "blackbox" else "source"
         )
+        trace = getattr(self.tools, "trace", None)
+        request_config = getattr(self.llm, "request_config", None)
+        if trace is not None and callable(request_config):
+            trace.record("llm_config", task=getattr(self.tools, "worker_id", ""), role=role, **request_config())
         system = build_system_prompt(self.tools.describe(), mode, role)
-        # 把"本次真工具能力"贴进系统提示词——模型不会自己发现有 sqlmap 可用
+        # 角色正文是静态的（"首选 sqlmap_scan"、"必须用 sandbox_script"），
+        # 而工具集是按环境动态裁剪的：沙箱不可用时这些名字根本不存在。
+        # 不把两边对齐，模型就会照着提示词反复调用不存在的工具，每次拿回一句
+        # "未知工具"——用户看到的"一直报未知工具"就是这么来的。
+        try:
+            names = list(self.tools.tool_names())
+        except Exception:  # noqa: BLE001 取不到就当"什么都没有"，只会更保守
+            names = []
+        system = adapt_prompt_to_tools(system, names, _OPTIONAL_TOOLS)
+        # 把"本次真工具能力"贴进提示词——模型不会自己发现有 sqlmap 可用
         briefing = ""
         getter = getattr(self.tools, "sandbox_briefing", None)
         if callable(getter):
@@ -487,6 +525,23 @@ class ReActAgent:
             self.budget.add_usage(usage, task=task_usage)
             self._accumulate(usage, totals)
             publish_usage()
+            response_finish = str(getattr(usage, "finish_reason", "") or "")
+            if trace is not None:
+                trace.record(
+                    "llm_response", task=getattr(self.tools, "worker_id", ""), role=role,
+                    step=step_no, finish_reason=response_finish,
+                    reasoning_tokens=int(getattr(usage, "reasoning_tokens", 0) or 0),
+                    total_tokens=int(getattr(usage, "total_tokens", 0) or 0),
+                    content_empty=not bool(content.strip()),
+                )
+            if not content.strip() or response_finish not in ("", "stop"):
+                finish_reason = "provider_error"
+                final_summary = (
+                    f"模型返回空内容或未完成响应（finish_reason={response_finish or '未提供'}）。"
+                    "已保留已有产出与本次 token 用量，请检查模型输出上限或兼容端点。"
+                )
+                emit({"step": step_no, "action": "provider_error", "observation": final_summary})
+                break
             messages.append({"role": "assistant", "content": content})
             if self.verbose:
                 print(f"\n===== Step {step_no} ({phase}) =====")
@@ -623,6 +678,8 @@ class ReActAgent:
             poc_paths=dict(getattr(self.tools, "poc_paths", {}) or {}),
             closing=closing.to_dict(),
             usage=task_usage.to_dict() if task_usage is not None else {},
+            # 工具失败统计：报告要能区分"环境缺工具"与"我们自己的 bug"
+            tool_failures=_tool_failure_stats(self.tools),
         )
 
 

@@ -287,6 +287,8 @@ class Config:
     max_seconds: float = 0.0
     #: 采样温度（推理型模型建议保持默认）。
     temperature: float = 0.2
+    #: DeepSeek 推理强度；空值不发送参数，沿用服务端默认值。
+    reasoning_effort: str = ""
 
     # ---------- 构建 ----------
 
@@ -348,6 +350,7 @@ class Config:
             max_tool_calls=max(0, _parse_int("MAX_TOOL_CALLS", 0)),
             max_seconds=max(0.0, _parse_float("MAX_SECONDS", 0.0)),
             temperature=min(2.0, max(0.0, _parse_float("TEMPERATURE", 0.2))),
+            reasoning_effort=os.getenv("LLM_REASONING_EFFORT", "").strip().lower(),
         )
         config.validate()
         return config
@@ -436,6 +439,8 @@ class Config:
 
     def validate(self) -> None:
         """校验配置；缺 key / 缺提供商 / 缺 base_url 时抛出可读错误。"""
+        if self.reasoning_effort not in ("", "low", "high", "max"):
+            raise ValueError("DeepSeek 推理强度只能留空（服务端默认）或填写 low / high / max。")
         if not self.provider:
             raise ValueError(
                 "还没有选择模型提供商。任选一种方式：\n"

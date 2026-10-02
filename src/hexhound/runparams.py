@@ -63,9 +63,11 @@ FIELDS: tuple[NumberField, ...] = (
     NumberField("max_tool_calls", "工具调用上限", "次", "int", 0, unlimited_at_zero=True),
     NumberField("max_seconds", "总时长上限", "秒", "float", 0.0, unlimited_at_zero=True),
     # --- 执行规模 ---
-    NumberField("max_steps", "单代理最大步数", "步", "int", 30, minimum=1),
+    NumberField("max_steps", "单代理最大步数", "步", "int", 30, minimum=1,
+                hint="仅单代理模式；多代理使用子任务最大步数"),
     NumberField("max_tasks", "子任务上限", "个", "int", 6, minimum=1, maximum=12),
-    NumberField("task_steps", "子任务最大步数", "步", "int", 10, minimum=4, maximum=30),
+    NumberField("task_steps", "子任务最大步数", "步", "int", 10, minimum=4, maximum=30,
+                hint="每个子任务的探测上限；另有至多两轮受限收尾，各波次步数累计"),
     NumberField("parallel", "并发子任务数", "个", "int", 3, minimum=1, maximum=6),
     NumberField("request_timeout", "单请求超时", "秒", "int", 10, minimum=1),
     NumberField("rate_limit", "请求最小间隔", "秒", "float", 0.0, minimum=0.0),
@@ -195,6 +197,7 @@ def config_from_settings(
         model=str(model or ""),
         provider=str(provider or ""),
         role_models=dict(role_models or {}),
+        reasoning_effort=str(settings.get("reasoning_effort") or "").strip().lower(),
         allowed_hosts=frozenset(allowed_hosts or ()),
         **{key: parsed[key] for key in parsed},
     )
