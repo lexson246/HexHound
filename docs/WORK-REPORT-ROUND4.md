@@ -220,6 +220,27 @@ python -m pytest tests/test_xssverify.py -q
 python -m ruff check src tests tools
 ```
 
+### 9.1 真工具链路端到端（零模型额度）
+
+单元测试只能证明"参数传下去了"。为了回答"桌面/CLI 到底能不能用真工具"，
+新增 `tools/verify_real_tool_chain.py`：用**真沙箱**（WSL Ubuntu-24.04）构建
+注入角色的注册表，对 WSL 里的靶场跑真工具，逐项断言。
+本机实测（靶场 `tools/start_lab_in_wsl.sh 5000`）：
+
+```
+[OK] prepare_sandbox 判定可用 — 真工具沙箱：WSL (Ubuntu-24.04)（可用工具：curl, ffuf,
+     gobuster, nikto, nmap, nuclei, python3, sqlmap, whatweb）
+[OK] 注入角色持有 sqlmap_scan / template_scan / sandbox_script / raw_command
+[OK] sqlmap_scan 真的跑起来了 — [E2E-T1] sqlmap 结果（…，耗时 2s）
+[OK] sandbox_script 执行成功 — [E2E-T2] 自定义脚本执行成功（耗时 0s，123 字符）
+[OK] raw_command 未报未知工具 — [E2E-T3] 命令成功
+[OK] 失败统计里没有'未下发的工具' — {'total': 0, 'tools_available': 23}
+[OK] 提示词无缺失工具清单 / 提示词广告了 sqlmap_scan
+端到端验证通过：真工具链路可用，无未知工具、无工具异常。
+```
+
+这正是用户报的那条故障的反面：**没有一次"未知工具"，工具全部真的执行了**。
+
 打包验证：
 
 ```bash
@@ -227,6 +248,12 @@ python -m PyInstaller --noconfirm --clean HexHound-desktop.spec   # → hexhound
 python -m PyInstaller --noconfirm --clean HexHound.spec           # → dist\hexhound.exe
 python tools/verify_desktop_exe.py                                # 21 项启动验收
 ```
+
+本轮实测：桌面 `hexhound.exe` **21/21 通过**（含双击启动、WebView2 渲染、
+端口仅回环、写接口 CSRF 403、关窗口后端口释放、设置不污染真实配置）；
+CLI `dist\hexhound.exe sandbox status` 正确识别 WSL 与 9 个工具；
+`dist\hexhound.exe doctor` 在本机"系统代理已开启 + NO_PROXY 含 `[::1]`"的真实环境下
+链路可达（HTTP 401 未认证探测，不消耗额度）。
 
 ---
 
