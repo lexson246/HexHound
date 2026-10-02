@@ -184,11 +184,48 @@ def main() -> int:
     print(f"     发现：{len(result.findings)} 条（去重 {result.deduped}）｜用量：{budget.describe()}")
     print(f"     产物：{artifacts.dir}")
 
+    # ---- 5. 墙钟软上限：真的会拦住后续波次，并被如实记录 ----
+    soft_events: list[dict] = []
+    soft_artifacts = RunArtifacts(TARGET)
+    soft_orchestrator = Orchestrator(
+        RealToolLLM(),
+        target=TARGET, goal=GOAL, mode="blackbox", base_dir=ROOT,
+        allowed_hosts=allowed, timeout=15, max_tasks=3, task_steps=4, parallel=1,
+        budget=Budget(BudgetLimits(max_tool_calls=40, max_seconds=300)),
+        artifacts=soft_artifacts,
+        surface=AttackSurface(
+            target=TARGET, mode="blackbox", path=soft_artifacts.surface_path, allowed_hosts=allowed
+        ),
+        verbose=False,
+        callbacks=SwarmCallbacks(
+            on_event=lambda event: soft_events.append(event)
+            if event.get("kind") in ("wave", "soft_time_stop") else None
+        ),
+        memory=None,
+        sandbox=setup.sandbox,
+        sandbox_note=setup,
+        coverage_sweep=True,
+        soft_seconds=0.01,  # 立刻到点：只应拦住"新开一波"
+    )
+    print("=== 软上限验证（0.01 秒即到点）===")
+    soft_result = soft_orchestrator.run()
+    check("软上限被触发的运行标记为 soft_timeout",
+          soft_result.finish_reason == "soft_timeout", soft_result.finish_reason)
+    check("软上限写进了事件流",
+          any(event.get("kind") == "soft_time_stop" for event in soft_events))
+    check("总结里写明软上限与关闭方式",
+          "软上限" in soft_result.final_summary and "HEXHOUND_SOFT_SECONDS" in soft_result.final_summary)
+    check("第一波仍然执行了（只拦新波次）",
+          any(event.get("kind") == "wave" and event.get("wave") == 1 for event in soft_events),
+          str([e.get("wave") for e in soft_events if e.get("kind") == "wave"]))
+    print(f"     软上限运行：{soft_result.finish_reason}｜波次 "
+          f"{[e.get('wave') for e in soft_events if e.get('kind') == 'wave']}")
+
     print()
     if FAILURES:
         print(f"编排验证未通过：{len(FAILURES)} 项 —— " + "；".join(FAILURES))
         return 1
-    print("编排验证通过：真工具在真实编排里被下发并执行，记录与报告一致。")
+    print("编排验证通过：真工具在真实编排里被下发并执行，软上限如实生效，记录与报告一致。")
     return 0
 
 
