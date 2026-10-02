@@ -28,7 +28,7 @@ HexHound 是一个 **LLM 驱动的黑盒 Web 安全审计 Agent**：编排者把
 
 | 项 | 状态 | 证据 |
 | --- | --- | --- |
-| 测试 | **1006 passed / 0 failed** | `python -m pytest tests -q` |
+| 测试 | **1035 passed / 0 failed** | `python -m pytest tests -q` |
 | 代码风格 | 干净 | `python -m ruff check src tests tools` |
 | 本地 CI 执行器 | **Windows 作业真跑；Linux 作业是 SKIP**（见下） | `python tools/run_ci_locally.py --all` |
 | GitHub CI | **8/8 绿** | `python tools/ci_status.py --sha e6e2431` |
@@ -38,6 +38,7 @@ HexHound 是一个 **LLM 驱动的黑盒 Web 安全审计 Agent**：编排者把
 | 真工具链路（零额度） | 15/15 | `python tools/verify_real_tool_chain.py` |
 | 真编排 + 真工具（零额度） | 15/15 + 软上限 4/4 | `python tools/verify_swarm_with_real_tools.py` |
 | 关窗护栏（Flask 层） | 12/12 | `python tools/verify_close_guard.py` |
+| **带标准答案的评测** | 引擎层 **检出 100% / 误报 0%**（12 场景） | `python tools/eval_scenarios.py --tier engine`（见 `docs/EVAL.md`） |
 
 > 跳过的那 1 个用例是"playwright 已安装"分支的环境性跳过，不是漏测。
 
@@ -209,6 +210,7 @@ python -m PyInstaller --noconfirm --clean HexHound.spec           # 可选：CLI
 | `tools/verify_real_tool_chain.py` | 注入角色的注册表真的能用真工具（sqlmap/脚本/命令） | 全 OK，失败统计无 `unknown`/`crashed` |
 | `tools/verify_swarm_with_real_tools.py` | **真实编排**里真工具被执行 + 软上限生效 | 全 OK，run.json 沙箱已启用，`sqlmap` 出现在工具日志 |
 | `tools/verify_close_guard.py` | 关窗护栏：中断后报告/运行记录/历史判定 | 12 项全 OK |
+| `tools/eval_scenarios.py --tier engine` | **带标准答案的检出率/误报率**（12 场景，见 `docs/EVAL.md`） | 检出 100% / 误报 0%（本机基线） |
 | `tools/verify_poc_selfcheck.py` | 生成的 PoC 能在 WSL 里自校验（需先有一份含 findings 的运行） | 按需 |
 
 前三个都要求 §4.2 的靶场在跑，否则 `prepare_sandbox` 之后的真工具调用会全部连不上
@@ -360,7 +362,7 @@ fuzz / compare / auth / creds / headers 全按"受阻、未完成"处理；
 
 | # | 事项 | 现状 | 验收标准 |
 | --- | --- | --- | --- |
-| 0 | **带标准答案的多场景评测**（检出率/误报率/耗时/成本） | 尚未建立：现在只有"能跑通"的验收（`verify_*`），没有"跑得准不准"的量化。靶场已知漏洞与 `tools/verify_lab_*.sh` 可作为标准答案来源 | 固定场景集（每个场景有 ground truth）+ 一次运行输出 检出率/误报率/耗时/成本 四列，可回归对比 |
+| 0 | ~~**带标准答案的多场景评测**（检出率/误报率/耗时/成本）~~ **已完成** | `tools/eval_scenarios.py` + `evals/scenarios.json`（12 场景，标准答案来自 vulnlab 的已知漏洞）+ 口径测试。引擎层实测 检出 100% / 误报 0%；Agent 层脚本 LLM 12.5%（是管道指标，不是能力指标）。**真实模型那一档还没跑过**：`--tier agent --llm live --allow-live`（花额度，需用户确认） | 详见 `docs/EVAL.md` |
 | 1 | `closing_no_finish` 占比 | 约 10%（模型不主动交总结，系统代写）；已把**最后一步**预留给收尾动作 | 一次真实运行里该终态 < 3%；或证明为什么降不下去 |
 | 2 | 关窗 45 秒上限 | `HEXHOUND_CLOSE_GRACE`；沙箱命令现在可被中断（实测 10 秒内退出） | 已在打包 exe 上验收（10/10）；剩余是把上限调到"不急不躁"的默认值 |
 | 3 | `memory/<host>.json` 无修剪 | 陈旧条目每次 diff 都以 `unknown` 复现 | `tests/test_diff.py` 加"已解决条目不再出现"；`hexhound memory` 报出修剪了什么 |

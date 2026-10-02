@@ -585,6 +585,46 @@ class RealToolVerdictTests(unittest.TestCase):
                 self.assertIn("注入成立", text)
 
 
+class XssSignalRuleTests(unittest.TestCase):
+    """XSS 判定规则：**回显 ≠ 注入**（评测场景集抓到的真误报）。
+
+    实测（`evals/scenarios.json` 的 `reflect-dom` 场景）：靶场把 payload
+    HTML 转义后放进 `<textarea>`，而 payload `javascript:alert(1)` 里没有任何
+    HTML 元字符，转义后依旧"原样可见"——旧规则据此报"未转义回显，疑似反射型 XSS"，
+    是误报。判据必须是**能破出文本上下文的元字符**。
+    """
+
+    class FakeResponse:
+        def __init__(self, body: str) -> None:
+            self.text = body
+
+    def signal(self, payload: str, body: str) -> str:
+        from hexhound.tools import _fuzz_signal
+
+        return _fuzz_signal("xss", payload, self.FakeResponse(body))
+
+    def test_metacharacter_free_payload_is_not_a_signal(self) -> None:
+        for body in (
+            "<textarea>javascript:alert(1)</textarea>",
+            "javascript:alert(1)",
+            "{\"note\": \"javascript:alert(1)\"}",
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(self.signal("javascript:alert(1)", body), "")
+
+    def test_unescaped_metacharacter_payload_is_a_signal(self) -> None:
+        self.assertIn(
+            "疑似反射型 XSS",
+            self.signal("<script>alert(1)</script>", "<h1>你好，<script>alert(1)</script></h1>"),
+        )
+
+    def test_escaped_payload_is_not_a_signal(self) -> None:
+        """被 HTML 转义的回显不是漏洞（这正是 textarea 场景的真相）。"""
+        self.assertEqual(
+            self.signal("<script>alert(1)</script>", "&lt;script&gt;alert(1)&lt;/script&gt;"), ""
+        )
+
+
 class CandidateReviewFlowTests(unittest.TestCase):
     """候选 → 复核 → 提升 的闭环（用户点名的验收项之一）。
 

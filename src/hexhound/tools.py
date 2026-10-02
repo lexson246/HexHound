@@ -1474,9 +1474,16 @@ def _fuzz_signal(category: str, payload: str, response: httpx.Response) -> str:
         match = KB.SQLI_ERROR.search(body)
         return f"命中 SQL 错误特征：{match.group(0)!r}" if match else ""
     if category == "xss":
-        if payload and payload in body:
-            return "payload 原样回显（未转义），疑似反射型 XSS"
-        return ""
+        if not payload or payload not in body:
+            return ""
+        # **回显 ≠ 注入**：不含 HTML 元字符的 payload（例如 `javascript:alert(1)`）
+        # 在任何上下文里都会"原样出现"——textarea、纯文本、JSON 字符串里都是，
+        # 它本身证明不了任何东西。实测（评测场景集 `reflect-dom`）：靶场把 payload
+        # HTML 转义后放进 <textarea>，`javascript:alert(1)` 依旧原样可见，
+        # 于是被判成"反射型 XSS"——那是误报。判据必须是**能破出文本上下文的元字符**。
+        if not any(char in payload for char in "<>"):
+            return ""
+        return "payload 原样回显（未转义），疑似反射型 XSS"
     if category == "ssti":
         for candidate, expected in KB.SSTI_EXPECTED.items():
             if candidate in str(payload) and expected in body:
