@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -150,6 +152,43 @@ def finding_matches(scenario: dict[str, Any], finding: Any) -> bool:
     return any(word.lower() in text for word in keywords)
 
 
+def coverage_mentions(scenario: dict[str, Any], coverage_rows: list[Any]) -> str:
+    """覆盖记录里是否有"已上报该端点**且类型对得上**"的结构化结论。
+
+    为什么要认这一条（第一次 live 评测抓到的口径问题）：回归复核型运行时，
+    子代理会把"历史漏洞仍成立"写进覆盖记录与任务总结（带证据编号），
+    而不一定再 `record_finding` 一次。只认 findings 会把这种情况误判成漏报。
+
+    判据与 `finding_matches` 一致：**端点路径 + 类型关键词**，两者都要对得上，
+    且只认结构化字段（`status == reported`），不从自由文本里猜。
+
+    为什么必须带类型（第二次踩到的）：脚本 LLM 那档会给 `/ssti`、`/file` 写
+    `status=reported` 但 detail 是同一句"sqli 注入（脚本 LLM 确认）"——
+    只看"端点 + reported"就会把这两条算成命中，检出率从 12.5% 虚高到 37.5%。
+    一条自相矛盾的记录（端点说模板注入、结论说 SQL 注入）不构成"发现了该漏洞"。
+    """
+    wanted = endpoint_path(str(scenario.get("endpoint") or ""))
+    keywords = tuple(word.lower() for word in requested_types(scenario) if word)
+    for entry in coverage_rows:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("status") or "") != "reported":
+            continue
+        target = str(entry.get("target") or "")
+        detail = str(entry.get("detail") or "")
+        # 类型关键词只看 detail：target 里的路径本身就常含类型名（`/ssti`、`/reflect`），
+        # 拿它当证据等于"端点名自带类型就算对得上"。
+        if keywords and not any(word in detail.lower() for word in keywords):
+            continue
+        # coverage 的 target 常写成 "http://…/api/order（参数 x）" 或
+        # "POST /order/confirm (…)"，取其中的路径片段再比。
+        for chunk in re.split(r"[\s（(，,；;]+", target):
+            if chunk.startswith("/") or "://" in chunk:
+                if endpoint_path(chunk) == wanted:
+                    return detail[:120]
+    return ""
+
+
 def summarize(results: list[ScenarioResult]) -> dict[str, Any]:
     """汇总成四列指标。**分母都不含 inconclusive**（没测成不能算漏报）。"""
     buckets: dict[str, list[ScenarioResult]] = {}
@@ -252,8 +291,28 @@ def _exchange_outcomes(surface: AttackSurface) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def isolate_run_memory(artifacts_home: Path) -> Path:
+    """把跨运行记忆指到本轮产物目录，保证评测**从零开始**。
+
+    **这是评测有效性问题，不是产品缺陷**（第一次 live 评测踩到的）：
+    `HostMemory` 走 `data_home()`（`HEXHOUND_HOME` 或 `~/.hexhound`），
+    不隔离就会读到这台机器的真实历史 → 规划者看到"上次报过这些"，
+    于是把整轮变成**回归复核**（计划里原话是"回归复核历史漏洞"），
+    测出来的就不是"能不能发现"，而是"会不会复测旧账"——分数取决于
+    这台机器以前跑过什么，跨机器/跨轮次都不可比。
+
+    修法：环境变量 + `RunArtifacts(home=...)` 双管齐下——前者管
+    `HostMemory` 这类自己解析 `data_home()` 的调用方，后者管产物落盘。
+    """
+    home = Path(artifacts_home)
+    os.environ["HEXHOUND_HOME"] = str(home)
+    return home
+
+
 def run_agent_tier(data: dict[str, Any], *, llm_kind: str, allow_live: bool,
-                   artifacts_home: Path, max_tasks: int, task_steps: int) -> tuple[list[ScenarioResult], dict[str, Any]]:
+                   artifacts_home: Path, max_tasks: int, task_steps: int,
+                   max_cost: float = 0.0, max_tokens: int = 0,
+                   max_seconds: float = 900.0) -> tuple[list[ScenarioResult], dict[str, Any]]:
     """跑一次完整编排，然后按 findings/candidates 打分。"""
     from hexhound.budget import Budget, BudgetLimits
     from hexhound.config import Config
@@ -282,10 +341,25 @@ def run_agent_tier(data: dict[str, Any], *, llm_kind: str, allow_live: bool,
         config = Config(**{**config.__dict__, "allowed_hosts": allowed})
     llm, pool = build_llm_pool(config, echo=print)
 
-    artifacts = RunArtifacts(target, home=artifacts_home)
+    home = isolate_run_memory(artifacts_home)
+    artifacts = RunArtifacts(target, home=home)
     surface = AttackSurface(target=target, mode="blackbox", path=artifacts.surface_path,
                             allowed_hosts=allowed)
-    budget = Budget(BudgetLimits(max_tool_calls=200, max_seconds=900))
+    print(f"跨运行记忆已隔离：HEXHOUND_HOME={home}（本轮按**全新审计**跑）")
+    # 预算：CLI 显式值优先，其次用配置里的上限（`.env` 的 MAX_COST/MAX_TOKENS），
+    # 兜底只有"时长 + 工具调用数"。**真实模型档必须有金额口径的上限**，
+    # 否则一次评测就可能跑飞——本项目的默认约定是"能设上限就设上限"。
+    limits = BudgetLimits(
+        max_cost=max_cost if max_cost > 0 else float(getattr(config, "max_cost", 0.0) or 0.0),
+        max_tokens=max_tokens if max_tokens > 0 else int(getattr(config, "max_tokens", 0) or 0),
+        max_tool_calls=200,
+        max_seconds=max_seconds,
+    )
+    budget = Budget(limits)
+    print(
+        f"预算：费用 ≤ ¥{limits.max_cost:.2f}｜token ≤ {limits.max_tokens or '不限'}"
+        f"｜工具调用 ≤ {limits.max_tool_calls}｜时长 ≤ {limits.max_seconds:.0f}s"
+    )
     orchestrator = Orchestrator(
         llm, target=target, goal=f"对 {target} 做黑盒安全评估（评测场景集）", mode="blackbox",
         base_dir=ROOT, allowed_hosts=allowed, timeout=10, max_tasks=max_tasks,
@@ -298,22 +372,34 @@ def run_agent_tier(data: dict[str, Any], *, llm_kind: str, allow_live: bool,
 
     reported = list(result.findings or [])
     scenarios = data["scenarios"]
+    coverage_rows = list(surface.coverage.values())
     matched: set[str] = set()
+    detail_of: dict[str, str] = {}
     for scenario in scenarios:
         if str(scenario.get("expected")) != "signal":
             continue
-        hit = any(finding_matches(scenario, item) for item in reported)
-        matched.add(str(scenario["id"])) if hit else None
+        hit = [item for item in reported if finding_matches(scenario, item)]
+        if hit:
+            matched.add(str(scenario["id"]))
+            detail_of[str(scenario["id"])] = "findings/candidates 命中"
+            continue
+        # 回归复核型运行会把"仍成立"写进覆盖记录（status=reported）而不重复 record_finding。
+        # 只认结构化字段，不从自由文本猜。
+        note = coverage_mentions(scenario, coverage_rows)
+        if note:
+            matched.add(str(scenario["id"]))
+            detail_of[str(scenario["id"])] = f"覆盖记录标记为已上报：{note}"
 
     results: list[ScenarioResult] = []
     for scenario in scenarios:
         expected = str(scenario.get("expected") or "signal")
+        scenario_id = str(scenario["id"])
         if expected == "signal":
-            hit = str(scenario["id"]) in matched
+            hit = scenario_id in matched
             results.append(ScenarioResult(
-                id=str(scenario["id"]), name=str(scenario.get("name") or ""), expected=expected,
+                id=scenario_id, name=str(scenario.get("name") or ""), expected=expected,
                 verdict="detected" if hit else "missed",
-                detail="findings/candidates 命中" if hit else "报告里没有对应条目",
+                detail=detail_of.get(scenario_id, "报告与覆盖记录里都没有对应条目"),
             ))
         else:
             # 应当安静的场景：报告里出现对应条目才算误报
@@ -322,7 +408,7 @@ def run_agent_tier(data: dict[str, Any], *, llm_kind: str, allow_live: bool,
                 "reflection_only_flagged" if flagged else "true_negative"
             )
             results.append(ScenarioResult(
-                id=str(scenario["id"]), name=str(scenario.get("name") or ""), expected=expected,
+                id=scenario_id, name=str(scenario.get("name") or ""), expected=expected,
                 verdict=verdict,
                 detail=f"报告了 {len(flagged)} 条" if flagged else "报告里没有对应条目",
             ))
@@ -415,6 +501,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-tasks", type=int, default=6)
     parser.add_argument("--task-steps", type=int, default=10)
     parser.add_argument("--per-category", type=int, default=4, help="引擎层每个类别试几个 payload")
+    parser.add_argument("--max-cost", type=float, default=0.0,
+                        help="费用上限（元）；0 = 用配置里的 MAX_COST")
+    parser.add_argument("--max-tokens", type=int, default=0,
+                        help="token 上限；0 = 用配置里的 MAX_TOKENS（0 即不限）")
+    parser.add_argument("--max-seconds", type=float, default=900.0, help="墙钟上限（秒）")
     args = parser.parse_args(argv)
 
     data = load_scenarios(Path(args.scenarios))
@@ -440,6 +531,7 @@ def main(argv: list[str] | None = None) -> int:
         results, meta = run_agent_tier(
             data, llm_kind=args.llm, allow_live=args.allow_live,
             artifacts_home=artifacts_home, max_tasks=args.max_tasks, task_steps=args.task_steps,
+            max_cost=args.max_cost, max_tokens=args.max_tokens, max_seconds=args.max_seconds,
         )
         meta["tier"] = f"agent/{args.llm}"
 

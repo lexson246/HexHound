@@ -28,7 +28,7 @@ HexHound 是一个 **LLM 驱动的黑盒 Web 安全审计 Agent**：编排者把
 
 | 项 | 状态 | 证据 |
 | --- | --- | --- |
-| 测试 | **1035 passed / 0 failed** | `python -m pytest tests -q` |
+| 测试 | **992 passed + 50 subtests passed / 1 skipped** | `python -m pytest tests`（别再补 `-q`：`addopts` 已有 `-q`，双重 `-qq` 会让 pytest 连汇总行都不打印） |
 | 代码风格 | 干净 | `python -m ruff check src tests tools` |
 | 本地 CI 执行器 | **Windows 作业真跑；Linux 作业是 SKIP**（见下） | `python tools/run_ci_locally.py --all` |
 | GitHub CI | **8/8 绿** | `python tools/ci_status.py --sha e6e2431` |
@@ -38,7 +38,7 @@ HexHound 是一个 **LLM 驱动的黑盒 Web 安全审计 Agent**：编排者把
 | 真工具链路（零额度） | 15/15 | `python tools/verify_real_tool_chain.py` |
 | 真编排 + 真工具（零额度） | 15/15 + 软上限 4/4 | `python tools/verify_swarm_with_real_tools.py` |
 | 关窗护栏（Flask 层） | 12/12 | `python tools/verify_close_guard.py` |
-| **带标准答案的评测** | 引擎层 **检出 100% / 误报 0%**（12 场景） | `python tools/eval_scenarios.py --tier engine`（见 `docs/EVAL.md`） |
+| **带标准答案的评测** | 引擎层 **检出 100% / 误报 0%**；真实模型档 **75% / 误报 0%**（两轮，¥0.42+¥0.44） | `python tools/eval_scenarios.py --tier engine`；真实模型档见 `docs/EVAL.md` §4（要 `--llm live --allow-live`，会花额度） |
 
 > 跳过的那 1 个用例是"playwright 已安装"分支的环境性跳过，不是漏测。
 
@@ -348,6 +348,20 @@ fuzz / compare / auth / creds / headers 全按"受阻、未完成"处理；
 定运行级 `finish_reason`，并在总结里点名。回归：
 `tests/test_orchestrator.py::RunStatusMatchesTaskStatusTests`（5 条）。
 
+### 6.12 评测跑成了"回归复核"，分数取决于这台机器以前跑过什么
+
+**症状**：第一次真实模型评测（`--llm live`）的计划里写着"回归复核历史漏洞"，
+子代理找了、也写在总结里了，但没重新 `record_finding`，评分算成两条漏报。
+**根因**：`HostMemory` 解析 `data_home()` → 用户真实的 `~/.hexhound`，而这个靶场之前扫过。
+**守卫**：`tools/eval_scenarios.py::isolate_run_memory()` 把 `HEXHOUND_HOME` 指到
+`.tmp/evals/<ts>/home`；`tests/test_eval_scenarios.py::MemoryIsolationTests`（4 条）——
+关键是按评测里的真实调用方式 `HostMemory(host)`（不传 home）断言新一轮读不到上一轮记忆，
+而不是只检查环境变量字符串。评测结论必须与开发机的历史无关。
+
+**顺带修正的口径**：回归复核型运行会把"仍成立"写进覆盖记录（`status=reported`）而不重复
+`record_finding`，所以判分也认这种**结构化**命中（`coverage_mentions`：只认
+`status=reported` + target 命中端点路径，不从自由文本里猜）。
+
 - **目标流量默认直连**（`trust_env=False`）：系统代理会把整轮扫描打成 502。
   要代理就用显式配置；LLM 调用与目标流量是两套。
 - **死代理自动绕开**：`llm._dead_proxy_detail()` 检测到"配了代理但端口连不上"时直连并
@@ -362,7 +376,9 @@ fuzz / compare / auth / creds / headers 全按"受阻、未完成"处理；
 
 | # | 事项 | 现状 | 验收标准 |
 | --- | --- | --- | --- |
-| 0 | ~~**带标准答案的多场景评测**（检出率/误报率/耗时/成本）~~ **已完成** | `tools/eval_scenarios.py` + `evals/scenarios.json`（12 场景，标准答案来自 vulnlab 的已知漏洞）+ 口径测试。引擎层实测 检出 100% / 误报 0%；Agent 层脚本 LLM 12.5%（是管道指标，不是能力指标）。**真实模型那一档还没跑过**：`--tier agent --llm live --allow-live`（花额度，需用户确认） | 详见 `docs/EVAL.md` |
+| 0 | ~~**带标准答案的多场景评测**（检出率/误报率/耗时/成本）~~ **已完成** | `tools/eval_scenarios.py` + `evals/scenarios.json`（12 场景，标准答案来自 vulnlab 的已知漏洞）+ 口径测试。引擎层实测 检出 100% / 误报 0%；Agent 层脚本 LLM 12.5%（是管道指标，不是能力指标）；**真实模型那一档已跑两轮**：75% / 误报 0%，¥0.4158 + ¥0.4357，351.8s + 407.2s（`--tier agent --llm live --allow-live`） | 详见 `docs/EVAL.md` §4 |
+| 0b | **覆盖记录与攻面证据自相矛盾**（live 评测发现，**未修**） | 攻面记了 3 条 `signal`（未转义回显），覆盖记录却写 `no_issue_found`，detail 里描述的正是那个未转义回显 | 有 `signal` 的端点不许停在 `no_issue_found`：要么升为候选/漏洞，要么带上明确的排除理由。测在**记录层**（覆盖写入路径），不是报告渲染层 |
+| 0c | **子任务超步数后不留"没测过"的痕**（live 评测发现，**未修**） | 两轮都漏 `/api/order` 越权：任务 `closing_no_finish` 收尾，该端点既无 attempt 也无 `not_tested` 覆盖行 → 覆盖率闸门与报告都看不见这块盲区 | 子任务没交结论时，把它被分配却没试过的端点写成 `not_tested`，报告覆盖率行按"未触及"计入而不是省略 |
 | 1 | `closing_no_finish` 占比 | 约 10%（模型不主动交总结，系统代写）；已把**最后一步**预留给收尾动作 | 一次真实运行里该终态 < 3%；或证明为什么降不下去 |
 | 2 | 关窗 45 秒上限 | `HEXHOUND_CLOSE_GRACE`；沙箱命令现在可被中断（实测 10 秒内退出） | 已在打包 exe 上验收（10/10）；剩余是把上限调到"不急不躁"的默认值 |
 | 3 | `memory/<host>.json` 无修剪 | 陈旧条目每次 diff 都以 `unknown` 复现 | `tests/test_diff.py` 加"已解决条目不再出现"；`hexhound memory` 报出修剪了什么 |

@@ -18,10 +18,11 @@
    六个真实事故与它们的守卫、还没做的事、推荐流程、一页速查。
 2. `docs/WORK-REPORT-ROUND4.md` —— 第四轮工作报告：每条修复的复现→根因→验证。
 
-读完先用三条命令确认基线（把输出贴给我）：`python -m pytest tests -q`、
+读完先用三条命令确认基线（把输出贴给我）：`python -m pytest tests`、
 `python -m ruff check src tests tools`、`python tools/ci_status.py`。
-期望是 **982 passed / 1 skipped**、ruff 干净、CI 8/8 绿。数字对不上就先查原因，
-不要在我给的任务上继续。
+期望是 **992 passed + 50 subtests passed / 1 skipped**、ruff 干净、CI 8/8 绿。
+（`pytest` 别再补 `-q`：`addopts` 里已经是 `-q`，双重 `-qq` 会让它连汇总行都不打印。）
+数字对不上就先查原因，不要在我给的任务上继续。
 
 ### 铁律（违反会造成不可逆损失，任何情况下都不许破）
 

@@ -264,6 +264,8 @@ script and the concatenation bypass attempt).
 | Console `UnicodeEncodeError` on `✓` | GBK console | `console.py` + ASCII markers `[OK]/[!!]/[XX]/[--]`; keep using them |
 | Frozen build crashes with `attempted relative import` | PyInstaller + package-relative import | `packaging/hexhound_cli.py` shim; keep entry points absolute |
 | Tests overwrite the developer's real `.env` | `config` calls `load_dotenv()` at import | `tests/conftest.py` stubs `dotenv.load_dotenv` and chdirs to a temp dir; root `conftest.py` anchors collection. Do not "simplify" either file |
+| An evaluation run "re-tests" old findings instead of discovering them (its plan literally says 回归复核历史漏洞) | the agent's `HostMemory` resolves `data_home()` → the developer's real `~/.hexhound`, and that target had been scanned before | **Fixed:** `tools/eval_scenarios.py::isolate_run_memory()` points `HEXHOUND_HOME` at `.tmp/evals/<ts>/home`; pinned by `tests/test_eval_scenarios.py::MemoryIsolationTests` (asserts `HostMemory(host)` reads nothing, not just that the env var is set) |
+| Coverage says `no_issue_found` for an endpoint whose recorded attempts contain a `signal`, and the detail text describes the unescaped reflection | nothing checks coverage rows against the attack surface's own evidence — the model's conclusion is taken at face value | **OPEN** (found by the live eval; §10.11) |
 
 Environment facts: Docker Desktop is installed but **broken** on this machine and the user is not
 admin, so the working backend is **WSL Ubuntu-24.04** (root, tools installed). WSL does not read the
@@ -331,8 +333,9 @@ check the proxy first.
 
 ## 10. Known gaps and tech debt (ranked)
 
-> **Status as of round 4 (2026-10-02)** — each line is marked so nobody re-does finished work:
-> ✅ DONE · 🔶 PARTIAL · ❌ OPEN.
+> **Status as of round 5 (2026-10-03)** — each line is marked so nobody re-does finished work:
+> ✅ DONE · 🔶 PARTIAL · ❌ OPEN. Items 11–12 were found by the **live-model evaluation**
+> (see §14 and `docs/EVAL.md`), not by reading code.
 
 1. ✅ **No version control.** Done: git history exists and CI runs on push.
 2. ✅ **ANSI/encoding garbage** in sandbox output — `sanitize.py` (`strip_ansi`,
@@ -358,6 +361,21 @@ check the proxy first.
 9. 🔶 **XSS stops at string reflection** unless playwright + Edge/Chrome are present; the report
    states the weaker conclusion when they are not.
 10. ❌ **`reports/` is gitignored**; copy anything that must survive into `docs/`.
+11. ❌ **Coverage rows are not checked against the run's own evidence.** Live eval run #2: the
+    surface recorded three `signal`s for `/reflect` ("payload 原样回显（未转义）"), while the
+    coverage row for that endpoint says `no_issue_found` — and its own detail text describes the
+    unescaped reflection landing in `<h1>`. One record, two contradictory statements; the report
+    then reads as "XSS tested, nothing found". A string-level reflection should be recorded as a
+    **candidate** ("not verified executable in a browser"), never as a neutral conclusion.
+    Acceptance: a run whose attempts contain a `signal` cannot leave that endpoint at
+    `no_issue_found` — either it becomes a candidate/finding, or the row must carry an explicit
+    reason the signal was dismissed.
+12. ❌ **A sub-task that runs out of steps leaves no trace of what it never reached.**
+    Both live runs missed `/api/order` (IDOR): the auth sub-task ended `closing_no_finish`, the
+    endpoint appears in **no** attempt row and in **no** coverage row, so the coverage gate and
+    the report cannot see the blind spot. Acceptance: when a sub-task ends without a conclusion,
+    the endpoints it was assigned but never attempted are recorded as `not_tested`, and the
+    report's coverage line counts them as unattempted rather than omitting them.
 
 
 ---
@@ -381,9 +399,19 @@ check the proxy first.
    reports what was pruned.
 7. ❌ **Map reasoning-effort parameters for non-DeepSeek providers** (nothing is sent for them today).
    Acceptance: a provider-matrix test asserts the exact request body per provider.
-8. ❌ **Migrate the plaintext `api_key` field in `settings.json`** into the DPAPI-protected
-   `provider_keys` map, with a rollback path. Acceptance: opening old settings still works and no
-   plaintext key remains.
+8. ✅ **Plaintext `api_key` migrated** into the DPAPI-protected `provider_keys` map
+   (`gui._store_provider_key` merges instead of overwriting, refuses to write when the keystore
+   cannot be read, and an empty field deletes rather than saves; the legacy field is moved and
+   cleared on load). Tests: `tests/test_provider_key_store.py` (9), including the
+   "typing a new key for one provider must not wipe the others" case; the migration test is
+   platform-branched because a non-DPAPI host cannot encrypt.
+9. ❌ **Make coverage rows agree with the surface evidence** (§10.11). Acceptance: a run whose
+   attempts contain a `signal` cannot leave that endpoint at `no_issue_found`; the row becomes a
+   candidate/finding or carries an explicit reason for dismissal. Test at the recording layer
+   (coverage write path), not in the report renderer.
+10. ❌ **Record untested endpoints for unfinished sub-tasks** (§10.12). Acceptance: a sub-task that
+   ends `closing_no_finish` still causes its assigned-but-unattempted endpoints to appear as
+   `not_tested` in the surface and in the report's coverage line.
 
 When you finish any of these: update `README.md` **and** `README_ZH.md` in the same change, keep the
 "measured, not claimed" tone, and re-run §8.
@@ -457,4 +485,72 @@ Full detail: `docs/WORK-REPORT-ROUND4.md`. Commits `a255248` (fixes) + `6d23f08`
   real planner→waves→verify flow with a scripted LLM and asserts `run.json` shows the sandbox
   enabled, `sqlmap` really executed, and no `unknown`/`crashed` tool failures.
 
+---
 
+## 14. Round 5 (2026-10-03) — second review batch, cancellation, and a real evaluation
+
+Predecessor commits: `bf9d0fc` (second review batch), `8fa8525`/`f2fb051` (CI diagnostics),
+`e6e2431` (platform-branched key test), `5c06264` (docs), `9938ec8` (eval harness),
+plus this commit (eval isolation + scoring + the live-run record). Details:
+`docs/WORK-REPORT-ROUND4.md` §11–§13; evaluation numbers: `docs/EVAL.md`.
+
+**The four second-batch review items are fixed** (each reproduced first, each pinned by a test):
+
+1. **429 was indistinguishable from "no signal"** — a rate-limited target produced empty
+   `no_signal` attempts, the dedup fingerprint then treated the endpoint as "already tried", and
+   the cross-run diff could print "已修复" for a vulnerability nobody retested. Now
+   `tools.THROTTLE_STATUS`/`_is_throttled()` mark the exchange, `surface.mark_throttled()` keeps
+   those endpoints out of `touched_endpoints()` (so the diff may only say `unknown`), `fuzz_params`
+   stops the whole sweep and reports `throttled_count`, and the report discloses it
+   ("目标限流/熔断 N 次 …不算本次覆盖过"). Tests: `tests/test_rate_limit.py` (8).
+2. **Saving one provider key wiped the others** — `/api/provider_key` parsed the DPAPI blob into
+   the settings payload. `gui._store_provider_key()` now decrypt-merges, refuses to write when the
+   keystore is unreadable, treats an empty field as *delete* rather than *save*, and the server
+   ignores any `provider_keys` the client sends. Legacy plaintext `api_key` is migrated into
+   `provider_keys[provider]` and cleared, and `_settings_payload()` no longer echoes plaintext
+   (it reports `key_saved` / `key_masked` / `key_from_env`). Tests:
+   `tests/test_provider_key_store.py` (9).
+3. **A failed sub-task still ended as "已完成"** — `_aggregate()` now writes
+   `finish_reason=failed`/`provider_error` and names the failed sub-tasks, and
+   `history.PARTIAL_FINISH_REASONS` marks the run partial. Tests:
+   `tests/test_orchestrator.py::RunStatusMatchesTaskStatusTests`.
+4. **A long tool call could not be cancelled** — `sandbox._run_host()` registers the live process
+   (`_active`), `cancel_current()` kills the whole tree (`taskkill /T /F` on Windows, `killpg`
+   elsewhere) because `terminate()` alone left `ping.exe` holding the pipes for 30 s; the CLI's
+   first Ctrl+C cancels the sandbox and marks the run partial, the desktop close guard stops the
+   audit and lets the window close. Tests: `tests/test_sandbox_cancel.py` (7),
+   `tests/test_desktop_close_guard.py` (10), and packaged-exe acceptance
+   `tools/verify_desktop_close_inflight.py` (10 assertions, hang-server + scripted provider).
+
+Also this round: the soft wall-clock cap (`HEXHOUND_SOFT_SECONDS` → `finish_reason=soft_timeout`),
+the partial-finish vocabulary, `trace.record()` writing inside its lock (torn `trace.jsonl` lines),
+and `sanitize.decode_console_output()`.
+
+**The evaluation harness now has real numbers** (`tools/eval_scenarios.py`,
+`evals/scenarios.json`, 12 scenarios with hand-reproducible ground truth):
+
+| Tier | Command | Detection | FPR | Cost | Wall clock |
+| --- | --- | --- | --- | --- | --- |
+| engine | `--tier engine` | 100% (8/8) | 0% (0/3) | ¥0 | 1.2 s |
+| agent / scripted LLM | `--tier agent --llm scripted` | 12.5% (1/8) | 0% (0/4) | ¥0 | 3.4 s |
+| agent / real model | `--tier agent --llm live --allow-live` | 75% (6/8) | 0% (0/4) | ¥0.42 / ¥0.44 | 352 s / 407 s |
+
+Two live runs, both 6/8 with zero false positives, but **not the same six** — the injection
+scenarios are stable, the authorization ones are not. Both misses were diagnosed from the run
+artifacts without spending more quota, and neither is "the model did not look": one is a coverage
+row that contradicts the surface evidence, the other a sub-task that ran out of steps and left no
+trace. They are filed as §10.11 and §10.12 with acceptance criteria. The first live run also
+exposed an evaluation bug (memory not isolated → the run became a regression retest of the
+developer's own history) which is fixed and pinned by `MemoryIsolationTests` — the fix did **not**
+move the score (both runs are 6/8); it made the number comparable across machines.
+
+Scoring was tightened in the same change: a "hit" needs the endpoint path **and** the vulnerability
+type, both for findings and for `reported` coverage rows. Without the type check the scripted tier
+scored 37.5% instead of 12.5%, because the scripted model writes `status=reported` for `/ssti` and
+`/file` with the detail "sqli 注入" — one self-contradictory record per false hit. Re-scoring both
+live runs offline under the stricter rule changes nothing (all 12 credited hits across the two runs
+came from findings/candidates, none from coverage rows).
+
+Test/lint state at the end of this round: `python -m pytest tests` →
+**992 passed, 50 subtests passed, 1 skipped** (run `-q` twice and pytest prints no totals —
+`addopts` already contains `-q`, so pass no extra `-q`); `ruff check src tests tools` clean.
