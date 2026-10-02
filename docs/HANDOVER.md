@@ -391,3 +391,40 @@ When you finish any of these: update `README.md` **and** `README_ZH.md` in the s
   diff feature exists to protect.
 - Do not print or commit `.env`, and do not send target traffic to hosts outside the allowlist, even
   "just to check connectivity".
+
+---
+
+## 13. Round 4 (2026-10-02) — external review P1–P7, current state
+
+Full detail: `docs/WORK-REPORT-ROUND4.md`. Commits `a255248` (fixes) + `6d23f08` (regressions).
+
+- Tests: **952 passed, 10 skipped**; `ruff check src tests tools` clean.
+  Skips are "no playwright browser in this environment" and DPAPI-only cases.
+- Fixed, each reproduced first:
+  - **P1 desktop never wired the scan environment** — CLI and desktop each had their own
+    sandbox-preparation copy and the recorded reason was a constant string, so "installed but
+    unused" was undiagnosable. Now one `sandbox.prepare_sandbox()` for both, and the concrete
+    reason/hint reaches `run.json`, the report, and the UI.
+  - **P2 role prompts advertised tools the role did not have** — static role text ("prefer
+    sqlmap_scan", "you must use sandbox_script") vs a dynamically pruned registry. Now
+    `prompts.adapt_prompt_to_tools()` drops those bullets and names what is missing. Invariant
+    test: a prompt body may not mention a tool the run does not have.
+  - **P3 identity was not part of the dedup fingerprint** — `attempt_key` now carries
+    method/identity(header hash)/location, and `blocked` (401/403) never counts as "tried".
+  - **P4 JSON bodies / PUT / PATCH** — injected into the JSON body; methods preserved.
+  - **P5 sqlmap negative verdicts** ("does not seem to be injectable") no longer read as
+    "injectable".
+  - **P7** `LLM_REASONING_EFFORT` (low/high/max, blank = server default, DeepSeek only), the
+    effective request config recorded as a trace `llm_config` event, and per-run tool-failure
+    statistics split into `unknown` / `crashed` / `returned` / `budget`.
+- Two real isolation bugs found by the new tests and fixed:
+  - the browser followed redirects **without** re-entering the route guard, so out-of-scope
+    targets (and other ports on the same host — cookies ignore ports) really received requests.
+    The `Location` header is now stripped for any redirect we refuse, and the refusal is recorded
+    in the observation.
+  - a malformed `NO_PROXY` entry (e.g. `[::1]`) made httpx throw while **constructing** a client,
+    which broke both `hexhound doctor` and every LLM client. Proxy resolution is now ours
+    (loopback and `NO_PROXY` matches go direct).
+- Built artifacts (verified this round): `hexhound.exe` (desktop, 21/21 startup checks via
+  `tools/verify_desktop_exe.py`) and `dist\hexhound.exe` (CLI).
+
