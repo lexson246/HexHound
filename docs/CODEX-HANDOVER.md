@@ -1,0 +1,342 @@
+# HexHound 交接文档（给下一个 AI 编码代理 / Codex）
+
+> 写于 2026-10-03，基线提交 **`439e02f`**（分支 `main`，origin = `lexson246/HexHound`，工作树干净）。
+> 本文件是**自包含**的：只读这一份 + `docs/WORK-REPORT-ROUND4.md` 就能接手。
+> 所有数字都来自本机实测；没测的一律写"未验证"。
+
+---
+
+## 0. 30 秒了解这个项目
+
+HexHound 是一个 **LLM 驱动的黑盒 Web 安全审计 Agent**：编排者把目标拆成子任务，
+按角色（recon / injection / auth / verify）派并发子代理，子代理通过工具（内置 HTTP 探测
++ **真工具沙箱**里的 sqlmap/nmap/nuclei/ffuf/自定义脚本）取证，只有带**真实请求证据**的
+结论才算"已复核漏洞"，其余进候选池由复核角色处理。交付物是一份 Markdown 报告 +
+运行产物目录（攻面/台账/轨迹/PoC）。
+
+- 入口：`hexhound.exe`（Windows 桌面，pywebview + WebView2）、`hexhound`（CLI）、
+  `python -m hexhound`。
+- 代码：`src/hexhound/`（38 个模块，见 §3 地图）；测试 `tests/`（37 个文件、982 个用例）。
+- 靶场：`vulnlab/app.py`（HANDOVER §9 记录为 13 类漏洞，含竞态/业务逻辑/JWT 伪造）。
+- 配套文档：本文件（交接）、`docs/CODEX-PROMPT.md`（给 Codex 的启动提示词）、
+  `docs/WORK-REPORT-ROUND4.md`（最近一轮修复的复现→根因→验证）、
+  `docs/HANDOVER.md`（更早的英文交接，§10/§11 已用 ✅/🔶/❌ 标注状态）。
+
+---
+
+## 1. 现在是什么状态（已实测）
+
+| 项 | 状态 | 证据 |
+| --- | --- | --- |
+| 测试 | **982 passed / 0 failed / 1 skipped** | `python -m pytest tests -q` |
+| 代码风格 | 干净 | `python -m ruff check src tests tools` |
+| 本地 CI 执行器 | **5/5 PASS** | `python tools/run_ci_locally.py --all` |
+| GitHub CI | **8/8 绿** | `python tools/ci_status.py --sha 439e02f` |
+| 桌面 exe | 已重建并 21/21 启动验收 | `python tools/verify_desktop_exe.py` |
+| CLI exe | `dist\hexhound.exe`，`sandbox status` 识别 WSL + 9 工具 | 手工跑过 |
+| 真工具链路（零额度） | 15/15 | `python tools/verify_real_tool_chain.py` |
+| 真编排 + 真工具（零额度） | 15/15 + 软上限 4/4 | `python tools/verify_swarm_with_real_tools.py` |
+| 关窗护栏（零额度） | 12/12 | `python tools/verify_close_guard.py` |
+
+> 跳过的那 1 个用例是"playwright 已安装"分支的环境性跳过，不是漏测。
+
+最近六轮的提交（老 → 新）：
+
+```
+633fc6e  范围不限制主机（ALLOWED_HOSTS=*）与其披露
+3bf2288  报告归档路径不一致
+af63a11  死系统代理导致"只有挂 VPN 才行"
+be63d4a  doctor/自动诊断 + .env 模型名修正
+a255248  外部评审 P1–P7（桌面真工具链路、提示词/工具对齐、身份维度、JSON 体、sqlmap 结论、失败统计）
+6d23f08  四项验收回归 + 提示词/请求体/失败统计用例
+2d294a0  真工具链路端到端脚本
+aac9a68  关窗不丢报告 + 中断不谎报完成 + CI 失败可公开诊断
+277a414 / a5b4f42 / 75872f1 / 426d7ea / 439e02f
+        文档同步、控制台解码统一、墙钟软上限、最后一步留给结论
+```
+
+---
+
+## 2. 五条铁律（违反会造成不可逆损失）
+
+1. **禁止 `git reset --hard` / `git clean -fd` / 批量 `git restore`。**工作树里可能有
+   未提交的成果；要回退就 `git revert` 或手工改回去。
+2. **永远不要打印或提交 `.env` / Cookie / Token / API key。**密钥在
+   `~/.hexhound/settings.json`（`provider_keys` 走 DPAPI），CLI 读 `.env`。
+   写代码时用 `sk-fake-*` 之类的假值做测试。
+3. **不要对未授权目标扫描。** `ALLOWED_HOSTS` 是本项目的核心安全边界；
+   用户当前设为 `*`（不限制），那是**他本人的授权声明**，不是让你放开手脚。
+   自测只用 `127.0.0.1` 靶场。
+4. **不要消耗真实模型额度做验证。**所有回归都能用
+   `hexhound.mockllm.ScriptedLLM`（脚本 LLM）+ 本地靶场零成本跑完（见 §5）。
+   真要真实运行，先问用户。
+5. **不要削弱"没测 ≠ 安全"这条不变量。**未覆盖的端点/参数必须留成
+   `not_tested` / `candidate`，报告里如实写"未完成"；任何为了让测试变绿而放宽
+   门禁的改动都不接受（`tests/` 里有多处守着这条）。
+
+补充的两条工程纪律（用户明确要求过）：
+
+- **每完成一个可验证的阶段就提交一次**，提交信息里写清"验证了什么、用什么命令验证的"；
+  如果那次提交包含别人未提交的改动，要在信息里说明。
+- **报告要写实测数字**。"修好了"必须附命令与输出；没验证的一律写"未验证"。
+
+---
+
+## 3. 代码地图（改哪儿先看哪儿）
+
+```
+src/hexhound/
+├── cli.py            CLI 入口（audit / doctor / sandbox / memory / history / providers）
+├── gui.py            Flask + 单文件 SPA（HTML 字符串在模块顶部）、/api/run|stop|status|history…
+├── desktop.py        pywebview 宿主：单实例互斥、随机端口、**关窗护栏**（见 §6.3）
+├── orchestrator.py   分层编排：规划 → 波次 → 补扫 → 复核 → 汇总；波次时间闸门（硬+软）
+├── agent.py          ReAct 子代理循环；步数预算、收尾回合、**最后一步留给结论**
+├── tools.py          工具注册表 + 30+ 工具实现 + 角色工具边界 + 工具失败统计
+├── sandbox.py        真工具执行层：WSL/Docker 探测（prepare_sandbox）、作用域校验、白名单
+├── surface.py        共享攻面：端点/参数/指纹/尝试去重（attempt_key 带 方法/身份/位置）
+├── budget.py         五维预算 + 原子占用（reserve_tool_call / reserve_llm_call）
+├── supervisor.py     停滞/重复/失败循环监督
+├── llm.py            OpenAI 兼容客户端：推理强度、代理解析、错误因果链
+├── diagnose.py       doctor：DNS→TCP→TLS→HTTP 分步探测 + 代理/路由事实（不发凭据）
+├── prompts.py        编排者与各角色提示词 + **可用性对齐**（adapt_prompt_to_tools）
+├── report.py         报告渲染（含"真工具沙箱是否启用 / 工具失败统计 / 范围披露"）
+├── history.py        历史运行（**只读磁盘**）+ 状态三判据（见 §6.4）
+├── sanitize.py       转义序列清理 + 输出解码（decode_output / **decode_console_output**）
+├── memory.py         RunArtifacts（运行产物）、HostMemory（跨运行记忆）、TaskLedger
+├── trace.py          追加写的审计轨迹 + 离线重渲染快照
+├── mockllm.py        脚本 LLM（零额度验证的核心）
+├── browser.py / xssverify.py / screenshot.py   浏览器验证与截图（认证隔离见 §6.5）
+└── apispec.py / replan.py / dedupe.py / diff.py / providers.py / config.py / runparams.py …
+```
+
+关键测试文件（改对应模块前先跑它们）：
+
+| 模块 | 测试 |
+| --- | --- |
+| orchestrator / agent | `tests/test_orchestrator.py`、`tests/test_context_compression.py` |
+| tools / surface | `tests/test_tools_gates.py`、`tests/test_surface.py`、`tests/test_request_bodies.py` |
+| sandbox | `tests/test_sandbox.py`、`tests/test_sandbox_script.py` |
+| gui / desktop | `tests/test_gui_state.py`、`tests/test_gui_frontend.py`、`tests/test_desktop_close_guard.py` |
+| 提示词 | `tests/test_prompts.py` |
+| 网络/代理/诊断 | `tests/test_diagnose.py`、`tests/test_llm.py` |
+| 历史/报告 | `tests/test_history.py`、`tests/test_report*.py` |
+
+---
+
+## 4. 怎么把它跑起来
+
+### 4.1 本机环境（当前这台机器已经配好）
+
+- Windows + Python 3.12（系统解释器）+ `.tmp/venv-3.11`、`.tmp/venv-3.12`；
+- **WSL `Ubuntu-24.04`**，里面装了 sqlmap/nmap/nuclei/ffuf/gobuster/nikto/whatweb/curl/python3；
+  靶场副本在 `/opt/hexhound-lab/`；
+- 桌面 exe：根目录 `hexhound.exe`（由 `dist\HexHound-desktop.exe` 复制而来）。
+
+### 4.2 起靶场（真工具验证的前提）
+
+```powershell
+# 注意：仓库里的 .sh 是 CRLF，直接 bash 会报奇怪的错，先去掉 \r
+wsl -d Ubuntu-24.04 -- bash -lc "tr -d '\r' < '/mnt/c/Users/LeXSon/Documents/ChatGPT/HexHound 2/tools/start_lab_in_wsl.sh' > /tmp/start_lab.sh; bash /tmp/start_lab.sh 5000"
+# 验证：200
+wsl -d Ubuntu-24.04 -- bash -lc "curl -s -o /dev/null -w '%{http_code}\n' --noproxy '*' http://127.0.0.1:5000/"
+# 停止
+wsl -d Ubuntu-24.04 -- bash -lc "pkill -f '/opt/hexhound-lab/app.py'"
+```
+
+靶场从 Windows 侧也能访问（`http://127.0.0.1:5000`，WSL2 端口转发），但**沙箱命令是在 WSL 里
+执行的**，所以真工具打 `127.0.0.1:5000` 指的是 WSL 里的靶场——这就是为什么
+`prepare_sandbox(..., map_loopback=False)` 用于本机靶场。
+
+### 4.3 常用命令
+
+```powershell
+python -m pytest tests -q                     # 全量测试
+python -m pytest tests -q -x -k "sandbox or gui"   # 局部
+python -m ruff check src tests tools          # 风格
+python tools/run_ci_locally.py --all          # 本地跑 .github/workflows/ci.yml 的 5 个作业
+python tools/ci_status.py --sha <sha>         # 读 GitHub CI 结果（只读公共 API，无需 token）
+python tools/run_ci_locally.py --list         # 看有哪些作业
+```
+
+（`tools/ci_status.py` 是 2026-10-03 新增的：它是 `tools/ci_rerun_report.py` 的"读"那一半——
+后者在 CI 失败时把 pytest 尾部写进 `$GITHUB_STEP_SUMMARY`，前者把结果读回来，
+两者合起来才有"CI 红了但知道为什么"。）
+
+测试有个**沙箱/临时目录**的坑：某些用例要求 `TEMP`/`TMP` 落在仓库内可写目录。稳妥起见用：
+
+```powershell
+$env:HEXHOUND_TEST_ROOT="$PWD\.tmp\pytest-root"; $env:TEMP="$PWD\.tmp\tmp"; $env:TMP="$PWD\.tmp\tmp"
+python -m pytest tests -q
+```
+
+（不设也能跑——2026-10-03 全量测试就是这么过的——但设了更保险。）
+
+### 4.4 打包（改完源码要重建，否则桌面端还是旧代码）
+
+```powershell
+python -m PyInstaller --noconfirm --clean HexHound-desktop.spec   # → dist\HexHound-desktop.exe
+Copy-Item dist\HexHound-desktop.exe hexhound.exe -Force          # 桌面入口就是根目录这个
+python tools/verify_desktop_exe.py                               # 21 项启动验收（会真开窗口）
+python -m PyInstaller --noconfirm --clean HexHound.spec           # 可选：CLI → dist\hexhound.exe
+```
+
+**重建前先确认桌面程序没在运行**（`Get-Process hexhound`）。审计正在跑时不要强杀：
+先看 `http://127.0.0.1:<port>/api/status` 的 `running`；要停就点界面"停止"（约 10 秒收尾）。
+
+---
+
+## 5. 零额度验证（改完东西**必须**跑这些）
+
+真模型调用要花钱，用户明确不希望被无故消耗。下面四个脚本都用脚本 LLM + 本地靶场，
+不需要 API key，也不产生流量到外部目标：
+
+| 脚本 | 验证什么 | 期望 |
+| --- | --- | --- |
+| `tools/verify_real_tool_chain.py` | 注入角色的注册表真的能用真工具（sqlmap/脚本/命令） | 全 OK，失败统计无 `unknown`/`crashed` |
+| `tools/verify_swarm_with_real_tools.py` | **真实编排**里真工具被执行 + 软上限生效 | 全 OK，run.json 沙箱已启用，`sqlmap` 出现在工具日志 |
+| `tools/verify_close_guard.py` | 关窗护栏：中断后报告/运行记录/历史判定 | 12 项全 OK |
+| `tools/verify_poc_selfcheck.py` | 生成的 PoC 能在 WSL 里自校验（需先有一份含 findings 的运行） | 按需 |
+
+前三个都要求 §4.2 的靶场在跑，否则 `prepare_sandbox` 之后的真工具调用会全部连不上
+（**这是最容易误判的一点**：靶场没起时 sqlmap 1 秒就返回，看起来像"跑过了"）。
+
+---
+
+## 6. 六个真实事故与它们的守卫（别把它们改回去）
+
+### 6.1 桌面"一直报未知工具"（P1）
+
+**症状**：子代理反复调用 `port_scan` / `web_fingerprint` / `sandbox_script`，每次拿回
+"未知工具"；`run.json` 里 `sandbox.reason` 永远是那句"本次运行未启用容器沙箱"。
+
+**根因**：CLI 与桌面各写了一份沙箱准备逻辑，且失败原因被吞掉。
+
+**守卫**：`sandbox.prepare_sandbox()` 是唯一实现（CLI/桌面共用），返回
+`sandbox/reason/hint/tools`；`Orchestrator.describe_sandbox()` 把原因写进 run.json 与报告。
+回归：`tests/test_gui_state.py::test_desktop_hands_real_tools_to_the_injection_role`。
+**改沙箱准备逻辑时不要绕过这个函数**，也不要把 reason 换成固定文案。
+
+### 6.2 提示词承诺了不存在的工具（P2）
+
+**症状**：角色提示词写着"首选 sqlmap_scan""必须用 sandbox_script"，而沙箱不可用时
+工具集里根本没有这些名字 → 模型白烧步数。
+
+**守卫**：`prompts.adapt_prompt_to_tools(system, available, optional)` 按注册表**实际**
+工具集摘条目、末尾显式列出"本次未下发的真工具"。
+不变量测试：`tests/test_prompts.py`（正文不得出现未下发的工具名；可用的必须仍被广告）。
+
+### 6.3 关桌面窗口丢掉整轮成果
+
+**症状**：审计跑到一半直接关窗口 → 进程退出、daemon 线程被杀，**连部分报告都没有**；
+而按界面"停止"却会正常写报告。
+
+**守卫**：`desktop.install_close_guard()` 拦截**第一次**关窗 → 请求停止 → 等报告写完
+（`HEXHOUND_CLOSE_GRACE`，默认 45 秒）→ 自己 `destroy()`；**第二次**不拦（不能让人关不掉）。
+`main()` 的 finally 里再兜底一次。回归：`tests/test_desktop_close_guard.py` +
+`tools/verify_close_guard.py`。
+
+### 6.4 中断的运行被记成"已完成"
+
+**症状**：用户按停止时编排器只是跳出波次循环、然后照常收尾 → `finish_reason="finish"`
+且 `snapshot.json` 照样生成 → 历史里显示"已完成"，而报告正文写着"不完整"。
+
+**守卫**：`Orchestrator._user_stopped()` 区分"用户停止"与"预算/闸门收尾"（前者
+`finish_reason="cancelled"`）；`history._status_of()` 三条判据（报告中断标记 → 记录的
+收尾原因 → 缺快照），`PARTIAL_FINISH_REASONS` 里任一都算"未完成"。
+**新增终态记得同步这个集合**（`soft_timeout` 就是这么加进去的）。
+
+### 6.5 浏览器把越界重定向也跟了（作用域泄漏）
+
+**症状**：白名单外主机、以及"同主机另一个端口"都**真的收到了请求**；后者更糟——
+cookie 按主机（不按端口）发送，等于把登录态交给别的端口。
+
+**根因**：浏览器跟随重定向时**不会再经过路由拦截器**（实测 route 回调只被调用一次）。
+
+**守卫**：`browser._redirect_target_allowed()` + 在响应里**摘掉 `Location`**
+（越界 / 同主机跨源 / 非 HTTP(S) 一律不跟随），拦截原因写进观察记录。
+回归：`tests/test_xssverify.py::RedirectPolicyTests` 与两个真实浏览器用例。
+
+### 6.6 坏掉的 `NO_PROXY` 让客户端起不来 + 中文 Windows 的 GBK
+
+**症状 A**：环境里 `NO_PROXY=...,[::1]`，httpx 解析该条目时抛
+`InvalidURL: Invalid port: ':1]'`——**请求还没发出去**，`httpx.Client()` 与 `OpenAI()`
+就构造失败，`doctor` 和所有模型调用一起挂。
+**守卫**：`diagnose.effective_proxy()` + `llm._proxy_for_target()` 自己解析代理
+（本机/`NO_PROXY` 命中则直连），不吃 httpx 的环境变量解析。
+
+**症状 B**：`route` / `ipconfig` / `docker` / 无头 Edge 在中文 Windows 上输出 GBK，
+`subprocess.run(..., text=True)` 按 UTF-8 解会在读取线程抛 `UnicodeDecodeError`，
+输出被截断且只留一条 threading 警告。
+**守卫**：`sanitize.decode_console_output()`（严格 UTF-8 → 系统代码页 → GBK → 兜底替换，
+NUL 存在时交给 `decode_output` 择优）。**顺序不能反**：先按 cp936 试会把 UTF-8 中文
+静默解成乱码，而且一个替换字符都不产生，判不出来。
+**新写 `subprocess.run` 时**：能捕获字节就用 `decode_console_output`，否则**必须**写
+`encoding=...`（`text=True` 单独用就是上面这个 bug）。
+
+### 6.7 真工具网络的另外两条
+
+- **目标流量默认直连**（`trust_env=False`）：系统代理会把整轮扫描打成 502。
+  要代理就用显式配置；LLM 调用与目标流量是两套。
+- **死代理自动绕开**：`llm._dead_proxy_detail()` 检测到"配了代理但端口连不上"时直连并
+  在 `network_note` 里说明（事故现场：`ProxyEnable=1` + 死端口 → 7.3 秒后
+  `APIConnectionError`、0 token；用户观感是"只有挂 VPN 才行"）。
+
+---
+
+## 7. 还没做的（按优先级，全部有验收标准）
+
+> 与 `docs/WORK-REPORT-ROUND4.md` §13 一致；HANDOVER.md §10/§11 有 ✅/🔶/❌ 标注。
+
+| # | 事项 | 现状 | 验收标准 |
+| --- | --- | --- | --- |
+| 1 | `closing_no_finish` 占比 | 约 10%（模型不主动交总结，系统代写）；已把**最后一步**预留给收尾动作 | 一次真实运行里该终态 < 3%；或证明为什么降不下去 |
+| 2 | 关窗 45 秒上限 | `HEXHOUND_CLOSE_GRACE`；sqlmap 单次可跑几百秒 | 超时能被中断当前工具调用（而不是直接退出） |
+| 3 | `memory/<host>.json` 无修剪 | 陈旧条目每次 diff 都以 `unknown` 复现 | `tests/test_diff.py` 加"已解决条目不再出现"；`hexhound memory` 报出修剪了什么 |
+| 4 | 非 DeepSeek 的推理参数 | 只对 DeepSeek 发送 `reasoning_effort` | 按提供商映射 + 矩阵测试断言请求体 |
+| 5 | `settings.json` 明文 `api_key` | `provider_keys` 是 DPAPI 的，历史键是明文 | 迁移 + 回滚路径；旧设置仍能打开、无明文残留 |
+| 6 | 首次 GitHub CI 的红点 | `2d294a0` 的 windows/py3.12 红过一次，**原因未定位**（日志要认证） | 复发时用 `tools/ci_status.py` + check-run 摘要定位 |
+| 7 | 运行中关窗只在 Flask 层验证 | 打包 exe 上的运行中关窗未实测 | 手工：exe 跑一次审计 → 关窗 → 确认 `report.md` 写出 |
+| 8 | `reports/` 被 gitignore | 报告不进仓库 | 需要长期留存时搬进 `docs/` |
+
+---
+
+## 8. 改代码的推荐流程
+
+1. **先读这里 + `docs/WORK-REPORT-ROUND4.md`**，再动代码；不要凭印象重构。
+2. **复现优先**：写一个最小复现（脚本放 gitignore 的 `.tmp/`，或直接做成失败用例），
+   确认现象后再改。
+3. 改完**跑相关单测** → `python -m pytest tests -q` → `python -m ruff check src tests tools`。
+4. 涉及编排/工具/沙箱的改动，**再跑 §5 的零额度脚本**（靶场要先起）。
+5. 改了源码要**重建 exe**（§4.4），否则用户双击的还是旧代码。
+6. **提交**：一个可验证的阶段一次；信息里写清"修了什么、怎么验证的、实测数字"。
+7. 推送后**看 CI**：`python tools/ci_status.py --sha <sha>`；红了先看 check-run 摘要。
+8. 文档同步：`README.md` + `README_ZH.md` + 相关 `docs/*.md`（用户明确要求过）。
+
+---
+
+## 9. 一页速查
+
+```powershell
+# 状态
+git log --oneline -5 ; git status --short
+python -m pytest tests -q
+python tools/ci_status.py
+
+# 靶场（真工具验证前提）
+wsl -d Ubuntu-24.04 -- bash -lc "tr -d '\r' < '/mnt/c/Users/LeXSon/Documents/ChatGPT/HexHound 2/tools/start_lab_in_wsl.sh' > /tmp/start_lab.sh; bash /tmp/start_lab.sh 5000"
+
+# 零额度端到端
+python tools/verify_real_tool_chain.py
+python tools/verify_swarm_with_real_tools.py
+python tools/verify_close_guard.py
+
+# 本地 CI / 打包
+python tools/run_ci_locally.py --all
+python -m PyInstaller --noconfirm --clean HexHound-desktop.spec
+Copy-Item dist\HexHound-desktop.exe hexhound.exe -Force
+python tools/verify_desktop_exe.py
+```
+
+用户配置（勿改）：`~/.hexhound/settings.json`（桌面设置，`max_steps=100`、`task_steps=10`、
+`swarm=1`）、仓库 `.env`（CLI：`LLM_MODEL=deepseek-flash`、`MAX_STEPS=30`、`ALLOWED_HOSTS=*`）。
+**注意**：多代理模式下 `max_steps` 不生效，真实上限是"每子任务 `task_steps` + 至多两轮收尾"。
