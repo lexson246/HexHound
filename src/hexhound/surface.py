@@ -261,6 +261,24 @@ class Attempt:
 DISCOVERY_CATEGORIES: frozenset[str] = frozenset({"enumerate", "crawl", "read", "restore"})
 
 
+def _idor_priority(url: str, params: list[str]) -> tuple[int, int, str]:
+    """越权候选面的排序键（越小越靠前）。
+
+    `/api/` 下的接口优先：它们多是 JSON、直接返回对象字段（PII 高发区），
+    也是 BOLA/IDOR 最典型的位置；其次是"参数名带具体资源"的
+    （`order_id`/`invoice_id` 比泛泛的 `id`/`uid` 更像真实的资源标识）；
+    最后按路径深浅与字典序排——**排序必须确定**，否则哪个端点被列进去
+    取决于扫描先后，等于把"测不测这条"交给运气。
+    """
+    path = normalize_path(url)
+    score = 0
+    if "/api/" in path or path.startswith("/api"):
+        score -= 2
+    if any(param not in ("id", "uid") for param in params):
+        score -= 1
+    return (score, path.count("/"), path)
+
+
 @dataclass
 class Finding:
     """一条漏洞记录：Discovery（候选）→ Verification（复核）→ 入库。"""
@@ -450,7 +468,7 @@ class AttackSurface:
         hits.sort(key=lambda item: item.at, reverse=True)
         return hits
 
-    def idor_candidates(self, limit: int = 3) -> list[tuple[str, list[str]]]:
+    def idor_candidates(self, limit: int = 4) -> list[tuple[str, list[str]]]:
         """越权（IDOR/BOLA）候选面：路径暗示了对象标识参数、但那个参数从没被试过。
 
         判据（三条都要满足）：
@@ -460,6 +478,10 @@ class AttackSurface:
 
         为什么要有这个：live 评测三轮都漏了 `/api/order` 越权——字典枚举**知道路径、
         不知道参数**，于是"用 order_id 去测"只能靠模型自己想到。这里把它变成确定性输入。
+
+        排序不能靠字典插入顺序（否则"哪个端点被列进去"取决于扫描先后，随机性太大）：
+        `/api/` 下的接口优先（JSON、PII、BOLA 高发），其次是有具体资源名参数的
+        （`order_id` 比泛泛的 `id` 值钱），再按路径深浅与字典序稳定排列。
         """
         with self._lock:
             endpoints = list(self.endpoints.values())
@@ -485,6 +507,7 @@ class AttackSurface:
             if not pending:
                 continue
             picks.append((endpoint.url, pending))
+        picks.sort(key=lambda item: _idor_priority(item[0], item[1]))
         return picks[:limit]
 
     def add_agent_note(self, worker: str, text: str) -> None:

@@ -135,6 +135,29 @@ class IdorCandidatesTests(unittest.TestCase):
         surface.add_endpoint("http://h/api/order?order_id=1", source="crawl")
         self.assertEqual(surface.idor_candidates(), [])
 
+    def test_api_candidates_come_first_and_order_is_deterministic(self) -> None:
+        """`/api/` 下的接口（JSON/PII 高发）优先，且排序**确定**。
+
+        不能靠字典插入顺序：那样"哪个端点被列进任务"取决于扫描先后 = 交给运气。
+        """
+        surface = AttackSurface(target="http://h", mode="blackbox")
+        for path in ("/coupon", "/order/prepare", "/invoice/detail", "/api/users", "/api/order"):
+            surface.add_endpoint("http://h" + path, source="enumerate")
+        picks = [url.split("http://h")[-1] for url, _params in surface.idor_candidates(limit=3)]
+        self.assertEqual(picks[:2], ["/api/order", "/api/users"])
+        again = [url.split("http://h")[-1] for url, _params in surface.idor_candidates(limit=3)]
+        self.assertEqual(picks, again, "排序必须稳定")
+
+    def test_limit_truncates_after_prioritising(self) -> None:
+        surface = AttackSurface(target="http://h", mode="blackbox")
+        for path in ("/coupon", "/api/order", "/api/invoice"):
+            surface.add_endpoint("http://h" + path, source="enumerate")
+        picks = surface.idor_candidates(limit=1)
+        self.assertEqual(len(picks), 1)
+        self.assertTrue(
+            picks[0][0].endswith("/api/invoice") or picks[0][0].endswith("/api/order")
+        )
+
 
 class IdorSweepTaskTests(unittest.TestCase):
     def make(self, **overrides) -> Orchestrator:
