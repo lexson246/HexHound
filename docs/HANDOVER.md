@@ -354,7 +354,9 @@ check the proxy first.
    and only while budget remains; recording and probing actions are refused there, so it cannot
    turn into another scan round). A last step that was a *rejected probe* gets no hand-off —
    another round would just repeat. Tests:
-   `tests/test_context_compression.py::ClosingHandoffTests` (6). Live effect not yet measured.
+   `tests/test_context_compression.py::ClosingHandoffTests` (6). **Measured in run #5:
+   0 of 17 sub-tasks ended `closing_no_finish`** (run #4, before the fix: 5 of 16 = 31%).
+   That meets the acceptance criterion in §11.3 (<3%).
 4. 🔶 **Run length** — `_may_start_wave` now has two gates: the hard `MAX_SECONDS` budget and a
    **soft** cap (`HEXHOUND_SOFT_SECONDS`, default 1800 s) that only refuses *new* waves and records
    `finish_reason=soft_timeout`. Still no cap on a single wave (by design).
@@ -572,9 +574,9 @@ and `sanitize.decode_console_output()`.
 | --- | --- | --- | --- | --- | --- |
 | engine | `--tier engine` | 100% (8/8) | 0% (0/3) | ¥0 | 1.2 s |
 | agent / scripted LLM | `--tier agent --llm scripted` | 12.5% (1/8) | 0% (0/4) | ¥0 | 3.4 s |
-| agent / real model | `--tier agent --llm live --allow-live` | 75% / 75% / 87.5% / 87.5% | 0% (0/4) | ¥0.42 / ¥0.44 / ¥0.47 / ¥0.41 | 352 / 407 / 411 / 389 s |
+| agent / real model | `--tier agent --llm live --allow-live` | 75% / 75% / 87.5% / 87.5% / 87.5% | 0% (0/4) | ¥0.42 / ¥0.44 / ¥0.47 / ¥0.41 / ¥0.41 | 352 / 407 / 411 / 389 / 360 s |
 
-Four live runs. The injection scenarios are 6/6 every time and nothing quiet was ever flagged;
+Five live runs. The injection scenarios are 6/6 every time and nothing quiet was ever flagged;
 the authorization scenarios are what moved: run #1 missed `idor-order` + `unauth-users`,
 run #2 missed `xss-reflect` + `idor-order`, runs #3 and #4 missed only `idor-order`.
 That single scenario has now been traced through **three layers**, each fixed and each
@@ -584,7 +586,12 @@ and finally the *value* was wrong — the agent tried `order_id=1`, got a 404 sa
 does not exist, and closed the whole endpoint as `ruled_out`. The IDOR objective now
 prescribes four non-skippable steps (no-param request → copy the real identifier →
 `compare_responses` against another valid identifier → anonymous request) and spells out
-the 404 semantics. Closing behaviour was fixed in the same batch: 25 of 65 sub-tasks ended
+the 404 semantics. **Run #5 confirmed it**: `idor-order` is now a recorded finding
+(HH-007), and the same trace shows the recording gate working (the agent ruled the
+candidate parameter `id` out with an explicit `dismiss_signals` reason). The miss moved to
+`unauth-users`, because a single IDOR task listing three endpoints let the model spend all
+nine steps on the first one and close — so the sweep now dispatches **one task per
+endpoint** (`I1`/`I2`/`I3`, 10 steps each). Closing behaviour was fixed in the same batch: 25 of 65 sub-tasks ended
 `closing_no_finish`, and **every one of them spent its last step recording instead of
 handing in a summary** — so a hand-off round that accepts only `finish_task` is now granted
 once when that happens.

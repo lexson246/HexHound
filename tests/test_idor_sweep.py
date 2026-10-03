@@ -214,22 +214,38 @@ class IdorSweepTaskTests(unittest.TestCase):
     def test_round_index_keeps_task_ids_unique(self) -> None:
         orchestrator = self.make()
         orchestrator.surface.add_endpoint(TARGET + "/api/order", source="enumerate")
-        self.assertEqual(orchestrator.idor_sweep_tasks(round_index=1)[0].id, "I2")
+        # 每轮 3 个编号（limit 默认 3）：第二轮从 I4 起，不会与上一轮撞号
+        self.assertEqual(orchestrator.idor_sweep_tasks(round_index=1)[0].id, "I4")
 
-    def test_limit_bounds_the_listing(self) -> None:
+    def test_one_task_per_endpoint(self) -> None:
+        """**一个端点一个任务**（第 5 轮实测）：一个任务列 3 个端点时，
+        模型把 9 步全花在第一个上就自认为完成收尾了，另外两个一步没测。
+        任务粒度=端点，就没有"挑一个交差"的余地。"""
         orchestrator = self.make()
         for path in ("/api/order", "/api/user", "/api/invoice", "/coupon"):
             orchestrator.surface.add_endpoint(TARGET + path, source="enumerate")
-        task = orchestrator.idor_sweep_tasks(limit=2)[0]
-        self.assertEqual(task.objective.count("候选参数："), 2)
+        tasks = orchestrator.idor_sweep_tasks(limit=3)
+        self.assertEqual([task.id for task in tasks], ["I1", "I2", "I3"])
+        self.assertEqual(len({task.url for task in tasks}), 3, "每个任务只盯一个端点")
+        for task in tasks:
+            self.assertEqual(task.objective.count("候选参数："), 1)
+            self.assertIn(task.url, task.objective)
+            self.assertIn("只做这一个端点", task.objective)
 
-    def test_steps_scale_with_the_number_of_endpoints(self) -> None:
+    def test_limit_bounds_the_number_of_tasks(self) -> None:
         orchestrator = self.make()
-        orchestrator.surface.add_endpoint(TARGET + "/api/order", source="enumerate")
-        one = orchestrator.idor_sweep_tasks(limit=1)[0]
-        orchestrator.surface.add_endpoint(TARGET + "/api/user", source="enumerate")
-        two = orchestrator.idor_sweep_tasks(limit=2)[0]
-        self.assertGreaterEqual(two.steps, one.steps)
+        for path in ("/api/order", "/api/user", "/api/invoice", "/coupon"):
+            orchestrator.surface.add_endpoint(TARGET + path, source="enumerate")
+        self.assertEqual(len(orchestrator.idor_sweep_tasks(limit=2)), 2)
+        self.assertEqual(len(orchestrator.idor_sweep_tasks(limit=10)), 4, "候选只有 4 个")
+
+    def test_api_candidates_are_dispatched_first(self) -> None:
+        """清单顺序即派发顺序：`/api/` 下的越权面先测（它们最可能是 BOLA）。"""
+        orchestrator = self.make()
+        for path in ("/coupon", "/api/order"):
+            orchestrator.surface.add_endpoint(TARGET + path, source="enumerate")
+        tasks = orchestrator.idor_sweep_tasks(limit=3)
+        self.assertTrue(tasks[0].url.endswith("/api/order"), [t.url for t in tasks])
 
 
 if __name__ == "__main__":

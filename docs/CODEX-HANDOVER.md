@@ -38,7 +38,7 @@ HexHound 是一个 **LLM 驱动的黑盒 Web 安全审计 Agent**：编排者把
 | 真工具链路（零额度） | 15/15 | `python tools/verify_real_tool_chain.py` |
 | 真编排 + 真工具（零额度） | 15/15 + 软上限 4/4 | `python tools/verify_swarm_with_real_tools.py` |
 | 关窗护栏（Flask 层） | 12/12 | `python tools/verify_close_guard.py` |
-| **带标准答案的评测** | 引擎层 **检出 100% / 误报 0%**；真实模型档 **75% → 87.5% / 误报 0%**（四轮：¥0.4158 / ¥0.4357 / ¥0.4747 / ¥0.4073，唯一剩下的漏报是 `idor-order`） | `python tools/eval_scenarios.py --tier engine`；真实模型档见 `docs/EVAL.md` §4（要 `--llm live --allow-live`，会花额度） |
+| **带标准答案的评测** | 引擎层 **检出 100% / 误报 0%**；真实模型档 **75% → 87.5% / 误报 0%**（五轮：¥0.4158 / ¥0.4357 / ¥0.4747 / ¥0.4073 / ¥0.4096。第 5 轮起注入六项 + 越权读订单全部命中，漏报在授权类场景间摆动 = 4 任务 × 8 步预算下的方差） | `python tools/eval_scenarios.py --tier engine`；真实模型档见 `docs/EVAL.md` §4（要 `--llm live --allow-live`，会花额度） |
 
 > 跳过的那 1 个用例是"playwright 已安装"分支的环境性跳过，不是漏测。
 
@@ -440,6 +440,12 @@ fuzz / compare / auth / creds / headers 全按"受阻、未完成"处理；
 回归：`tests/test_context_compression.py::ClosingHandoffTests`（6 条）。
 
 ---
+
+### 6.18 一个任务列多个端点 = 模型挑一个交差（live 评测发现）
+
+**症状**：第 5 轮的 `I1` 列了 3 个端点，模型把全部 9 步花在第一个（`/api/order`）上——确认越权、记 HH-007、排除另一个参数、写覆盖、交总结——然后**自认为完成就收尾**，另外两个端点一步没测；`/api/users`（未授权访问场景）因此成了那一轮唯一的漏报。
+**守卫**：`idor_sweep_tasks()` 改成**一个端点一个任务**（`I1`/`I2`/`I3`…，各 10 步），目标里写明「只做这一个端点，做完为止」。零额度验证：脚本档里三个任务各自 `done`。
+回归：`tests/test_idor_sweep.py::test_one_task_per_endpoint`。
 
 ## 7. 还没做的（按优先级，全部有验收标准）
 
