@@ -353,6 +353,121 @@ class ContextCompressionTests(unittest.TestCase):
         self.assertTrue(any(step["action"] == "parse_error" for step in result.steps))
 
 
+class ClosingHandoffTests(unittest.TestCase):
+    """`closing_no_finish` 的对症修法：写完记录后**补授一个只许交总结的回合**。
+
+    实测数据（四轮 live 评测、25 个未收尾子任务）：**100% 的最后一步都是记录类动作**
+    （record_coverage 12 / leave_note 11 / record_finding 2），
+    而所有正常收尾的任务最后一步都是 `finish_task`。
+    模型不是不肯交总结，而是把收尾回合全花在写东西上，写到没步数了。
+
+    边界同样重要：只对**记录类**动作补授（试图探测的那种保持原样——再给一轮也只是重复），
+    上限**一次**，且该回合只接受 `finish_task`（不可能变成新一轮扫描）。
+    """
+
+    class RecordingLLM:
+        """正常步探测；进收尾后一直写记录——直到被要求交总结。"""
+
+        def __init__(self, finish_when_told: bool = True) -> None:
+            self.calls = 0
+            self.finish_when_told = finish_when_told
+            self.saw_handoff = False
+
+        def complete(self, messages):
+            self.calls += 1
+            text = "\n".join(str(m.get("content", "")) for m in messages)
+            usage = SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+            if "<handoff>" in text:
+                self.saw_handoff = True
+                if self.finish_when_told:
+                    return json.dumps(
+                        {"action": "finish_task", "action_input": {"summary": "写完记录后交总结"}}
+                    ), usage
+                return json.dumps(
+                    {"action": "record_coverage",
+                     "action_input": {"target": "/x", "status": "no_issue_found"}}
+                ), usage
+            if "收尾回合" in text or "最后一步" in text:
+                return json.dumps(
+                    {"action": "record_coverage",
+                     "action_input": {"target": "/x", "status": "no_issue_found"}}
+                ), usage
+            return json.dumps({"action": "http_request", "action_input": {"url": "x"}}), usage
+
+    def test_recording_on_the_last_step_earns_one_handoff_round(self) -> None:
+        llm = self.RecordingLLM()
+        result = agent.ReActAgent(llm, FakeTools(), max_steps=2, budget=Budget()).run("goal")
+        self.assertTrue(llm.saw_handoff, "应当补授交总结的回合")
+        self.assertEqual(result.finish_reason, "finish", "补授后应当由模型自己收尾")
+        self.assertEqual(result.final_summary, "写完记录后交总结")
+        self.assertTrue(result.closing["handoff"])
+
+    def test_handoff_round_accepts_only_finish_task(self) -> None:
+        """补授回合里再写记录 → 拒绝，且**不执行**（否则又变成写东西的回合）。"""
+        llm = self.RecordingLLM(finish_when_told=False)
+        tools = FakeTools()
+        result = agent.ReActAgent(llm, tools, max_steps=2, budget=Budget()).run("goal")
+        handoff_steps = [s for s in result.steps if s.get("handoff")]
+        self.assertTrue(handoff_steps, "应当留下补授回合的步骤记录")
+        for step in handoff_steps:
+            # 步骤里记的是"模型尝试了什么"，观察结果是拒绝——关键是它没被执行
+            self.assertIn("只接受 finish_task", step["observation"])
+        # 收尾回合里的记录动作照常执行；**补授回合里的**一次都不许执行
+        tried = [s for s in result.steps if s["action"] == "record_coverage"]
+        handoff_tried = [s for s in tried if s.get("handoff")]
+        self.assertTrue(handoff_tried, "补授回合应当有被拒的记录动作")
+        self.assertEqual(
+            tools.calls.count("record_coverage"), len(tried) - len(handoff_tried),
+            "补授回合里的记录动作不该被执行",
+        )
+
+    def test_handoff_happens_at_most_once(self) -> None:
+        llm = self.RecordingLLM(finish_when_told=False)
+        result = agent.ReActAgent(llm, FakeTools(), max_steps=3, budget=Budget()).run("goal")
+        # 3 个正常步 + 2 个收尾回合 + 1 个补授回合；补授回合里可能因解析/拒绝重试
+        self.assertLessEqual(llm.calls, 3 + agent.MAX_CLOSING_ROUNDS + 1 + 1)
+        handoff = [s for s in result.steps if s.get("handoff")]
+        self.assertLessEqual(len({s["step"] for s in handoff}), 1, "补授只发生一次")
+        self.assertEqual(result.finish_reason, "closing_no_finish", "没交出总结仍是未收尾")
+
+    def test_probing_on_the_last_step_gets_no_handoff(self) -> None:
+        """最后一步在**试图探测**（被拒绝）→ 不补授：再给一轮也只是重复。"""
+        llm = NeverFinishingLLM()
+        agent.ReActAgent(llm, FakeTools(), max_steps=3, budget=Budget()).run("goal")
+        self.assertEqual(llm.calls, 3 + agent.MAX_CLOSING_ROUNDS)
+
+    def test_finishing_on_the_last_step_gets_no_handoff(self) -> None:
+        class Finishing:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages):
+                self.calls += 1
+                usage = SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+                if self.calls >= 2:
+                    return json.dumps(
+                        {"action": "finish_task", "action_input": {"summary": "正常收尾"}}
+                    ), usage
+                return json.dumps(
+                    {"action": "record_coverage",
+                     "action_input": {"target": "/x", "status": "no_issue_found"}}
+                ), usage
+
+        llm = Finishing()
+        result = agent.ReActAgent(llm, FakeTools(), max_steps=2, budget=Budget()).run("goal")
+        self.assertEqual(result.finish_reason, "finish")
+        self.assertFalse(result.closing["handoff"], "正常收尾不该花补授回合")
+        self.assertEqual(llm.calls, 2)
+
+    def test_no_handoff_when_budget_cannot_pay_for_it(self) -> None:
+        """预算已经花光 → 不补授（补授是"把总结要回来"，不是"超额再跑一轮"）。"""
+        budget = Budget(BudgetLimits(max_llm_calls=4))
+        llm = self.RecordingLLM()
+        result = agent.ReActAgent(llm, FakeTools(), max_steps=4, budget=budget).run("goal")
+        self.assertFalse(result.closing["handoff"])
+        self.assertLessEqual(llm.calls, 4)
+
+
 class ExtractJsonTests(unittest.TestCase):
     def test_extract_from_fenced_block(self) -> None:
         parsed = agent.extract_json('```json\n{"action": "finish"}\n```')

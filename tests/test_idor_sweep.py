@@ -171,6 +171,23 @@ class IdorSweepTaskTests(unittest.TestCase):
         # 必须有"每个端点都要有结论"的硬要求，否则又会留下"没测"的静默盲区
         self.assertIn("record_coverage", task.objective)
 
+    def test_objective_teaches_value_discovery_and_404_semantics(self) -> None:
+        """第 4 轮 live 评测踩到的坑，必须写进任务目标里。
+
+        事实经过：I1 真的试了 `/api/order?order_id=1` → 404
+        `{"code":1,"msg":"订单不存在"}`，于是**把它记成 ruled_out 走了**。
+        参数名已经猜对了，错在**值**：靶场的订单是 1001/1002，
+        而"不带参数请求会返回默认对象 1001"这条线索它没利用。
+        """
+        orchestrator = self.make()
+        orchestrator.surface.add_endpoint(TARGET + "/api/order", source="enumerate")
+        objective = orchestrator.idor_sweep_tasks()[0].objective
+        self.assertIn("先不带任何参数请求一次", objective)
+        self.assertIn("抄下来", objective)
+        self.assertIn("compare_responses", objective)
+        self.assertIn("404", objective)
+        self.assertIn("值不对", objective)
+
     def test_round_index_keeps_task_ids_unique(self) -> None:
         orchestrator = self.make()
         orchestrator.surface.add_endpoint(TARGET + "/api/order", source="enumerate")

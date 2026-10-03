@@ -276,6 +276,12 @@ CLOSING_TOOLS: frozenset[str] = frozenset({
     "finish_task",
 })
 
+#: 收尾回合里"写记录"的那几个（不含 finish_task）——见 `_ClosingState.needs_handoff`。
+RECORDING_TOOLS: frozenset[str] = CLOSING_TOOLS - {"finish_task"}
+
+#: 交总结回合（hand-off）只接受这一个动作。
+HANDOFF_TOOLS: frozenset[str] = frozenset({"finish_task"})
+
 #: 允许的最大收尾回合数（硬上限，配置不了——这是"给两次机会"，不是"再跑一轮"）。
 MAX_CLOSING_ROUNDS = 2
 
@@ -462,6 +468,8 @@ class ReActAgent:
             # 最后一步正常步预留给收尾（见 `_ClosingState.restricted`）
             reserved_final = phase == "probe" and closing.restricted(step_no, self.max_steps)
             restricted = phase == "closing" or reserved_final
+            # 补授的"只许交总结"回合：见 `_ClosingState.needs_handoff`
+            handoff_only = closing.handoff_granted and step_no >= total_budget
 
             if should_stop is not None and should_stop():
                 finish_reason = "stopped"
@@ -598,6 +606,9 @@ class ReActAgent:
                 "action_input": action_input,
                 "phase": phase,
             }
+            if handoff_only:
+                # 追溯用：这一步是补授的"只许交总结"回合（报告/trace 能分辨）
+                record["handoff"] = True
 
             if action in ("finish", "finish_task"):
                 summary = str(action_input.get("summary") or parsed.get("summary") or "")
@@ -620,6 +631,16 @@ class ReActAgent:
                 record["observation"] = observation
                 emit(record)
                 messages.append({"role": "user", "content": observation + "\n\n请继续，输出下一轮的 JSON。"})
+                continue
+
+            if handoff_only and str(action) not in HANDOFF_TOOLS:
+                # 补授回合只差交总结：记录动作也拒绝（它已经把该记的记完了），
+                # 免得又把这一步花在写东西上。
+                observation = closing.handoff_rejection(str(action))
+                record["observation"] = observation
+                closing.rejected += 1
+                emit(record)
+                messages.append({"role": "user", "content": observation})
                 continue
 
             if restricted and str(action) not in CLOSING_TOOLS:
@@ -650,6 +671,15 @@ class ReActAgent:
             )
             if self.verbose:
                 print(f"[观察] {observation[:400]}")
+            # 步数用尽、最后一步又花在"写记录"上 → 补授一个只许交总结的回合。
+            # 上限一次，且必须还有预算可花：这是"把总结要回来"，不是"再跑一轮"
+            # （该回合只接受 finish_task，不可能变成新的探测）。
+            if closing.needs_handoff(step_no, total_budget, str(action)) and self.budget.can_spend():
+                closing.grant_handoff()
+                total_budget += 1
+                messages.append({"role": "user", "content": closing.handoff_directive()})
+                if self.on_notice is not None:
+                    self.on_notice("HANDOFF", "记录已写下：最后一步只接受 finish_task（交回总结）")
         else:
             # while 正常走完（没有 break）：正常步数与收尾回合全部耗尽。
             # 用 CLOSE_REASON_UNCLOSED 标记，下面统一翻译成"系统代写总结"的终态。
@@ -713,10 +743,55 @@ class _ClosingState:
         self.rejected = 0
         self.parse_failures = 0
         self.tools_used: dict[str, int] = {}
+        #: 是否已经补授过"只许交总结"的回合（最多一次，见 `needs_handoff`）。
+        self.handoff_granted = False
 
     def phase(self, step_no: int, max_steps: int) -> str:
         """当前是 `probe`（正常步）还是 `closing`（受限收尾回合）。"""
         return "closing" if step_no > max_steps else "probe"
+
+    def needs_handoff(self, step_no: int, total_budget: int, action: str) -> bool:
+        """步数用尽、且最后一步花在"写记录"上时，补授**一个只许交总结的回合**。
+
+        为什么（四轮 live 评测、25 个 `closing_no_finish` 子任务的实测数据）：
+        **100% 的未收尾任务，最后一步都是记录类动作**
+        （record_coverage 12 / leave_note 11 / record_finding 2），
+        而所有正常收尾的任务最后一步都是 `finish_task`。
+        也就是说模型不是不肯交，而是把收尾回合全用在写东西上，写到没步数了——
+        "最后一步预留收尾动作"只保证它**能**写结论，补授这一步保证它**还能交**总结。
+
+        只对记录类动作补授：最后一步若是在**试图探测**（被拒绝），
+        说明它没理解收尾约束，再给一轮也只是重复——那种情况保持原样
+        （系统代写总结，终态 `closing_no_finish`），不额外花钱。
+        """
+        if self.handoff_granted or self.closed:
+            return False
+        if step_no < total_budget:
+            return False
+        return str(action) in RECORDING_TOOLS
+
+    def grant_handoff(self) -> None:
+        self.handoff_granted = True
+
+    def handoff_directive(self) -> str:
+        """补授回合的指令：这一步只用来交总结。"""
+        return (
+            "<handoff>\n"
+            "记录已经写下了。**这是最后一步，且只接受 finish_task。**\n"
+            "任何 record_finding / record_coverage / leave_note 都会被拒绝——"
+            "不是「再记一条」，而是把已经写下的东西**汇总成交回总结**：\n"
+            "确认了什么漏洞（编号）、覆盖了哪些面、哪些没做到、下一步建议。\n"
+            "直接输出 action=\"finish_task\" 与 summary。\n"
+            "</handoff>"
+        )
+
+    def handoff_rejection(self, action: str) -> str:
+        allowed = "、".join(sorted(HANDOFF_TOOLS))
+        return (
+            f"这一步只接受 {allowed}（你刚才要调 {action}）。\n"
+            "记录已经写下了，现在只差交回总结：把确认的漏洞编号、覆盖到的面、"
+            "未完成项与下一步建议写进 summary，然后 finish_task。"
+        )
 
     def restricted(self, step_no: int, max_steps: int) -> bool:
         """这一步是否**只允许收尾动作**。
@@ -796,6 +871,7 @@ class _ClosingState:
             "rejected": self.rejected,
             "tools_used": dict(self.tools_used),
             "max_rounds": MAX_CLOSING_ROUNDS,
+            "handoff": self.handoff_granted,
         }
 
 

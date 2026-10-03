@@ -344,9 +344,17 @@ check the proxy first.
    `docker`/headless-Edge output, which used to crash reader threads on Chinese Windows.
 3. 🔶 **Special tasks hitting their step cap** — closing rounds (`MAX_CLOSING_ROUNDS=2`) removed
    `max_steps` endings entirely (by-date check: 09-18…09-20 had 74; from 09-21 on, zero). What is
-   left is `closing_no_finish` (~10%): the model does not hand in its own summary. Round 4 reserves
-   the **last step** for closing actions so it has one; **the resulting drop is not yet measured on
-   a real run**.
+   left is `closing_no_finish`: measured at **31–43% of sub-tasks** in the eval runs (25 of 65
+   across four live runs), far above the ~10% seen in the earlier engagements, because the eval
+   runs on a tight budget (4 tasks × 8 steps). Forensics on all 25: **every single one spent its
+   last step on a recording action** (record_coverage 12 / leave_note 11 / record_finding 2), while
+   every normally-closed task ended with `finish_task`. Fix
+   (`agent._ClosingState.needs_handoff`): when the budget is exhausted and the last action was a
+   *recording* one, grant **one hand-off round that accepts only `finish_task`** (at most once,
+   and only while budget remains; recording and probing actions are refused there, so it cannot
+   turn into another scan round). A last step that was a *rejected probe* gets no hand-off —
+   another round would just repeat. Tests:
+   `tests/test_context_compression.py::ClosingHandoffTests` (6). Live effect not yet measured.
 4. 🔶 **Run length** — `_may_start_wave` now has two gates: the hard `MAX_SECONDS` budget and a
    **soft** cap (`HEXHOUND_SOFT_SECONDS`, default 1800 s) that only refuses *new* waves and records
    `finish_reason=soft_timeout`. Still no cap on a single wave (by design).
@@ -394,8 +402,14 @@ check the proxy first.
     `orchestrator.idor_sweep_tasks()` dispatches one deterministic `auth` task (`I1`) that must
     confirm which parameter actually works, then do the A/B id comparison and the anonymous
     request, with a conclusion required per endpoint.
-    Tests: `tests/test_idor_sweep.py` (18). Measured effect of the fix is still pending a paid
-    live run (run #3 scored 87.5% with `idor-order` as the only miss).
+    Tests: `tests/test_idor_sweep.py` (19).
+    **Run #4 (paid) showed the parameter half works and the value half did not**: `/api/order` got
+    25 attempts, 24 of them carrying `order_id`, and the `I1` task finished properly — but it tried
+    `order_id=1`, got 404 `{"msg":"订单不存在"}`, and recorded the whole endpoint as `ruled_out`.
+    "The value does not exist" is not "the parameter has no effect": the objective now prescribes
+    four non-skippable steps (request once **without** parameters, copy the real identifier/owner
+    out of that response, then `compare_responses` against another **valid** identifier, then test
+    anonymous access) and states the 404 semantics explicitly.
 
 
 ---
@@ -558,12 +572,22 @@ and `sanitize.decode_console_output()`.
 | --- | --- | --- | --- | --- | --- |
 | engine | `--tier engine` | 100% (8/8) | 0% (0/3) | ¥0 | 1.2 s |
 | agent / scripted LLM | `--tier agent --llm scripted` | 12.5% (1/8) | 0% (0/4) | ¥0 | 3.4 s |
-| agent / real model | `--tier agent --llm live --allow-live` | 75% / 75% / **87.5%** | 0% (0/4) | ¥0.42 / ¥0.44 / ¥0.47 | 352 s / 407 s / 411 s |
+| agent / real model | `--tier agent --llm live --allow-live` | 75% / 75% / 87.5% / 87.5% | 0% (0/4) | ¥0.42 / ¥0.44 / ¥0.47 / ¥0.41 | 352 / 407 / 411 / 389 s |
 
-Three live runs. The injection scenarios are 6/6 every time and nothing quiet was ever flagged;
+Four live runs. The injection scenarios are 6/6 every time and nothing quiet was ever flagged;
 the authorization scenarios are what moved: run #1 missed `idor-order` + `unauth-users`,
-run #2 missed `xss-reflect` + `idor-order`, run #3 (after the recording gate) missed only
-`idor-order` — which is now understood end to end and fixed (§10.13, §4.1/§4.3 in `docs/EVAL.md`).
+run #2 missed `xss-reflect` + `idor-order`, runs #3 and #4 missed only `idor-order`.
+That single scenario has now been traced through **three layers**, each fixed and each
+confirmed by the next run (`docs/EVAL.md` §4.1/§4.3/§4.4): the endpoint was never
+discovered (tier choice), the parameter name was unknown (dictionary only knows paths),
+and finally the *value* was wrong — the agent tried `order_id=1`, got a 404 saying the order
+does not exist, and closed the whole endpoint as `ruled_out`. The IDOR objective now
+prescribes four non-skippable steps (no-param request → copy the real identifier →
+`compare_responses` against another valid identifier → anonymous request) and spells out
+the 404 semantics. Closing behaviour was fixed in the same batch: 25 of 65 sub-tasks ended
+`closing_no_finish`, and **every one of them spent its last step recording instead of
+handing in a summary** — so a hand-off round that accepts only `finish_task` is now granted
+once when that happens.
 
 Two live runs, both 6/8 with zero false positives, but **not the same six** — the injection
 scenarios are stable, the authorization ones are not. Both misses were diagnosed from the run
@@ -607,5 +631,5 @@ must not be able to kill a run. It now retries after trimming the non-ASCII tail
 `looks_like_url()` returns `False` for the same input.
 
 Test/lint state at the end of this round: `python -m pytest tests` →
-**1037 passed, 71 subtests passed, 1 skipped** (run `-q` twice and pytest prints no totals —
+**1044 passed, 71 subtests passed, 1 skipped** (run `-q` twice and pytest prints no totals —
 `addopts` already contains `-q`, so pass no extra `-q`); `ruff check src tests tools` clean.

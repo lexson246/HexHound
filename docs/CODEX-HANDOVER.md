@@ -28,7 +28,7 @@ HexHound 是一个 **LLM 驱动的黑盒 Web 安全审计 Agent**：编排者把
 
 | 项 | 状态 | 证据 |
 | --- | --- | --- |
-| 测试 | **1037 passed + 71 subtests passed / 1 skipped** | `python -m pytest tests`（别再补 `-q`：`addopts` 已有 `-q`，双重 `-qq` 会让 pytest 连汇总行都不打印） |
+| 测试 | **1044 passed + 71 subtests passed / 1 skipped** | `python -m pytest tests`（别再补 `-q`：`addopts` 已有 `-q`，双重 `-qq` 会让 pytest 连汇总行都不打印） |
 | 代码风格 | 干净 | `python -m ruff check src tests tools` |
 | 本地 CI 执行器 | **Windows 作业真跑；Linux 作业是 SKIP**（见下） | `python tools/run_ci_locally.py --all` |
 | GitHub CI | **8/8 绿** | `python tools/ci_status.py --sha e6e2431` |
@@ -38,7 +38,7 @@ HexHound 是一个 **LLM 驱动的黑盒 Web 安全审计 Agent**：编排者把
 | 真工具链路（零额度） | 15/15 | `python tools/verify_real_tool_chain.py` |
 | 真编排 + 真工具（零额度） | 15/15 + 软上限 4/4 | `python tools/verify_swarm_with_real_tools.py` |
 | 关窗护栏（Flask 层） | 12/12 | `python tools/verify_close_guard.py` |
-| **带标准答案的评测** | 引擎层 **检出 100% / 误报 0%**；真实模型档 **75% / 误报 0%**（两轮，¥0.42+¥0.44） | `python tools/eval_scenarios.py --tier engine`；真实模型档见 `docs/EVAL.md` §4（要 `--llm live --allow-live`，会花额度） |
+| **带标准答案的评测** | 引擎层 **检出 100% / 误报 0%**；真实模型档 **75% → 87.5% / 误报 0%**（四轮：¥0.4158 / ¥0.4357 / ¥0.4747 / ¥0.4073，唯一剩下的漏报是 `idor-order`） | `python tools/eval_scenarios.py --tier engine`；真实模型档见 `docs/EVAL.md` §4（要 `--llm live --allow-live`，会花额度） |
 
 > 跳过的那 1 个用例是"playwright 已安装"分支的环境性跳过，不是漏测。
 
@@ -401,7 +401,7 @@ fuzz / compare / auth / creds / headers 全按"受阻、未完成"处理；
 `Endpoint.suggested_params`（**推测值单独一栏，永不混进 `params`**）+
 `orchestrator.idor_sweep_tasks()`（确定性派 `I1(auth)` 任务）。
 界面与提示词必须能分辨：`参数[...]` 是探到的，`推测参数[...](按路径名词推测，未验证)` 是猜的。
-回归：`tests/test_idor_sweep.py`（18 条）。
+回归：`tests/test_idor_sweep.py`（19 条）。
 
 **顺带把闸门的边界磨精确**：`enumerate_common` 会把"路径存在（200/403）"也记成
 `outcome=signal`，而那不是漏洞信号——`surface.DISCOVERY_CATEGORIES` 把这些发现类尝试
@@ -412,6 +412,32 @@ fuzz / compare / auth / creds / headers 全按"受阻、未完成"处理；
 - **死代理自动绕开**：`llm._dead_proxy_detail()` 检测到"配了代理但端口连不上"时直连并
   在 `network_note` 里说明（事故现场：`ProxyEnable=1` + 死端口 → 7.3 秒后
   `APIConnectionError`、0 token；用户观感是"只有挂 VPN 才行"）。
+
+### 6.16 值不存在被当成"参数不生效"，整条越权面被关掉（live 评测发现）
+
+**症状**：第 4 轮 live 评测 87.5%，唯一漏报还是 `idor-order`。查 `I1` 的 trace：
+匿名读 `/api/users` 拿到了 PII（正确报了 HH-003），接着 4 步浪费在错的端点上，
+然后 `/api/order?order_id=1` → 404 `{"code":1,"msg":"订单不存在"}`，
+于是写覆盖 `ruled_out`：「试过 id=1、order_id=1001 两个候选参数，均返回 404」——
+**把"值不存在"读成了"参数不生效"**。靶场的订单是 1001/1002，
+而且**不带参数请求**就返回默认订单 1001（枚举那次已经拿到过）。
+**守卫**：`idor_sweep_tasks` 的目标文本重写成不可跳过的四步——
+先不带参数请求一次 → 把响应里的真实标识值与属主抄下来 → 用另一个**有效**标识做
+`compare_responses` 对比 → 再测匿名访问；并写明 404 是「值不对」不是「参数不生效」，
+不许据此把端点记成 ruled_out。回归：
+`tests/test_idor_sweep.py::test_objective_teaches_value_discovery_and_404_semantics`。
+
+### 6.17 写完记录就没步数交总结（`closing_no_finish` 31–43%）
+
+**症状**：四轮 live 评测 65 个子任务里 25 个落在 `closing_no_finish`（系统代写总结）。
+**根因（25/25 的取证）**：**每个未收尾任务的最后一步都是记录类动作**
+（record_coverage 12 / leave_note 11 / record_finding 2），
+而所有正常收尾的任务最后一步都是 `finish_task`——模型不是不肯交总结，
+是把收尾回合全花在写东西上，写到没步数了。
+**守卫**：`agent._ClosingState.needs_handoff`——步数用尽且最后一步是**记录类**动作时，
+**补授一个只许 `finish_task` 的回合**（上限一次、必须还有预算；该回合拒绝记录与探测动作，
+所以不可能变成新一轮扫描）。最后一步若是在**试图探测**（被拒绝）则不补授。
+回归：`tests/test_context_compression.py::ClosingHandoffTests`（6 条）。
 
 ---
 
@@ -424,7 +450,7 @@ fuzz / compare / auth / creds / headers 全按"受阻、未完成"处理；
 | 0 | ~~**带标准答案的多场景评测**（检出率/误报率/耗时/成本）~~ **已完成** | `tools/eval_scenarios.py` + `evals/scenarios.json`（12 场景，标准答案来自 vulnlab 的已知漏洞）+ 口径测试。引擎层实测 检出 100% / 误报 0%；Agent 层脚本 LLM 12.5%（是管道指标，不是能力指标）；**真实模型那一档已跑两轮**：75% / 误报 0%，¥0.4158 + ¥0.4357，351.8s + 407.2s（`--tier agent --llm live --allow-live`） | 详见 `docs/EVAL.md` §4 |
 | 0b | ~~**覆盖记录与攻面证据自相矛盾**（live 评测发现）~~ **已修** | 攻面记了 3 条 `signal`（未转义回显），覆盖记录却写 `no_issue_found` | 记录层闸门：有 signal 时拒绝写 `no_issue_found`/`ruled_out`，除非带 `dismiss_signals`（理由随覆盖行进报告）。`tests/test_coverage_consistency.py`（13 条） |
 | 0c | ~~**子任务没跑完不留"没测过"的痕**（live 评测发现）~~ **已修** | 真根因更狠：侦察子代理自己挑档位时漏了 `business`，而 `/api/order` 在 business 档第 68/77 位——**端点根本没被发现**；`closing_no_finish` 又算"已收尾"，于是一片空白 | ① `knowledge.BUSINESS_CRITICAL_PATHS`（12 条只读、凭 id 就能读的入口）**无论选哪些档位都探**（`include_critical=false` 可关）；② 没以 `done` 收尾的任务，把它点名却没碰过的端点写成 `not_tested`。零额度验证：`/api/order` 从 0 端点/0 尝试 → 1/1 |
-| 0d | ~~**字典发现的端点没有参数信息**~~ **已修** | `/api/order` 登记时参数为空，"该用 `order_id` 测"只能靠模型猜——三轮 live 评测都没想到（第 3 轮 87.5%，唯一漏报就是它） | ① `knowledge.suggest_id_params()` 按路径名词给候选（`/api/order` → `order_id`/`id`；`/login` 这类动作路径**不给**）；② 存进 `Endpoint.suggested_params`，**永不混进 `params`**，提示词里标成 `推测参数[...](未验证)`；③ `orchestrator.idor_sweep_tasks()` 确定性派 `I1(auth)` 任务（先确认真实参数名，再 A/B 换 id 对比，每端点必须有结论）。`tests/test_idor_sweep.py`（18 条） |
+| 0d | ~~**字典发现的端点没有参数信息**~~ **已修（参数名那半）** | `/api/order` 登记时参数为空，"该用 `order_id` 测"只能靠模型猜——三轮 live 评测都没想到。第 4 轮修完：`/api/order` 拿到 25 次尝试、其中 24 次带 `order_id`，`I1` 任务正常收尾，**但仍漏报**——模型试 `order_id=1` 得到 404「订单不存在」，把整条端点记成 ruled_out | ① `knowledge.suggest_id_params()` 按路径名词给候选（`/api/order` → `order_id`/`id`；`/login` 这类动作路径**不给**）；② 存进 `Endpoint.suggested_params`，**永不混进 `params`**，提示词里标成 `推测参数[...](未验证)`；③ `orchestrator.idor_sweep_tasks()` 确定性派 `I1(auth)` 任务（先确认真实参数名，再 A/B 换 id 对比，每端点必须有结论）。`tests/test_idor_sweep.py`（18 条） |
 | 1 | `closing_no_finish` 占比 | 约 10%（模型不主动交总结，系统代写）；已把**最后一步**预留给收尾动作 | 一次真实运行里该终态 < 3%；或证明为什么降不下去 |
 | 2 | 关窗 45 秒上限 | `HEXHOUND_CLOSE_GRACE`；沙箱命令现在可被中断（实测 10 秒内退出） | 已在打包 exe 上验收（10/10）；剩余是把上限调到"不急不躁"的默认值 |
 | 3 | `memory/<host>.json` 无修剪 | 陈旧条目每次 diff 都以 `unknown` 复现 | `tests/test_diff.py` 加"已解决条目不再出现"；`hexhound memory` 报出修剪了什么 |
@@ -474,3 +500,5 @@ python tools/verify_desktop_exe.py
 用户配置（勿改）：`~/.hexhound/settings.json`（桌面设置，`max_steps=100`、`task_steps=10`、
 `swarm=1`）、仓库 `.env`（CLI：`LLM_MODEL=deepseek-flash`、`MAX_STEPS=30`、`ALLOWED_HOSTS=*`）。
 **注意**：多代理模式下 `max_steps` 不生效，真实上限是"每子任务 `task_steps` + 至多两轮收尾"。
+
+
