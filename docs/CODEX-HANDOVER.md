@@ -28,7 +28,7 @@ HexHound 是一个 **LLM 驱动的黑盒 Web 安全审计 Agent**：编排者把
 
 | 项 | 状态 | 证据 |
 | --- | --- | --- |
-| 测试 | **1044 passed + 71 subtests passed / 1 skipped** | `python -m pytest tests`（别再补 `-q`：`addopts` 已有 `-q`，双重 `-qq` 会让 pytest 连汇总行都不打印） |
+| 测试 | **1062 passed + 71 subtests passed / 1 skipped** | `python -m pytest tests`（别再补 `-q`：`addopts` 已有 `-q`，双重 `-qq` 会让 pytest 连汇总行都不打印） |
 | 代码风格 | 干净 | `python -m ruff check src tests tools` |
 | 本地 CI 执行器 | **Windows 作业真跑；Linux 作业是 SKIP**（见下） | `python tools/run_ci_locally.py --all` |
 | GitHub CI | **8/8 绿** | `python tools/ci_status.py --sha e6e2431` |
@@ -38,7 +38,7 @@ HexHound 是一个 **LLM 驱动的黑盒 Web 安全审计 Agent**：编排者把
 | 真工具链路（零额度） | 15/15 | `python tools/verify_real_tool_chain.py` |
 | 真编排 + 真工具（零额度） | 15/15 + 软上限 4/4 | `python tools/verify_swarm_with_real_tools.py` |
 | 关窗护栏（Flask 层） | 12/12 | `python tools/verify_close_guard.py` |
-| **带标准答案的评测** | 引擎层 **检出 100% / 误报 0%**；真实模型档 **75% → 87.5% / 误报 0%**（五轮：¥0.4158 / ¥0.4357 / ¥0.4747 / ¥0.4073 / ¥0.4096。第 5 轮起注入六项 + 越权读订单全部命中，漏报在授权类场景间摆动 = 4 任务 × 8 步预算下的方差） | `python tools/eval_scenarios.py --tier engine`；真实模型档见 `docs/EVAL.md` §4（要 `--llm live --allow-live`，会花额度） |
+| **带标准答案的评测** | 引擎层 **检出 100% / 误报 0%**；真实模型档 **75–87.5% / 误报 0%**（六轮、约 ¥2.68：注入六项与越权读订单都命中过，漏报在场景间摆动 = 4 任务 × 8 步预算下的方差）。第 6 轮又暴露"实测信号没人接就消失"，已加**兜底候选**安全网（§6.19），效果待第 7 轮实测 | `python tools/eval_scenarios.py --tier engine`；真实模型档见 `docs/EVAL.md` §4（要 `--llm live --allow-live`，会花额度） |
 
 > 跳过的那 1 个用例是"playwright 已安装"分支的环境性跳过，不是漏测。
 
@@ -446,6 +446,20 @@ fuzz / compare / auth / creds / headers 全按"受阻、未完成"处理；
 **症状**：第 5 轮的 `I1` 列了 3 个端点，模型把全部 9 步花在第一个（`/api/order`）上——确认越权、记 HH-007、排除另一个参数、写覆盖、交总结——然后**自认为完成就收尾**，另外两个端点一步没测；`/api/users`（未授权访问场景）因此成了那一轮唯一的漏报。
 **守卫**：`idor_sweep_tasks()` 改成**一个端点一个任务**（`I1`/`I2`/`I3`…，各 10 步），目标里写明「只做这一个端点，做完为止」。零额度验证：脚本档里三个任务各自 `done`。
 回归：`tests/test_idor_sweep.py::test_one_task_per_endpoint`。
+
+### 6.19 实测信号没人接就消失了（live 评测发现）
+
+**症状**：第 6 轮漏了 `xss-reflect` 与 `lfi-file`，而两者的信号都在攻面里：
+`/reflect` 3 条 xss 信号（payload 原样回显未转义）、`/file` 1 条 path 信号（响应 196 → 1451 字节，内容差异就是那个敏感文件）。一个被模型「排除」、一个连覆盖结论都没写——**报告读起来像这两个面没漏**。
+**守卫**：`orchestrator._auto_register_signals()`——收尾时凡是"有非发现类信号、却没有 finding/候选/`reported` 覆盖行"的端点，一律登记为**候选**（`[自动]` 前缀、`confidence=unreviewed`、附上模型的排除理由）。只登记候选（不是漏洞），`enumerate` 的发现类命中不算信号，同指纹去重。
+评测口径同步：这种候选算"被发现"但**单独计数**（`auto_candidates` 字段 + 报告里的"兜底候选 N（模型未下结论）"）——平台没让证据消失 ≠ 模型判对了。
+离线复核：第 6 轮产物跑新逻辑正好接住那两条漏报。回归：`tests/test_auto_candidates.py`。
+
+### 6.20 误报判定一直是空转的（度量 bug，已修）
+
+**症状**：agent 层的"误报率 0%"从第一天起就是空转的数字——静默场景的 `ground_truth` 是占位文案「（不是漏洞）」，被 `requested_types` 当成关键词去匹配 finding 文本，而那句话永远不会出现在报告里。**在诱饵端点上明确报 SQLi/XSS 也不会被算误报。**（引擎层的误报判定走记录结果，一直有效——`reflect-dom` 那个真误报就是它抓的。）
+**守卫**：静默场景按它在诱骗的 `category` 判（`CATEGORY_KEYWORDS`），且只看 `title`/`vuln_type`（结论声称的类型），不看描述——第 2 轮那条"JS 硬编码 SIGN_SECRET"曾因描述里带「注入」被误判成误报。
+修正后离线复核六轮：误报 **0 条**，且判定非空转。回归：`tests/test_eval_scenarios.py::QuietScenarioCriterionTests`。
 
 ## 7. 还没做的（按优先级，全部有验收标准）
 

@@ -167,6 +167,103 @@ class CoverageScoringTests(unittest.TestCase):
         self.assertEqual(ev.coverage_mentions(self.SCENARIO, rows), "")
 
 
+class QuietScenarioCriterionTests(unittest.TestCase):
+    """"应当安静"的场景必须**真的会被判误报**。
+
+    发现的度量 bug：静默场景的 `ground_truth` 写的是占位文案"（不是漏洞）"，
+    而 `requested_types` 把它当关键词去匹配 finding 文本——那句文案永远不会出现在
+    报告里，于是**误报判定从第一天起就是空转的**：在诱饵端点上明确报 SQLi/XSS
+    也不会被算成误报，误报率恒等于 0%。
+
+    现在按"这个场景在诱骗哪一类错误结论"判（`CATEGORY_KEYWORDS`），
+    同时**不能矫枉过正**：同一路径上的另一类问题（首页缺安全响应头）不是这个诱饵的误报。
+    """
+
+    def match(self, scenario: dict, **finding) -> bool:
+        return ev.finding_matches(scenario, finding)
+
+    def test_wrong_claim_on_a_decoy_endpoint_is_now_a_false_positive(self) -> None:
+        decoy = {"id": "decoy-root", "endpoint": "/", "param": "q", "category": "sqli",
+                 "expected": "none", "ground_truth": "（不是漏洞）"}
+        self.assertTrue(self.match(
+            decoy, url="http://127.0.0.1:5000/", title="SQL 注入", vuln_type="SQL注入",
+        ))
+        dom = {"id": "reflect-dom", "endpoint": "/reflect-dom", "param": "name",
+               "category": "xss", "expected": "none", "ground_truth": "（不是漏洞）"}
+        self.assertTrue(self.match(
+            dom, url="http://127.0.0.1:5000/reflect-dom", title="反射型XSS",
+            vuln_type="反射型XSS",
+        ))
+
+    def test_a_different_issue_on_the_same_path_is_not_a_false_positive(self) -> None:
+        """诱饵测的是"参数被忽略/该类别不该命中"，不是"这个页面必须完美"。"""
+        decoy = {"id": "decoy-root", "endpoint": "/", "param": "q", "category": "sqli",
+                 "expected": "none", "ground_truth": "（不是漏洞）"}
+        self.assertFalse(self.match(
+            decoy, url="http://127.0.0.1:5000/", title="缺少安全响应头",
+            vuln_type="安全配置缺陷",
+        ))
+
+    def test_description_prose_does_not_turn_a_real_finding_into_a_false_positive(self) -> None:
+        """实测第 2 轮的真实情形：`decoy-static` 上那条"JS 硬编码 SIGN_SECRET"。
+
+        它和诱饵毫无关系（诱饵测的是 `?x=` 参数），但描述里带了"注入"两个字，
+        于是旧文本匹配把它算成误报。**判误报看结论声称的类型（title/vuln_type），
+        不看描述行文**——否则误报率会随模型的措辞随机跳动。
+        """
+        decoy = {"id": "decoy-static", "endpoint": "/static/app.js", "param": "x",
+                 "category": "sqli", "expected": "none", "ground_truth": "（不是漏洞）"}
+        self.assertFalse(self.match(
+            decoy, url="http://127.0.0.1:5000/static/app.js",
+            title="前端 JS 明文硬编码签名密钥 SIGN_SECRET（/static/app.js）",
+            vuln_type="敏感信息泄露",
+            description="可用于伪造 role=admin 的令牌，绕过鉴权后注入任意查询参数。",
+        ))
+        # 而"在这个端点上声称注入成立"仍然算误报
+        self.assertTrue(self.match(
+            decoy, url="http://127.0.0.1:5000/static/app.js",
+            title="SQL 注入", vuln_type="SQL注入", description="x 参数可注入",
+        ))
+
+    def test_reflection_only_scenario_flags_an_xss_claim(self) -> None:
+        csp = {"id": "reflect-csp", "endpoint": "/reflect-csp", "param": "name",
+               "category": "xss", "expected": "reflection_only", "ground_truth": "（不是漏洞）"}
+        self.assertTrue(self.match(
+            csp, url="http://127.0.0.1:5000/reflect-csp", title="反射型 XSS",
+            vuln_type="反射型XSS",
+        ))
+
+    def test_placeholder_truth_is_never_a_keyword(self) -> None:
+        for placeholder in ("（不是漏洞）", "-", "无", ""):
+            scenario = {"expected": "none", "category": "sqli", "ground_truth": placeholder}
+            self.assertNotIn(placeholder, ev.requested_types(scenario))
+            self.assertIn("sql", ev.requested_types(scenario))
+
+    def test_signal_scenarios_still_use_the_ground_truth(self) -> None:
+        scenario = {"expected": "signal", "category": "sqli", "ground_truth": "越权访问"}
+        self.assertEqual(ev.requested_types(scenario), ("越权", "idor", "水平"))
+
+
+class AutoCandidateAccountingTests(unittest.TestCase):
+    """兜底候选要能被单独计数——"平台没让证据消失"不等于"模型判对了"。"""
+
+    def test_auto_candidate_is_recognised(self) -> None:
+        self.assertTrue(ev.is_auto_candidate(
+            {"title": "[自动] 实测信号未形成结论：xss @ /reflect"}
+        ))
+        self.assertFalse(ev.is_auto_candidate({"title": "反射型 XSS"}))
+
+    def test_auto_candidate_still_matches_its_scenario(self) -> None:
+        """它算"被发现"（评测口径），但报告说明里区分来源。"""
+        scenario = {"id": "xss-reflect", "endpoint": "/reflect", "expected": "signal",
+                    "ground_truth": "反射型XSS"}
+        candidate = {"url": "http://127.0.0.1:5000/reflect",
+                     "title": "[自动] 实测信号未形成结论：xss @ /reflect",
+                     "vuln_type": "反射型XSS", "status": "candidate"}
+        self.assertTrue(ev.finding_matches(scenario, candidate))
+        self.assertTrue(ev.is_auto_candidate(candidate))
+
+
 class MemoryIsolationTests(unittest.TestCase):
     """评测必须**从零开始**：不许读到这台机器的历史（第一次 live 评测的教训）。
 

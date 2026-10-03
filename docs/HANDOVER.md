@@ -574,9 +574,9 @@ and `sanitize.decode_console_output()`.
 | --- | --- | --- | --- | --- | --- |
 | engine | `--tier engine` | 100% (8/8) | 0% (0/3) | ¥0 | 1.2 s |
 | agent / scripted LLM | `--tier agent --llm scripted` | 12.5% (1/8) | 0% (0/4) | ¥0 | 3.4 s |
-| agent / real model | `--tier agent --llm live --allow-live` | 75% / 75% / 87.5% / 87.5% / 87.5% | 0% (0/4) | ¥0.42 / ¥0.44 / ¥0.47 / ¥0.41 / ¥0.41 | 352 / 407 / 411 / 389 / 360 s |
+| agent / real model | `--tier agent --llm live --allow-live` | 75 / 75 / 87.5 / 87.5 / 87.5 / 75% | 0% (0/4) | ¥0.42 / ¥0.44 / ¥0.47 / ¥0.41 / ¥0.41 / ¥0.54 | 352 / 407 / 411 / 389 / 360 / 417 s |
 
-Five live runs. The injection scenarios are 6/6 every time and nothing quiet was ever flagged;
+Six live runs (≈¥2.68 total). The injection scenarios are 6/6 every time and nothing quiet was ever flagged;
 the authorization scenarios are what moved: run #1 missed `idor-order` + `unauth-users`,
 run #2 missed `xss-reflect` + `idor-order`, runs #3 and #4 missed only `idor-order`.
 That single scenario has now been traced through **three layers**, each fixed and each
@@ -611,6 +611,22 @@ never reached. Both are now **fixed** (§10.11, §10.12):
   per-tier cut). This was the actual root cause: the endpoint was never discovered at all;
 - a task that does not end `done` (including `closing_no_finish`, which counts as *closed*)
   now has the endpoints it named but never touched written as `not_tested`.
+
+Run #6 also exposed the last silent failure mode: `/reflect` and `/file` both had recorded
+signals (3 × xss, 1 × path with a 196 → 1451 byte content difference) and neither became a
+finding — one was dismissed, one had no conclusion at all. The evidence was simply dropped,
+and the report read as if those faces were clean. `orchestrator._auto_register_signals()`
+now registers every such endpoint as a **[自动] candidate** (`confidence=unreviewed`, the
+model's dismissal reason included), and the eval counts those separately
+(`auto_candidates`) because *the platform not losing evidence is not the model getting it
+right*. Replaying run #6's surface offline, the net catches exactly those two misses.
+
+A metric bug fell out of the same work: the agent-tier false-positive check was **vacuous**
+from day one — quiet scenarios carry `ground_truth: "（不是漏洞）"`, which was used as a
+keyword, so no claim on a decoy endpoint could ever be flagged. Quiet scenarios are now
+judged by the category they decoy (`CATEGORY_KEYWORDS`), looking only at `title`/`vuln_type`;
+re-scoring all six live runs under the corrected criterion still gives **zero false
+positives**, and the criterion is non-vacuous (pinned by `QuietScenarioCriterionTests`).
 
 Zero-quota evidence: in a scripted run `/api/order` went from **0 endpoints / 0 attempts** to
 **1 / 1**, and the deterministic `I1(auth)` IDOR task (candidate params `order_id`/`id`) is

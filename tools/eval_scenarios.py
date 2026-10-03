@@ -61,6 +61,30 @@ TYPE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "未授权访问": ("未授权", "unauth"),
 }
 
+#: 场景 `category` → 关键词。**"应当安静"的场景必须靠它判误报**。
+#:
+#: 为什么需要（发现的度量 bug）：静默场景的 `ground_truth` 写的是"（不是漏洞）"，
+#: 而 `requested_types` 会把它当成关键词去匹配 finding 文本——那句占位文案永远不会
+#: 出现在报告里，于是**误报判定从第一天起就是空转的**：任何在诱饵端点上
+#: 明确报了 SQLi/XSS 的结论都不会被算作误报，误报率恒等于 0%。
+#: 现在改成"这个场景在诱骗哪一类错误结论"：`decoy-root`(sqli) 上写 SQL 注入
+#: 才算误报；同一路径上的**另一类**问题（例如首页缺安全响应头）不算——
+#: 那个诱饵测的是"参数被忽略"，不是"首页必须完美"。
+CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "sqli": ("sql", "注入"),
+    "nosqli": ("sql", "注入"),
+    "xss": ("xss", "跨站"),
+    "ssti": ("ssti", "模板"),
+    "cmd": ("命令", "cmd", "rce"),
+    "path": ("文件读取", "遍历", "路径穿越", "lfi"),
+    "ssrf": ("ssrf", "服务端请求"),
+    "auth": ("越权", "未授权", "idor"),
+    "idor": ("越权", "idor", "水平"),
+}
+
+#: `ground_truth` 里这些是"没有标准答案"的占位文案，绝不能当关键词用。
+PLACEHOLDER_TRUTHS: frozenset[str] = frozenset({"（不是漏洞）", "(不是漏洞)", "-", "无", "n/a", ""})
+
 
 @dataclass
 class ScenarioResult:
@@ -133,23 +157,59 @@ def classify_engine_outcome(outcomes: list[str], expected: str) -> tuple[str, st
 
 
 def requested_types(scenario: dict[str, Any]) -> tuple[str, ...]:
+    """该场景"什么样的结论才算说对了/说错了"的关键词。
+
+    * 应命中的场景：按 `ground_truth`（标准答案）取类型关键词；
+    * 应当安静的场景：`ground_truth` 是"（不是漏洞）"这种占位文案，**不能当关键词**
+      （否则误报判定永远为空转，见 `CATEGORY_KEYWORDS` 的说明），
+      改用它要诱骗的那一类 `category`。
+    """
+    expected = str(scenario.get("expected") or "signal")
+    if expected in ("none", "reflection_only"):
+        category = str(scenario.get("category") or "").lower()
+        if category in CATEGORY_KEYWORDS:
+            return CATEGORY_KEYWORDS[category]
     truth = str(scenario.get("ground_truth") or "")
-    return TYPE_KEYWORDS.get(truth, (truth.lower(),) if truth else ("",))
+    if truth and truth not in PLACEHOLDER_TRUTHS:
+        return TYPE_KEYWORDS.get(truth, (truth.lower(),))
+    return ()
 
 
 def finding_matches(scenario: dict[str, Any], finding: Any) -> bool:
-    """finding（或候选）是否命中该场景：**路径一致 + 类型关键词一致**。"""
+    """finding（或候选）是否命中该场景：**路径一致 + 类型关键词一致**。
+
+    判别字段随场景而变：
+    * 应命中的场景看 `title`/`vuln_type`/`description` 三处——模型常把类型写在描述里；
+    * **应当安静的场景只看 `title`/`vuln_type`**（这条结论*声称*的是什么），
+      不看描述：描述里出现"注入"这种词是常事——实测第 2 轮那条
+      "前端 JS 明文硬编码 SIGN_SECRET（/static/app.js）"就因为描述里带了"注入"
+      被误判成 `decoy-static` 的误报，而它其实是另一类真问题（硬编码密钥），
+      不是"在静态资源参数上注出了 SQL"。
+    """
     url = str(getattr(finding, "url", "") or (finding.get("url") if isinstance(finding, dict) else ""))
     if endpoint_path(url) != endpoint_path(str(scenario.get("endpoint") or "")):
         return False
     keywords = tuple(word for word in requested_types(scenario) if word)
     if not keywords:
         return True
+    keys = ("title", "vuln_type")
+    if str(scenario.get("expected") or "signal") not in ("none", "reflection_only"):
+        keys = ("title", "vuln_type", "description")
     text = " ".join(
         str(getattr(finding, key, "") or (finding.get(key, "") if isinstance(finding, dict) else ""))
-        for key in ("title", "vuln_type", "description")
+        for key in keys
     ).lower()
     return any(word.lower() in text for word in keywords)
+
+
+def is_auto_candidate(finding: Any) -> bool:
+    """这条是"实测信号兜底登记"的候选吗（标题带 `[自动]`，见 orchestrator._auto_register_signals）。
+
+    为什么要区分：那种候选代表"平台没让证据消失"，**不代表模型下了结论**。
+    判分时两者都算"被发现"，但报告的说明列必须写清是哪一种。
+    """
+    title = str(getattr(finding, "title", "") or (finding.get("title") if isinstance(finding, dict) else ""))
+    return title.startswith("[自动]")
 
 
 def coverage_mentions(scenario: dict[str, Any], coverage_rows: list[Any]) -> str:
@@ -381,7 +441,13 @@ def run_agent_tier(data: dict[str, Any], *, llm_kind: str, allow_live: bool,
         hit = [item for item in reported if finding_matches(scenario, item)]
         if hit:
             matched.add(str(scenario["id"]))
-            detail_of[str(scenario["id"])] = "findings/candidates 命中"
+            # 区分"模型自己下的结论"与"平台兜底登记的候选"：两者都算"被发现"，
+            # 但读者必须看得出是谁下的结论（第 6 轮起的安全网会登记 `[自动]` 候选）。
+            auto = [item for item in hit if is_auto_candidate(item)]
+            detail_of[str(scenario["id"])] = (
+                "实测信号自动登记为候选（模型未下结论）" if len(auto) == len(hit)
+                else "findings/candidates 命中"
+            )
             continue
         # 回归复核型运行会把"仍成立"写进覆盖记录（status=reported）而不重复 record_finding。
         # 只认结构化字段，不从自由文本猜。
@@ -402,7 +468,8 @@ def run_agent_tier(data: dict[str, Any], *, llm_kind: str, allow_live: bool,
                 detail=detail_of.get(scenario_id, "报告与覆盖记录里都没有对应条目"),
             ))
         else:
-            # 应当安静的场景：报告里出现对应条目才算误报
+            # 应当安静的场景：报告里出现"本场景在诱骗的那一类结论"才算误报
+            # （判据见 `requested_types`：静默场景按 `category` 取关键词）
             flagged = [item for item in reported if finding_matches(scenario, item)]
             verdict = "false_positive" if flagged and expected == "none" else (
                 "reflection_only_flagged" if flagged else "true_negative"
@@ -410,7 +477,10 @@ def run_agent_tier(data: dict[str, Any], *, llm_kind: str, allow_live: bool,
             results.append(ScenarioResult(
                 id=scenario_id, name=str(scenario.get("name") or ""), expected=expected,
                 verdict=verdict,
-                detail=f"报告了 {len(flagged)} 条" if flagged else "报告里没有对应条目",
+                detail=(
+                    "报告了 " + str(len(flagged)) + " 条："
+                    + "；".join(str(getattr(item, "title", "") or "")[:60] for item in flagged[:3])
+                ) if flagged else "报告里没有对应条目",
             ))
 
     usage = budget.snapshot()
@@ -420,6 +490,8 @@ def run_agent_tier(data: dict[str, Any], *, llm_kind: str, allow_live: bool,
         "estimated_cost": round(float(usage.get("estimated_cost") or 0.0), 4),
         "findings": len([item for item in reported if getattr(item, "status", "") != "candidate"]),
         "candidates": len(surface.pending_candidates()),
+        # 兜底登记的候选（模型没下结论，平台没让证据消失）——单独计数，别混进"模型的能力"
+        "auto_candidates": len([item for item in reported if is_auto_candidate(item)]),
         "finish_reason": result.finish_reason,
         "model": config.provider + "/" + config.model,
     }
@@ -457,7 +529,12 @@ def render_report(data: dict[str, Any], results: list[ScenarioResult], metrics: 
         f"｜**误报率：{_pct(metrics['false_positive_rate'])}**"
         f"（{metrics['false_positives']}/{metrics['quiet_expected']}）"
         f"｜仅反射命中：{metrics['reflection_only_flagged']}"
-        f"｜无结论：{metrics['inconclusive']}",
+        f"｜无结论：{metrics['inconclusive']}"
+        + (
+            f"｜其中兜底候选：{meta['auto_candidates']}（实测信号自动登记，"
+            "模型未下结论——算「被发现」，但不算「模型判对了」）"
+            if meta.get("auto_candidates") else ""
+        ),
         "",
         "## 逐场景",
         "",

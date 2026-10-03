@@ -41,10 +41,12 @@ from .sandbox import sandbox_report
 from .supervisor import Supervisor
 from .surface import (
     AttackSurface,
+    Finding,
     normalize_endpoint,
     normalize_path,
     sort_urls,
     target_path_list,
+    target_paths,
 )
 from .tools import ToolRegistry
 from .trace import TraceRecorder, summarize_trace, write_snapshot
@@ -95,6 +97,23 @@ INCOMPLETE_OUTCOMES: frozenset[str] = frozenset({
     "max_steps", "closing_failed", "budget", "supervisor_abort",
     "parse_error", "provider_error", "stopped",
 })
+
+#: 自动登记候选时，把尝试类别翻译成报告里的漏洞类型（认不出就照抄类别名）。
+AUTO_CANDIDATE_TYPES: dict[str, str] = {
+    "sqli": "SQL注入",
+    "nosqli": "SQL注入",
+    "xss": "反射型XSS",
+    "ssti": "SSTI",
+    "cmd": "命令注入",
+    "path": "任意文件读取",
+    "lfi": "任意文件读取",
+    "ssrf": "SSRF",
+    "idor": "越权访问",
+    "auth": "未授权访问",
+    "default_creds": "弱口令/默认凭据",
+    "race": "竞态条件",
+    "security_headers": "安全配置缺陷",
+}
 
 
 @dataclass
@@ -1873,6 +1892,60 @@ class Orchestrator:
             ),
         )
 
+    def _auto_register_signals(self) -> list[str]:
+        """把"实测有信号却没人下结论"的端点登记成**候选**，不让证据凭空消失。
+
+        为什么（第 6 轮 live 评测实测）：`/reflect` 记了 3 条 xss 信号、
+        `/file` 记了 1 条 path 信号（响应 196 → 1451 字节，内容差异就是那个敏感文件），
+        但两个端点都没有 finding 也没有候选——一个被模型"排除"、一个连覆盖结论都没写。
+        报告于是读起来像"这两个面没漏"，而证据明明在攻面里躺着。
+
+        这里只做一件事：**把信号登记为候选**（status=candidate，标题带 `[自动]`，
+        confidence=unrecovered）。候选不是结论——它说的是"有待复核的证据"，
+        而不是"确认有漏洞"；排除理由（`dismissed`）一并写进描述，读者两边都能看到。
+        复核波会照常尝试复核它们。
+        """
+        registered: list[str] = []
+        for attempt in self.surface.unresolved_signals():
+            endpoint = normalize_endpoint(attempt.endpoint)
+            if not endpoint:
+                continue
+            dismissal = ""
+            wanted = normalize_path(endpoint)
+            with self.surface._lock:  # noqa: SLF001 读覆盖记录里的排除理由
+                for entry in self.surface.coverage.values():
+                    if wanted in target_paths(str(entry.get("target") or "")):
+                        dismissal = str(entry.get("dismissed") or "")
+                        break
+            candidate = Finding(
+                id="",
+                title=f"[自动] 实测信号未形成结论：{attempt.category or '未知类别'} @ "
+                f"{normalize_path(endpoint)}",
+                severity="low",
+                confidence="unreviewed",
+                vuln_type=AUTO_CANDIDATE_TYPES.get(
+                    str(attempt.category).lower(), str(attempt.category or "待分类")
+                ),
+                url=endpoint,
+                param=str(attempt.param or ""),
+                evidence=str(attempt.detail or "")[:300],
+                description=(
+                    "该端点在实测中记录到信号，但本轮没有任何 finding/候选把它落地。"
+                    f"原始信号：{attempt.category} {('payload=' + attempt.payload) if attempt.payload else ''}"
+                    + (f"；模型给出的排除理由：{dismissal}" if dismissal else "")
+                ),
+                status="candidate",
+                dedupe_key=f"auto|{endpoint}|{attempt.param}|{attempt.category}",
+            )
+            saved = self.surface.add_candidate(candidate)
+            registered.append(saved.id)
+            self.surface.record_coverage(
+                endpoint + (f"（参数 {attempt.param}）" if attempt.param else ""),
+                "not_tested",
+                detail="实测有信号但本轮未形成结论，已自动登记为候选（待复核）",
+            )
+        return registered
+
     def _finalise_coverage(self, findings: list[dict[str, Any]], tasks: list[WorkerTask]) -> None:
         """收尾时补齐覆盖面记录（对标 Strix 的 coverage 收口）。
 
@@ -1944,6 +2017,18 @@ class Orchestrator:
             #  报告里读起来就像"这个面测过了、没漏洞"。）
             if task.outcome != "done":
                 self._mark_assigned_but_untested(task, attempted)
+        # 最后一道防线：实测有信号却没人下结论的端点 → 自动登记为候选。
+        # 放在最后：这样本轮 findings 产生的 `reported` 行已经写好，
+        # 已经落地的信号不会被重复登记。
+        auto_ids = self._auto_register_signals()
+        if auto_ids:
+            self._event(
+                kind="auto_candidates",
+                message=(
+                    f"{len(auto_ids)} 条实测信号未形成结论，已自动登记为候选"
+                    f"（{', '.join(auto_ids)}，待复核；候选≠确认漏洞）"
+                ),
+            )
 
     def _mark_assigned_but_untested(self, task: WorkerTask, attempted: set[str]) -> None:
         """把"任务点名要打、但既没试过也没结论"的端点写成 `not_tested`（最多 6 条）。

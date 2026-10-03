@@ -510,6 +510,49 @@ class AttackSurface:
         picks.sort(key=lambda item: _idor_priority(item[0], item[1]))
         return picks[:limit]
 
+    def unresolved_signals(self, limit: int = 12) -> list[Attempt]:
+        """实测有信号、却**没有落地成结论**的那些尝试。
+
+        为什么要有它（第 6 轮 live 评测实测）：`/reflect` 记了 3 条 xss 信号
+        （"payload 原样回显（未转义）"）、`/file` 记了 1 条 path 信号
+        （响应 196 → 1451 字节，内容差异里就是那个敏感文件），
+        但两个端点都没有 finding/候选——`/reflect` 被模型"排除"了、
+        `/file` 连覆盖结论都没写。**证据就这样消失了**，报告里读起来像"没漏"。
+
+        判据：该端点既没有 finding、也没有候选，覆盖记录里也没有 `reported`。
+        `no_issue_found`/`ruled_out`（含带 `dismissed` 的）**不算结论落地**——
+        排除一条实测信号需要有证据，而这里只负责"不让信号凭空消失"：
+        调用方把这些登记成**候选**（候选不是结论，只是"有待复核的证据"）。
+
+        发现类尝试（`DISCOVERY_CATEGORIES`）不算信号，理由同 `signals_for_target`。
+        """
+        with self._lock:
+            attempts = [
+                attempt
+                for attempt in self.attempts.values()
+                if attempt.outcome == "signal" and attempt.category not in DISCOVERY_CATEGORIES
+            ]
+            settled = {normalize_endpoint(item.url) for item in self.findings}
+            settled |= {normalize_endpoint(item.url) for item in self.candidates.values()}
+            # 覆盖记录的 target 是**人话**（`…/reflect（参数 name）`、`/reflect?name=`），
+            # 必须用 `target_paths` 抽路径再比——直接 `normalize_path` 会把
+            # 全角括号整段留在路径里，于是"本轮已报的端点"认不出来，冒出重复候选。
+            reported: set[str] = set()
+            for entry in self.coverage.values():
+                if str(entry.get("status") or "") != "reported":
+                    continue
+                reported |= target_paths(str(entry.get("target") or ""))
+        pending: list[Attempt] = []
+        for attempt in attempts:
+            if normalize_endpoint(attempt.endpoint) in settled:
+                continue
+            if normalize_path(attempt.endpoint) in reported:
+                continue
+            pending.append(attempt)
+        # 先按"证据强度"排：内容差异/长度变化这类信号比纯回显更值得复核
+        pending.sort(key=lambda item: (len(item.detail or ""), item.at), reverse=True)
+        return pending[:limit]
+
     def add_agent_note(self, worker: str, text: str) -> None:
         """子代理留下的一条结论/线索（跨代理可读，对标 Strix 的 notes 工具）。"""
         text = str(text or "").strip()[:400]
