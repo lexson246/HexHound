@@ -28,7 +28,7 @@ HexHound 是一个 **LLM 驱动的黑盒 Web 安全审计 Agent**：编排者把
 
 | 项 | 状态 | 证据 |
 | --- | --- | --- |
-| 测试 | **1062 passed + 71 subtests passed / 1 skipped** | `python -m pytest tests`（别再补 `-q`：`addopts` 已有 `-q`，双重 `-qq` 会让 pytest 连汇总行都不打印） |
+| 测试 | **1067 passed + 71 subtests passed / 1 skipped** | `python -m pytest tests`（别再补 `-q`：`addopts` 已有 `-q`，双重 `-qq` 会让 pytest 连汇总行都不打印） |
 | 代码风格 | 干净 | `python -m ruff check src tests tools` |
 | 本地 CI 执行器 | **Windows 作业真跑；Linux 作业是 SKIP**（见下） | `python tools/run_ci_locally.py --all` |
 | GitHub CI | **8/8 绿** | `python tools/ci_status.py --sha e6e2431` |
@@ -38,7 +38,7 @@ HexHound 是一个 **LLM 驱动的黑盒 Web 安全审计 Agent**：编排者把
 | 真工具链路（零额度） | 15/15 | `python tools/verify_real_tool_chain.py` |
 | 真编排 + 真工具（零额度） | 15/15 + 软上限 4/4 | `python tools/verify_swarm_with_real_tools.py` |
 | 关窗护栏（Flask 层） | 12/12 | `python tools/verify_close_guard.py` |
-| **带标准答案的评测** | 引擎层 **检出 100% / 误报 0%**；真实模型档 **75–87.5% / 误报 0%**（六轮、约 ¥2.68：注入六项与越权读订单都命中过，漏报在场景间摆动 = 4 任务 × 8 步预算下的方差）。第 6 轮又暴露"实测信号没人接就消失"，已加**兜底候选**安全网（§6.19），效果待第 7 轮实测 | `python tools/eval_scenarios.py --tier engine`；真实模型档见 `docs/EVAL.md` §4（要 `--llm live --allow-live`，会花额度） |
+| **带标准答案的评测** | 引擎层 **检出 100% / 误报 0%**；真实模型档 **75–87.5% / 误报 0%**（七轮、约 ¥3.15：八个应命中场景**每一个都被检出过**、误报始终 0，漏报在场景间摆动 = 4 任务 × 8 步预算下的方差）。每轮的漏报都追到了一个**具体缺口**并修掉：发现层（§6.14）→ 参数名（§6.15）→ 值语义（§6.16）→ 任务粒度（§6.18）→ 信号兜底（§6.19）→ 真参数越权面（§6.21） | `python tools/eval_scenarios.py --tier engine`；真实模型档见 `docs/EVAL.md` §4（要 `--llm live --allow-live`，会花额度） |
 
 > 跳过的那 1 个用例是"playwright 已安装"分支的环境性跳过，不是漏测。
 
@@ -460,6 +460,14 @@ fuzz / compare / auth / creds / headers 全按"受阻、未完成"处理；
 **症状**：agent 层的"误报率 0%"从第一天起就是空转的数字——静默场景的 `ground_truth` 是占位文案「（不是漏洞）」，被 `requested_types` 当成关键词去匹配 finding 文本，而那句话永远不会出现在报告里。**在诱饵端点上明确报 SQLi/XSS 也不会被算误报。**（引擎层的误报判定走记录结果，一直有效——`reflect-dom` 那个真误报就是它抓的。）
 **守卫**：静默场景按它在诱骗的 `category` 判（`CATEGORY_KEYWORDS`），且只看 `title`/`vuln_type`（结论声称的类型），不看描述——第 2 轮那条"JS 硬编码 SIGN_SECRET"曾因描述里带「注入」被误判成误报。
 修正后离线复核六轮：误报 **0 条**，且判定非空转。回归：`tests/test_eval_scenarios.py::QuietScenarioCriterionTests`。
+
+### 6.21 真参数越过了越权任务（live 评测发现）
+
+**症状**：第 7 轮漏了 `idor-order`，而 `/api/order` 有 **25 次尝试**——全是注入类 fuzz（sqli/cmd/ssti/path/xss/nosqli，拿的都是无效值），补扫据此写下「端点基线恒 HTTP404，无异常信号」。越权任务根本没碰它。
+**根因**：`idor_candidates()` 当时只认「**没有**探到参数」的端点；`/api/order` 一登记出真参数 `order_id` 就被排除在越权面之外了。**参数被发现了 ≠ 它被当作对象标识测过。**
+**守卫**：候选面同时接受「已发现的对象标识参数」与「推测参数」并把两者分开写；排除条件从「任何尝试」改成「**授权类**尝试」（`IDOR_CATEGORIES`，注入 fuzz 不算）；有参数但没有标识类参数的端点（`/search?q=`）不进候选。
+离线复核：第 7 轮产物在新逻辑下会重新派出 `/api/order`。
+回归：`tests/test_idor_sweep.py`（25 条）。
 
 ## 7. 还没做的（按优先级，全部有验收标准）
 

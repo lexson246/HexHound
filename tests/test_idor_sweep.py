@@ -104,7 +104,9 @@ class IdorCandidatesTests(unittest.TestCase):
         return surface
 
     def test_untested_endpoint_is_a_candidate(self) -> None:
-        self.assertEqual(self.make().idor_candidates(), [("http://h/api/order", ["order_id", "id"])])
+        self.assertEqual(
+            self.make().idor_candidates(), [("http://h/api/order", [], ["order_id", "id"])]
+        )
 
     def test_enumeration_probe_does_not_count_as_a_param_test(self) -> None:
         """枚举时那次 GET（param 为空）不算"试过参数"——否则候选面会自己消失。"""
@@ -122,17 +124,36 @@ class IdorCandidatesTests(unittest.TestCase):
         surface = self.make()
         surface.mark_attempt("http://h/api/order", "idor", param="order_id", outcome="no_signal")
         picks = surface.idor_candidates()
-        self.assertEqual(picks, [("http://h/api/order", ["id"])])
+        self.assertEqual(picks, [("http://h/api/order", [], ["id"])])
+
+    def test_injection_fuzz_does_not_count_as_an_authorization_test(self) -> None:
+        """**第 7 轮的教训**：`order_id` 被 sqli/cmd/ssti 各 fuzz 过 25 次，
+        但那都是拿无效值的 payload 试注入——越权从来没测过。
+        参数"被发现了/被试过"不等于"被当作对象标识测过"。"""
+        surface = self.make()
+        for category in ("sqli", "cmd", "ssti", "path", "xss", "nosqli"):
+            surface.mark_attempt(
+                "http://h/api/order", category, param="order_id", payload="'", outcome="no_signal",
+            )
+        picks = surface.idor_candidates()
+        self.assertEqual(picks, [("http://h/api/order", [], ["order_id", "id"])])
+
+    def test_discovered_id_param_is_also_a_candidate(self) -> None:
+        """探到的真参数照样可能是越权面（第 7 轮的教训）。"""
+        surface = AttackSurface(target="http://h", mode="blackbox")
+        surface.add_endpoint("http://h/api/order?order_id=1", source="crawl")
+        picks = surface.idor_candidates()
+        self.assertEqual(picks, [("http://h/api/order", ["order_id"], [])])
+
+    def test_discovered_non_id_param_is_not_a_candidate(self) -> None:
+        """有参数、但没有一个像对象标识 → 不是越权面的形状，别浪费任务。"""
+        surface = AttackSurface(target="http://h", mode="blackbox")
+        surface.add_endpoint("http://h/search?q=hello&page=1", source="crawl")
+        self.assertEqual(surface.idor_candidates(), [])
 
     def test_reported_endpoints_are_not_candidates(self) -> None:
         surface = self.make()
         surface.record_coverage("http://h/api/order", "reported", detail="越权")
-        self.assertEqual(surface.idor_candidates(), [])
-
-    def test_endpoints_with_real_params_are_out_of_scope(self) -> None:
-        """有真参数的端点走参数补扫那条路，不由这里派活（避免重复派任务烧钱）。"""
-        surface = AttackSurface(target="http://h", mode="blackbox")
-        surface.add_endpoint("http://h/api/order?order_id=1", source="crawl")
         self.assertEqual(surface.idor_candidates(), [])
 
     def test_api_candidates_come_first_and_order_is_deterministic(self) -> None:
@@ -143,9 +164,9 @@ class IdorCandidatesTests(unittest.TestCase):
         surface = AttackSurface(target="http://h", mode="blackbox")
         for path in ("/coupon", "/order/prepare", "/invoice/detail", "/api/users", "/api/order"):
             surface.add_endpoint("http://h" + path, source="enumerate")
-        picks = [url.split("http://h")[-1] for url, _params in surface.idor_candidates(limit=3)]
+        picks = [url.split("http://h")[-1] for url, _d, _s in surface.idor_candidates(limit=3)]
         self.assertEqual(picks[:2], ["/api/order", "/api/users"])
-        again = [url.split("http://h")[-1] for url, _params in surface.idor_candidates(limit=3)]
+        again = [url.split("http://h")[-1] for url, _d, _s in surface.idor_candidates(limit=3)]
         self.assertEqual(picks, again, "排序必须稳定")
 
     def test_limit_truncates_after_prioritising(self) -> None:
@@ -228,9 +249,19 @@ class IdorSweepTaskTests(unittest.TestCase):
         self.assertEqual([task.id for task in tasks], ["I1", "I2", "I3"])
         self.assertEqual(len({task.url for task in tasks}), 3, "每个任务只盯一个端点")
         for task in tasks:
-            self.assertEqual(task.objective.count("候选参数："), 1)
+            self.assertIn("推测参数：", task.objective)
+            self.assertEqual(task.objective.count("推测参数："), 1)
             self.assertIn(task.url, task.objective)
             self.assertIn("只做这一个端点", task.objective)
+
+    def test_objective_separates_discovered_and_guessed_params(self) -> None:
+        """探到的参数与猜的参数必须分开写——并提醒"被发现了 ≠ 被当作对象标识测过"。"""
+        orchestrator = self.make()
+        orchestrator.surface.add_endpoint(TARGET + "/api/order?order_id=1", source="crawl")
+        objective = orchestrator.idor_sweep_tasks()[0].objective
+        self.assertIn("已发现参数：order_id", objective)
+        self.assertNotIn("推测参数：order_id", objective)
+        self.assertIn("注入类 fuzz", objective)
 
     def test_limit_bounds_the_number_of_tasks(self) -> None:
         orchestrator = self.make()

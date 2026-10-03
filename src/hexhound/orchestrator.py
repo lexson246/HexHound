@@ -1570,15 +1570,23 @@ class Orchestrator:
         """
         picks = self.surface.idor_candidates(limit=limit)
         tasks: list[WorkerTask] = []
-        for index, (url, params) in enumerate(picks):
+        for index, (url, discovered, suggested) in enumerate(picks):
+            parts: list[str] = []
+            if discovered:
+                parts.append("已发现参数：" + "、".join(discovered))
+            if suggested:
+                parts.append("推测参数：" + "、".join(suggested) + "（按路径名词推测，未验证）")
+            params_line = "；".join(parts)
             tasks.append(
                 WorkerTask(
                     id=f"I{round_index * max(1, limit) + index + 1}",
                     role="auth",
                     objective=(
                         "**越权读取排查（IDOR/BOLA）**：只做这一个端点，做完为止：\n"
-                        f"  {url}  候选参数：{'、'.join(params)}"
-                        "（**按路径名词推测的、未经验证**——试不中不算失败，但要写清试过哪些名字）\n"
+                        f"  {url}  {params_line}\n"
+                        "注意：「已发现参数」是从请求/表单里看到的真参数名，"
+                        "但**它有没有被当作对象标识测过是另一回事**——"
+                        "注入类 fuzz 只会拿无效值试 payload，测不出越权。\n"
                         "步骤（顺序别调）：\n"
                         "1) **先不带任何参数请求一次**：很多接口会返回一个默认对象，"
                         "响应里就写着真实的标识值与属主（例如 `\"order_id\":\"1001\"`、"

@@ -404,7 +404,15 @@ check the proxy first.
     `orchestrator.idor_sweep_tasks()` dispatches one deterministic `auth` task (`I1`) that must
     confirm which parameter actually works, then do the A/B id comparison and the anonymous
     request, with a conclusion required per endpoint.
-    Tests: `tests/test_idor_sweep.py` (19).
+    **Run #7 then showed a side effect of this very fix**: once `/api/order` had a
+    *discovered* `order_id`, it no longer qualified as an IDOR candidate (the sweep only
+    took param-less endpoints) and fell to the injection sweep, which fuzzed it with
+    invalid values, saw 404 every time and filed it as `no_issue_found`. Candidates now
+    come from **both** discovered object-id params and guessed ones, exclusion is by
+    *authorization* attempts only (`IDOR_CATEGORIES` — injection fuzz does not count), and
+    the objective spells out that a discovered parameter still has to be tested as an
+    object identifier. Offline replay of run #7's surface dispatches `/api/order` again.
+    Tests: `tests/test_idor_sweep.py` (25).
     **Run #4 (paid) showed the parameter half works and the value half did not**: `/api/order` got
     25 attempts, 24 of them carrying `order_id`, and the `I1` task finished properly — but it tried
     `order_id=1`, got 404 `{"msg":"订单不存在"}`, and recorded the whole endpoint as `ruled_out`.
@@ -574,9 +582,11 @@ and `sanitize.decode_console_output()`.
 | --- | --- | --- | --- | --- | --- |
 | engine | `--tier engine` | 100% (8/8) | 0% (0/3) | ¥0 | 1.2 s |
 | agent / scripted LLM | `--tier agent --llm scripted` | 12.5% (1/8) | 0% (0/4) | ¥0 | 3.4 s |
-| agent / real model | `--tier agent --llm live --allow-live` | 75 / 75 / 87.5 / 87.5 / 87.5 / 75% | 0% (0/4) | ¥0.42 / ¥0.44 / ¥0.47 / ¥0.41 / ¥0.41 / ¥0.54 | 352 / 407 / 411 / 389 / 360 / 417 s |
+| agent / real model | `--tier agent --llm live --allow-live` | 75 / 75 / 87.5 / 87.5 / 87.5 / 75 / 87.5% | 0% (0/4) | ¥0.42 / ¥0.44 / ¥0.47 / ¥0.41 / ¥0.41 / ¥0.54 / ¥0.47 | 352 / 407 / 411 / 389 / 360 / 417 / 380 s |
 
-Six live runs (≈¥2.68 total). The injection scenarios are 6/6 every time and nothing quiet was ever flagged;
+Seven live runs (≈¥3.15 total). Every one of the eight signal scenarios has been detected
+in at least three runs and no run has ever produced a false positive; the misses rotate,
+and each run that missed something exposed a *different* concrete gap which is now fixed. The injection scenarios are 6/6 every time and nothing quiet was ever flagged;
 the authorization scenarios are what moved: run #1 missed `idor-order` + `unauth-users`,
 run #2 missed `xss-reflect` + `idor-order`, runs #3 and #4 missed only `idor-order`.
 That single scenario has now been traced through **three layers**, each fixed and each
@@ -654,5 +664,5 @@ must not be able to kill a run. It now retries after trimming the non-ASCII tail
 `looks_like_url()` returns `False` for the same input.
 
 Test/lint state at the end of this round: `python -m pytest tests` →
-**1044 passed, 71 subtests passed, 1 skipped** (run `-q` twice and pytest prints no totals —
+**1067 passed, 71 subtests passed, 1 skipped** (run `-q` twice and pytest prints no totals —
 `addopts` already contains `-q`, so pass no extra `-q`); `ruff check src tests tools` clean.

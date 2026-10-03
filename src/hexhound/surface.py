@@ -24,7 +24,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
 from .apispec import Operation, SpecImport, build_operation_url  # noqa: F401
-from .knowledge import suggest_id_params
+from .knowledge import OBJECT_ID_PARAMS, suggest_id_params
 
 SEVERITIES = ("critical", "high", "medium", "low", "info")
 SEVERITY_RANK = {name: index for index, name in enumerate(SEVERITIES)}
@@ -260,6 +260,14 @@ class Attempt:
 #: 时必须把它们排除，否则每个字典扫出来的端点都要被要求解释一遍。
 DISCOVERY_CATEGORIES: frozenset[str] = frozenset({"enumerate", "crawl", "read", "restore"})
 
+#: 授权类尝试的类别（判断"这个参数有没有被当作对象标识测过"）。
+#: 注入类 fuzz（sqli/xss/...）**不算**——它们只会拿无效值试 payload。
+IDOR_CATEGORIES: frozenset[str] = frozenset({"idor", "bola", "auth", "access"})
+
+#: 对象标识类参数名（越权测试的落点）。与 `knowledge.OBJECT_ID_PARAMS` 同源，
+#: 这里做成集合是为了 O(1) 判断"这个探到的参数像不像对象标识"。
+OBJECT_ID_PARAM_SET: frozenset[str] = frozenset(param.lower() for param in OBJECT_ID_PARAMS)
+
 
 def _idor_priority(url: str, params: list[str]) -> tuple[int, int, str]:
     """越权候选面的排序键（越小越靠前）。
@@ -468,16 +476,22 @@ class AttackSurface:
         hits.sort(key=lambda item: item.at, reverse=True)
         return hits
 
-    def idor_candidates(self, limit: int = 4) -> list[tuple[str, list[str]]]:
-        """越权（IDOR/BOLA）候选面：路径暗示了对象标识参数、但那个参数从没被试过。
+    def idor_candidates(self, limit: int = 4) -> list[tuple[str, list[str], list[str]]]:
+        """越权（IDOR/BOLA）候选面：`(端点, 已发现的对象标识参数, 推测的参数名)`。
 
-        判据（三条都要满足）：
-        1. 端点**没有探到的参数**，但有 `suggested_params`（按路径名词推测的标识参数名）；
-        2. 那些候选参数名从没出现在任何尝试记录里（枚举时的那次 GET 不算"试过参数"）；
+        判据：
+        1. 端点**有对象标识类参数**——要么是"探到的"（`params` 命中
+           `knowledge.OBJECT_ID_PARAMS`），要么是"按路径名词推测的"
+           （`suggested_params`）；
+        2. 那些参数**没有做过授权类尝试**（`idor`/`bola`/`auth` 类别）——
+           注意：注入类 fuzz（sqli/cmd/…）**不算**做过越权测试；
         3. 该端点还没有 `reported` 结论（已经报过的不用再派）。
 
-        为什么要有这个：live 评测三轮都漏了 `/api/order` 越权——字典枚举**知道路径、
-        不知道参数**，于是"用 order_id 去测"只能靠模型自己想到。这里把它变成确定性输入。
+        为什么两条来源都要（第 7 轮 live 评测实测）：先前只认"没有探到参数"的端点，
+        于是 `/api/order` 一旦被登记出 `order_id` 这个真参数，就越过了越权任务、
+        落到注入补扫那条路上——注入补扫只会拿无效值 fuzz，
+        最后写下"端点基线恒 HTTP404，无异常信号"，把整条越权面判成了没问题。
+        **参数被发现了，不等于它被当作"对象标识"测过。**
 
         排序不能靠字典插入顺序（否则"哪个端点被列进去"取决于扫描先后，随机性太大）：
         `/api/` 下的接口优先（JSON、PII、BOLA 高发），其次是有具体资源名参数的
@@ -486,28 +500,40 @@ class AttackSurface:
         with self._lock:
             endpoints = list(self.endpoints.values())
             attempts = list(self.attempts.values())
-            reported = {
-                normalize_path(str(entry.get("target") or ""))
-                for entry in self.coverage.values()
-                if str(entry.get("status") or "") == "reported"
-            }
-        tested: dict[str, set[str]] = {}
+            reported: set[str] = set()
+            for entry in self.coverage.values():
+                if str(entry.get("status") or "") != "reported":
+                    continue
+                reported |= target_paths(str(entry.get("target") or ""))
+        # 已经做过授权类尝试的参数（注入类 fuzz 不算）
+        idor_tried: dict[str, set[str]] = {}
         for attempt in attempts:
-            if attempt.param:
-                tested.setdefault(normalize_path(attempt.endpoint), set()).add(attempt.param.lower())
-        picks: list[tuple[str, list[str]]] = []
-        for endpoint in endpoints:
-            if endpoint.params or not endpoint.suggested_params:
+            if str(attempt.category or "").lower() not in IDOR_CATEGORIES:
                 continue
+            if attempt.param:
+                idor_tried.setdefault(normalize_path(attempt.endpoint), set()).add(
+                    attempt.param.lower()
+                )
+        picks: list[tuple[str, list[str], list[str]]] = []
+        for endpoint in endpoints:
             path = normalize_path(endpoint.url)
             if path in reported:
                 continue
-            already = tested.get(path, set())
-            pending = [p for p in endpoint.suggested_params if p.lower() not in already]
+            already = idor_tried.get(path, set())
+            discovered = [
+                param for param in endpoint.params
+                if param.lower() in OBJECT_ID_PARAM_SET and param.lower() not in already
+            ]
+            suggested = [
+                param for param in endpoint.suggested_params if param.lower() not in already
+            ]
+            if endpoint.params and not discovered:
+                continue  # 有参数、但没有一个像对象标识：不是越权面的形状
+            pending = list(dict.fromkeys(discovered + suggested))
             if not pending:
                 continue
-            picks.append((endpoint.url, pending))
-        picks.sort(key=lambda item: _idor_priority(item[0], item[1]))
+            picks.append((endpoint.url, discovered, suggested))
+        picks.sort(key=lambda item: _idor_priority(item[0], item[1] + item[2]))
         return picks[:limit]
 
     def unresolved_signals(self, limit: int = 12) -> list[Attempt]:
